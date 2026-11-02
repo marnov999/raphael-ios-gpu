@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the XNU kernel needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); MMIO addresses
-come from the target device's live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--raphael]
+come from the target device's live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--raphael] [--fullram]
 
 --raphael: Xiaomi Redmi K20 Pro (SM8150 / Snapdragon 855). Same Qualcomm
 platform family as the generic driver set (Kryo 400 series CPUs, ARMv8.2
@@ -41,6 +41,13 @@ RAPHAEL_PHYS_BASE = 0x110000000
 RAPHAEL_MEM_SIZE = HIGH_PHYS_BASE + HIGH_MEM_SIZE - RAPHAEL_PHYS_BASE
 BADRAM_START, BADRAM_END = 0x1016a0000, 0x1016c0000
 assert RAPHAEL_PHYS_BASE >= BADRAM_END
+# --raphael --fullram: all RAM above the fixed carve-outs (the last one, ramdump_fb, ends at 0xb0000000;
+# the dynamic pools in the SoC tree are Linux's), the bad cells inside it kept out by the kernel
+# (xnu patch 0103 reads /chosen sweet-badram). Needs a kernel with 0103: an older one would use them.
+# The top is the K20 Pro port's live memory node (0x1fcc00000); MIUI on this phone maps RAM up to
+# 0x1ffffffff, to be checked against this phone's own memory node.
+FULLRAM_PHYS_BASE = 0xb0000000
+FULLRAM_MEM_SIZE = 0x1fcc00000 - FULLRAM_PHYS_BASE
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -96,7 +103,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None):
+def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullram=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     raphael=True: Redmi K20 Pro panel geometry and Kryo 485 clocks.
     cpus=N: /cpus child node count (default 8). N=1 replicates the t2 swap-test
@@ -106,7 +113,9 @@ def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None):
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     if raphael and highmem:
         phys_base, mem_size = RAPHAEL_PHYS_BASE, RAPHAEL_MEM_SIZE
-    assert phys_base >= BADRAM_END or phys_base + mem_size <= BADRAM_START, 'kernel RAM overlaps the bad DRAM'
+    if raphael and fullram:
+        phys_base, mem_size = FULLRAM_PHYS_BASE, FULLRAM_MEM_SIZE
+    assert fullram or phys_base >= BADRAM_END or phys_base + mem_size <= BADRAM_START, 'kernel RAM overlaps the bad DRAM'
     fb_h, fb_stride = (RAPHAEL_FB_H, RAPHAEL_FB_STRIDE) if raphael else (FB_H, FB_STRIDE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
@@ -117,6 +126,7 @@ def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None):
         ph(),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
+    ] + ([('sweet-badram', u64(BADRAM_START, BADRAM_END - BADRAM_START))] if fullram else []) + [
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
         ('firmware-version', cstr('sweet-shim')),
@@ -276,7 +286,7 @@ if __name__ == '__main__':
     for a in sys.argv:
         if a.startswith('--cpus='):
             cpus_arg = int(a.split('=', 1)[1])
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, fullram='--fullram' in sys.argv,
                  raphael='--raphael' in sys.argv, cpus=cpus_arg)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)

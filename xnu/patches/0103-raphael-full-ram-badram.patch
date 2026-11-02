@@ -1,0 +1,90 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..6577fe1 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2569,6 +2569,13 @@ static unsigned int avail_page_count = 0;
+ static bool need_ram_ranges_init = true;
+ 
+ 
++/*
++ * SWEET/raphael: physical RAM the VM must never hand out, from the ADT's /chosen "sweet-badram"
++ * property (u64 pa, u64 size; tools/mkadt.py). The Mi 9T Pro has weak DRAM cells in
++ * 0x1016aa000-0x1016bdfff, inside the one contiguous range XNU manages.
++ */
++static pmap_paddr_t sweet_badram_lo, sweet_badram_hi;
++
+ /**
+  * Checks to see if a given page is in
+  * the array of known bad pages
+@@ -2576,9 +2583,11 @@ static bool need_ram_ranges_init = true;
+  * @param ppn page number to check
+  */
+ bool
+-pmap_is_bad_ram(__unused ppnum_t ppn)
++pmap_is_bad_ram(ppnum_t ppn)
+ {
+-	return false;
++	pmap_paddr_t pa = (pmap_paddr_t)ppn << PAGE_SHIFT;
++
++	return pa >= sweet_badram_lo && pa < sweet_badram_hi;
+ }
+ 
+ /**
+@@ -2594,12 +2603,37 @@ initialize_ram_ranges(void)
+ {
+ 	pmap_paddr_t first = first_avail;
+ 	pmap_paddr_t end = avail_end;
++	DTEntry chosen;
++	void const *prop;
++	unsigned int prop_size;
+ 
+ 	assert(first <= end);
+ 	assert(first == (first & ~PAGE_MASK));
+ 	assert(end == (end & ~PAGE_MASK));
+ 	avail_page_count = atop(end - first);
+ 
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "sweet-badram", &prop, &prop_size) == kSuccess &&
++	    prop_size >= 2 * sizeof(uint64_t)) {
++		uint64_t range[2];
++
++		memcpy(range, prop, sizeof(range));
++		sweet_badram_lo = trunc_page(range[0]);
++		sweet_badram_hi = round_page(range[0] + range[1]);
++		/* the early allocations (page tables, pmap structures) come from first_avail directly */
++		if (first > sweet_badram_lo) {
++			panic("SWEET: early boot allocations reached the bad RAM at 0x%llx (first_avail 0x%llx)",
++			    (unsigned long long)sweet_badram_lo, (unsigned long long)first);
++		}
++		if (sweet_badram_lo < end && sweet_badram_hi > first) {
++			pmap_paddr_t lo = MAX(sweet_badram_lo, first), hi = MIN(sweet_badram_hi, end);
++
++			avail_page_count -= atop(hi - lo);
++		}
++		printf("SWEET RAM: keeping 0x%llx-0x%llx out of the VM (%u pages free)\n",
++		    (unsigned long long)sweet_badram_lo, (unsigned long long)sweet_badram_hi, avail_page_count);
++	}
++
+ 	need_ram_ranges_init = false;
+ }
+ 
+@@ -2642,6 +2676,10 @@ pmap_next_page(
+ 	}
+ 
+ 
++	if (first_avail >= sweet_badram_lo && first_avail < sweet_badram_hi) {
++		first_avail = MIN(sweet_badram_hi, avail_end);
++	}
++
+ 	if (first_avail != avail_end) {
+ 		*pnum = (ppnum_t)atop(first_avail);
+ 		first_avail += PAGE_SIZE;
+@@ -6881,7 +6919,7 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	flush_dcache((vm_offset_t) pp << PAGE_SHIFT, PAGE_SIZE, TRUE);     /* (pp << PAGE_SHIFT) lost bit 32 of PAs above 4 GB */
+ }
+ 
+ #if CONFIG_COREDUMP
