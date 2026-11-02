@@ -237,3 +237,16 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - Open: off-mode charging through the flashed image (power off, plug charger); 6 third-party apps
   (packages-3rdparty.txt, APKs in apps.tar) if wanted. Next: step 4, the iOS root into iosdata.
 
+### 2026-11-02 (step 4 done: iOS lock screen)
+- Root: `tools/build-root.sh` (ubuntu:22.04 --privileged container, IPSW dmgs from davinci-ios/ipsw, apfs-fuse,
+  mkiosroot + sweet-root-tweaks, no davinci overlay): out/root/ios16-root-raphael.img, 26835156992 bytes
+  (= iosdata - 8 MiB), 12 GB used, fsck clean, sha256 88652eb0...
+- Write: first try (gzip | adb exec-in su -c 'gzip -dc | dd') wrote NOTHING - Magisk su's stdin relay makes
+  toybox dd stop after one 4 MiB block and toybox gzip -dc output nothing; only the final sha256 caught it.
+  `tools/write-root.sh` now pushes 512 MiB chunks with adb push, dd's them from the file, verifies each on
+  the partition, writes all-zero chunks from /dev/zero: 50/50 verified, 12792 MiB sent, 12 min.
+- **16:10 `fastboot boot out/raphael-ios-t5.img`, Boot iOS: lock screen** after a long first boot (> 15 min
+  on the Apple logo; user saw it on the lock screen later). Unlock works (very laggy: CPU compositing),
+  display off/on works, Settings > storage 27 GB, 13.69 GB free.
+- Next: step 5, the GPU (Adreno 640) and the GLES path as on davinci.
+

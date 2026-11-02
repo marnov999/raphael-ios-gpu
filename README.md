@@ -15,11 +15,11 @@ the iOS root in its own partition, and the GPU (Adreno 640).
 
 | Step | State |
 | --- | --- |
-| 1. XNU + display via `fastboot boot` | first test image built, not yet run on this phone |
-| 2. Boot-partition image (shim + XNU + MIUI kernel, boot menu, charger mode) | planned |
-| 3. userdata split into `iosdata` + `userdata` | planned |
-| 4. iOS root, lock screen, home screen, touch | planned |
-| 5. GPU (Adreno 640), Metal/GLES, frame pacing | planned |
+| 1. XNU + display via `fastboot boot` | done: console on the panel, 8 cores, touch, keys |
+| 2. Boot-partition image (shim + XNU + MIUI kernel, boot menu, charger mode) | done, flashed |
+| 3. userdata split into `iosdata` + `userdata` | done: iosdata 25 GiB, MIUI 26.6 GiB without FBE |
+| 4. iOS root, lock screen, home screen, touch | lock screen and unlock (CPU rendering) |
+| 5. GPU (Adreno 640), Metal/GLES, frame pacing | in progress |
 | 6. USB networking, cpufreq, battery, Wi-Fi, camera, ... | planned |
 
 Details, hardware facts and the handoff log: [NOTES.md](NOTES.md).
