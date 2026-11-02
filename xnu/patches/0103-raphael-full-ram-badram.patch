@@ -1,22 +1,24 @@
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 00568d3..6577fe1 100644
+index 00568d3..3ce098c 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -2569,6 +2569,13 @@ static unsigned int avail_page_count = 0;
+@@ -2569,6 +2569,15 @@ static unsigned int avail_page_count = 0;
  static bool need_ram_ranges_init = true;
  
  
 +/*
 + * SWEET/raphael: physical RAM the VM must never hand out, from the ADT's /chosen "sweet-badram"
 + * property (u64 pa, u64 size; tools/mkadt.py). The Mi 9T Pro has weak DRAM cells in
-+ * 0x1016aa000-0x1016bdfff, inside the one contiguous range XNU manages.
++ * 0x1016aa000-0x1016bdfff, inside the one contiguous range XNU manages. The pages stay in
++ * vm_pages[] (arm64 computes a page's address from its index there, so it cannot have holes);
++ * vm_resident.c marks them retired (vmp_error) instead of releasing them.
 + */
 +static pmap_paddr_t sweet_badram_lo, sweet_badram_hi;
 +
  /**
   * Checks to see if a given page is in
   * the array of known bad pages
-@@ -2576,9 +2583,11 @@ static bool need_ram_ranges_init = true;
+@@ -2576,9 +2585,11 @@ static bool need_ram_ranges_init = true;
   * @param ppn page number to check
   */
  bool
@@ -30,14 +32,14 @@ index 00568d3..6577fe1 100644
  }
  
  /**
-@@ -2594,12 +2603,37 @@ initialize_ram_ranges(void)
- {
+@@ -2595,11 +2606,33 @@ initialize_ram_ranges(void)
  	pmap_paddr_t first = first_avail;
  	pmap_paddr_t end = avail_end;
+ 
 +	DTEntry chosen;
 +	void const *prop;
 +	unsigned int prop_size;
- 
++
  	assert(first <= end);
  	assert(first == (first & ~PAGE_MASK));
  	assert(end == (end & ~PAGE_MASK));
@@ -56,30 +58,30 @@ index 00568d3..6577fe1 100644
 +			panic("SWEET: early boot allocations reached the bad RAM at 0x%llx (first_avail 0x%llx)",
 +			    (unsigned long long)sweet_badram_lo, (unsigned long long)first);
 +		}
-+		if (sweet_badram_lo < end && sweet_badram_hi > first) {
-+			pmap_paddr_t lo = MAX(sweet_badram_lo, first), hi = MIN(sweet_badram_hi, end);
-+
-+			avail_page_count -= atop(hi - lo);
-+		}
-+		printf("SWEET RAM: keeping 0x%llx-0x%llx out of the VM (%u pages free)\n",
-+		    (unsigned long long)sweet_badram_lo, (unsigned long long)sweet_badram_hi, avail_page_count);
++		printf("SWEET RAM: retiring 0x%llx-0x%llx (managed 0x%llx-0x%llx)\n",
++		    (unsigned long long)sweet_badram_lo, (unsigned long long)sweet_badram_hi,
++		    (unsigned long long)first, (unsigned long long)end);
 +	}
 +
  	need_ram_ranges_init = false;
  }
  
-@@ -2642,6 +2676,10 @@ pmap_next_page(
- 	}
- 
- 
-+	if (first_avail >= sweet_badram_lo && first_avail < sweet_badram_hi) {
-+		first_avail = MIN(sweet_badram_hi, avail_end);
-+	}
+@@ -2629,7 +2662,13 @@ pmap_next_page_hi(
+ 	ppnum_t            * pnum,
+ 	__unused boolean_t might_free)
+ {
+-	return pmap_next_page(pnum);
++	boolean_t ok = pmap_next_page(pnum);
 +
- 	if (first_avail != avail_end) {
- 		*pnum = (ppnum_t)atop(first_avail);
- 		first_avail += PAGE_SIZE;
-@@ -6881,7 +6919,7 @@ void
++	/* pmap_steal_memory: these pages are never vm_pages, so they could not be retired */
++	if (ok && pmap_is_bad_ram(*pnum)) {
++		panic("SWEET: pmap_steal_memory reached the bad RAM (page 0x%x)", *pnum);
++	}
++	return ok;
+ }
+ 
+ 
+@@ -6881,7 +6920,7 @@ void
  pmap_sync_page_attributes_phys(
  	ppnum_t pp)
  {
@@ -88,3 +90,54 @@ index 00568d3..6577fe1 100644
  }
  
  #if CONFIG_COREDUMP
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 6394730..aff4dd1 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -655,6 +655,8 @@ ppnum_t delay_above_pnum = PPNUM_MAX;
+  */
+ #define VM_DELAY_PAGE_CHUNK ((1024 * 1024 * 1024) / PAGE_SIZE)
+ 
++static unsigned int sweet_retired_pages;        /* SWEET: pmap_is_bad_ram pages kept out of the free lists */
++
+ /*
+  * Get and initialize the next delayed page.
+  */
+@@ -694,6 +696,14 @@ vm_get_delayed_page(int grab_options)
+ 	vm_page_init(p, pnum, FALSE);
+ 	++vm_pages_count;
+ 	++vm_page_pages;
++	if (pmap_is_bad_ram(pnum)) {
++		/* SWEET: retired, stays counted as wired; hand out the next page instead */
++		p->vmp_error = TRUE;
++		++sweet_retired_pages;
++		vm_free_page_unlock();
++		printf("SWEET RAM: retired page 0x%x (%u)\n", pnum, sweet_retired_pages);
++		return vm_get_delayed_page(grab_options);
++	}
+ 	vm_free_page_unlock();
+ 
+ 	/*
+@@ -1567,14 +1577,21 @@ pmap_startup(
+ #endif
+ 		++vm_pages_count;
+ 		vm_page_init(&vm_pages[i], phys_page, FALSE);
++		if (pmap_is_bad_ram(phys_page)) {
++			vm_pages[i].vmp_error = TRUE;   /* SWEET: retired, never released (stays wired) */
++			++sweet_retired_pages;
++		}
+ 		if (fill) {
+ 			fillPage(phys_page, fillval);
+ 		}
+-		if (vm_himemory_mode) {
++		if (vm_himemory_mode && !VMP_ERROR_GET(&vm_pages[i])) {
+ 			vm_page_release_startup(&vm_pages[i]);
+ 		}
+ 	}
+ 	vm_page_pages = vm_pages_count; /* used to report to user space */
++	if (sweet_retired_pages) {
++		printf("SWEET RAM: %u bad pages retired at startup\n", sweet_retired_pages);
++	}
+ 
+ 	if (!vm_himemory_mode) {
+ 		do {
