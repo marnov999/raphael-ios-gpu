@@ -195,3 +195,33 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   /proc/cmdline, badram hole present; Boot iOS (vol-up, power) -> XNU console + mount-root loop as t1.
   All three menu paths verified. Next: flash t3 to `boot` (user's OK pending); then test off-mode charging.
 
+### 2026-11-02 (step 2 flashed, step 3 done: userdata split, MIUI unencrypted)
+- **14:14 t3 flashed to `boot`** (sha256 f6fd80d8...); boots the menu -> MIUI by countdown. Rollback:
+  `fastboot flash boot backup/boot-current-20261102.img` (= kbuild/raphael_magisk_boot_legacysar.img).
+- Old userdata: ext4, **FBE** (`fileencryption=ice,wrappedkey`, TrustZone-wrapped keys), 51 GB, 45 GB used of
+  which 39 GB /data/local/tmp/cp2077 (deleted on the user's word). Raw image impossible (PC 27 GB free, and
+  only restorable to this phone). File backup (root tar over adb, 5.3 GB, SHA256SUMS):
+  `/home/marnov/xmiphones/raphael_backup/userdata-files-20261102/` = magisk (/data/adb), adbkeys
+  (misc/adb), linux (chroot 2.7 GB), localtmp, media (/data/media/0), system, net (wifi WifiConfigStore,
+  bluedroid), apps (/data/app), appdata (data + user_de), packages-3rdparty.txt, getprop, cmdline.
+- **MIUI without FBE** (tools/miui-overlay.py): Magisk overlay.d in the chain-loaded ramdisk carries a copy
+  of /vendor/etc/fstab.qcom whose /data line drops fileencryption/wrappedkey/inlinecrypt and adds
+  formattable, and an rc `on late-fs: mount_all ${MAGISKTMP}/fstab.qcom --late`. Magisk merges it into
+  init.rc, whose late-fs actions run before vendor's init.target.rc: ours mounts /data, vendor's
+  `mount_all /vendor/etc/fstab.qcom --late` then fails with "queue_fs_event() failed: Invalid code: -1"
+  (harmless). Dead ends, both on the encrypted data with an unchanged fstab: init `mount ... bind` over
+  the vendor file = avc denied mounton (vendor_configs_file); `exec u:r:magisk:s0 -- mount -o bind` in
+  early-fs or on init = MIUI recovery `--prompt_and_wipe_data --reason=enablefilecrypto_failed` (user
+  picked Reboot to System; data intact). Verified the mount_all variant with the FBE fstab first.
+  /vendor is dm-verity (dm-0): editing the real file is not an option.
+- **GPT split** (tools/gpt-split.py, from the live sectors; phone GPT == Sept EDL dump): #31 iosdata
+  507904-7061503 (25 GiB, new GUID), #32 userdata 7061504-14026746 (26.57 GiB, old GUID); 32-entry table,
+  slot 32 was free. Written from rooted MIUI. toybox dd: `conv=fsync` unknown and without `notrunc` it
+  ftruncates -> the tail write failed before copying (rewritten with conv=notrunc, both halves read back
+  OK). Undo = original sectors in backup/gpt-lun0-20261102/lun0-{head,tail}.bin. ABL getvar after reboot:
+  iosdata 0x640000000, userdata 0x6A47FB000.
+- **t4 flashed** (sha256 1087e860..., MIUI=backup/miui-unenc, ROOT=iosdata, DEFAULT=miui) and
+  `fastboot format:ext4 userdata` (needed chmod +x platform-tools/mke2fs). 14:59 reboot into MIUI's
+  first boot. Next: user does setup + USB debugging; verify ro.crypto.state=unencrypted; restore
+  magisk/adb keys/wifi/chroot/tmp from the backup; then step 4 (iOS root into iosdata).
+
