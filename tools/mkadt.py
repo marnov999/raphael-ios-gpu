@@ -41,13 +41,14 @@ RAPHAEL_PHYS_BASE = 0x110000000
 RAPHAEL_MEM_SIZE = HIGH_PHYS_BASE + HIGH_MEM_SIZE - RAPHAEL_PHYS_BASE
 BADRAM_START, BADRAM_END = 0x1016a0000, 0x1016c0000
 assert RAPHAEL_PHYS_BASE >= BADRAM_END
-# --raphael --fullram: all RAM above the fixed carve-outs (the last one, ramdump_fb, ends at 0xb0000000;
-# the dynamic pools in the SoC tree are Linux's), the bad cells inside it kept out by the kernel
-# (xnu patch 0103 reads /chosen sweet-badram). Needs a kernel with 0103: an older one would use them.
-# The top is the K20 Pro port's live memory node (0x1fcc00000); MIUI on this phone maps RAM up to
-# 0x1ffffffff, to be checked against this phone's own memory node.
-FULLRAM_PHYS_BASE = 0xb0000000
-FULLRAM_MEM_SIZE = 0x1fcc00000 - FULLRAM_PHYS_BASE
+# --raphael --fullram: the largest contiguous RAM this phone's ABL reports, the bad cells inside it
+# kept out by the kernel (xnu patch 0103 reads /chosen sweet-badram; an older kernel would use them).
+# The live /memory node (read from MIUI 2026-11-02): <0x80000000 0x3cc00000> <0xc0000000 0x80000000>
+# <0x140000000 0xc0000000>, i.e. RAM 0x80000000-0xbcc00000 and 0xc0000000-0x200000000: unlike davinci
+# (top 52 MB kept by the firmware) raphael's firmware keeps 0xbcc00000-0xc0000000. davinci's window
+# 0xb0000000-0x1fcc00000 crossed that hole and stalled the UFS (t7, t9).
+FULLRAM_PHYS_BASE = 0xc0000000
+FULLRAM_MEM_SIZE = 0x200000000 - FULLRAM_PHYS_BASE
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
