@@ -306,3 +306,10 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   consumed; SET_SECURE_MODE 0 consumed; CP_MEM_WRITE 0x600dc0de + CACHE_FLUSH_TS 0x12345678 read back.
   GPU VAs: ring 0x01000000 (0x8000), SQE 0x01100000, scratch 0x01200000; RB_CNTL 0x800020c (no rptr shadow, poll
   CP_RB_RPTR). Next: shader tests (compute store, triangle) on this ring, then port davinci's KGSL/DRM UAPI.
+- **g5 (0110, commit 1f2a737, CI 41530678205; sweetgpu=8) 22:50: SHADERS RUN, FIRST TRIANGLE, lock screen.**
+  out/logs/g5-kernel.log: compute stg 0xdeadbeef + TS 0xc0de; triangle centre 0xff0000ff, corner 0xff400000,
+  181/1024 samples red, TS 0xd3ad/0xd3ae. a640 values that matter: Mesa magic_regs GPUId(640), RB_CCU_CNTL
+  0x10000000 (sysmem, 2 CCUs). Test VAs: shaders 0x01300000, VBO 0x01400000, target 0x02000000.
+- Next (layer 4): port davinci's /dev/kgsl-3d0 + MSM-DRM UAPI (davinci sweet_gpu.c ~2979-5350: ring/fence,
+  gpumem alloc/mmap, GPU_COMMAND/GEM_SUBMIT, iOS surface import, present) onto this ring/context-0 tables; then
+  the userland stack (Mesa freedreno, libredwood-gl FD_MESA_GMEM 1 MB, SweetGLES/RedwoodMetal, root overlay).
