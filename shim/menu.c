@@ -1,8 +1,9 @@
 /*
  * Boot menu, at every power-on that is not a charger's: "Boot iOS / Boot MIUI / Power off" on a black
  * screen. Volume up and down move (and stop the countdown), power picks; with no key for 10 s the
- * phone boots iOS. A power key still held from switching the phone on counts only once let go. Keys
- * over SPMI as bsd/dev/sweet_keys.c reads them. Without readable keys: iOS at once.
+ * phone boots the default (iOS, or MIUI while there is no iOS root: shim.c). A power key still held
+ * from switching the phone on counts only once let go. Keys over SPMI as bsd/dev/sweet_keys.c reads
+ * them. Without readable keys: the default at once.
  */
 #include "menu.h"
 #include "console.h"
@@ -33,25 +34,32 @@ static void item(int i, int sel, int have_miui)
 		con_text(ITEM_X, y + 84, "needs its own data partition", 2, DIM, BLACK);
 }
 
-static void footer(int left_s)
+static void footer(int left_s, int def)
 {
 	char line[40] = "vol: move   power: select";
 	con_rect(0, 1600, FB_W, 120, BLACK);
 	con_text(ITEM_X, 1620, line, 3, GREY, BLACK);
 	if (left_s > 0) {
 		char c[24] = "iOS in 0 s";
-		c[7] = (char)('0' + left_s);
+		if (def == BOOT_MIUI) {
+			char m[24] = "MIUI in 0 s";
+			for (int i = 0; i < 24; i++)
+				c[i] = m[i];
+		}
+		c[def == BOOT_MIUI ? 8 : 7] = (char)('0' + left_s);
 		con_text(ITEM_X, 1680, c, 3, GREY, BLACK);
 	}
 }
 
-enum boot_choice boot_menu(int have_miui)
+enum boot_choice boot_menu(int have_miui, enum boot_choice def)
 {
 	int pon = spmi_apid(PPID_PON), volup = spmi_apid(PPID_VOLUP);
 	uint8_t p, g = 1;
+	if (def == BOOT_MIUI && !have_miui)
+		def = BOOT_IOS;
 	if (spmi_rd(pon, PMIC_RT_STS, &p) != 0)
-		return BOOT_IOS;
-	int sel = BOOT_IOS, waited = 0, counting = 1, last_s = -1;
+		return def;
+	int sel = def, waited = 0, counting = 1, last_s = -1;
 	int pw_was = 1, dn_was = 1, up_was = 1;		/* a key down at the start counts once let go */
 	con_clear(BLACK);
 	for (int i = 0; i < 3; i++)
@@ -59,7 +67,7 @@ enum boot_choice boot_menu(int have_miui)
 	for (;;) {
 		int s = counting ? (TIMEOUT_MS - waited + 999) / 1000 : 0;
 		if (s != last_s) {
-			footer(s);
+			footer(s, def);
 			last_s = s;
 		}
 		sleep_ms(TICK_MS);
@@ -87,7 +95,7 @@ enum boot_choice boot_menu(int have_miui)
 		up_was = up;
 		if (counting && (waited += TICK_MS) >= TIMEOUT_MS) {
 			con_clear(BLACK);
-			return BOOT_IOS;
+			return def;
 		}
 	}
 }

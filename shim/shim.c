@@ -523,10 +523,13 @@ void shim_main(uint64_t dtb)
 	stage_diag_mark(1);
 
 	/* A charger woke the phone: MIUI's own charger mode. Otherwise the boot menu (iOS / MIUI /
-	 * power off; iOS after 10 s), with MIUI only when the image carries its kernel (tools/mkcombo.py). */
+	 * power off), with MIUI only when the image carries its kernel (tools/mkcombo.py). The countdown
+	 * boots iOS, or MIUI when the image's cmdline says "sweetdefault=miui" (while there is no iOS root;
+	 * linux.c keeps sweet* words out of MIUI's command line). */
 	stage = "menu";
 	charge_mode(dtb);
-	switch (boot_menu(linux_present(dtb))) {
+	enum boot_choice def = fdt_chosen_has(dtb, "bootargs", "sweetdefault=miui") ? BOOT_MIUI : BOOT_IOS;
+	switch (boot_menu(linux_present(dtb), def)) {
 	case BOOT_OFF:
 		spmi_power_off();
 	case BOOT_MIUI: {

@@ -184,4 +184,10 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - Image: out/raphael-ios-t2.img (61 MB = shim + XNU payload + MIUI kernel/ramdisk/cmdline), CONSOLE=1,
   ufsroot=rawdump. To test with fastboot boot: menu; Boot MIUI (expect rooted MIUI, iomem hole
   1016a0000-1016bffff); Boot iOS (as t1); Power off.
+- **13:56-13:57 t2 on the phone:** menu shown; Power off works; Boot MIUI works: MIUI ready 25 s after
+  `fastboot boot`, rooted (magisk), cmdline = the normal boot's 76 words + sweet.t0/tc/hz,
+  /proc/iomem System RAM `c0000000-10169ffff` + `1016c0000-1ffffffff` (hole = badram), node
+  /proc/device-tree/reserved-memory/badram@1016a0000, MemTotal 5633752 kB (= boot-resv.img's).
+- Menu default: `sweetdefault=miui` in the boot image's cmdline (DEFAULT=miui tools/mkiosimg.sh) makes the
+  countdown boot MIUI: the image to flash while iOS has no root. t3 = t2 + that.
 
