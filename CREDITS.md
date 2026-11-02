@@ -10,6 +10,11 @@ which is under the **Apple Public Source License 2.0**; the patched files stay u
   raphael parts of `tools/mkadt.py`.
 - **davinci-ios-gpu** (<https://github.com/marnov999/davinci-ios-gpu>): `tools/mkcombo.py`,
   `tools/sweet-root-overlay.py`, `shim/build-clang.sh`.
+- **HeliumStudio's HakiOS raphael port** (<https://github.com/HeliumStudio-Dev/hackios-xnu-kernel>,
+  APSL 2.0 for its XNU files): the Adreno 640 bring-up order and values `bsd/dev/sweet_gpu.c` follows from
+  stage 6 on (GMU memory blocks, PDC/RSCC sequencer words, HFI v2 messages, the GPU SMMU entries). The driver
+  itself is davinci-ios-gpu's, adapted; no file is copied from it.
+- **davinci-ios-gpu's GPU driver** (`bsd/dev/sweet_gpu.c` there): structure, cmd-db reading and RPMh votes.
 - **XNU** (Apple, APSL 2.0): xnu-8796.141.3, built with
   **blacktop/darwin-xnu-build** (<https://github.com/blacktop/darwin-xnu-build>, MIT).
 - **AOSP mkbootimg** (`tools/mkbootimg.py`, Apache 2.0).

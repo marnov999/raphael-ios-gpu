@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the XNU kernel needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); MMIO addresses
-come from the target device's live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--raphael] [--fullram [--base=PA]]
+come from the target device's live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--raphael] [--fullram [--base=PA]] [--fw=DIR]
 
 --raphael: Xiaomi Redmi K20 Pro (SM8150 / Snapdragon 855). Same Qualcomm
 platform family as the generic driver set (Kryo 400 series CPUs, ARMv8.2
@@ -104,7 +104,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullram=False, fullram_base=None):
+def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullram=False, fullram_base=None, fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     raphael=True: Redmi K20 Pro panel geometry and Kryo 485 clocks.
     cpus=N: /cpus child node count (default 8). N=1 replicates the t2 swap-test
@@ -280,7 +280,18 @@ def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullra
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]) + fw_node(fw))
+
+
+# --fw=DIR: the GPU firmware (from the phone's vendor partition; never in git) as properties of
+# /sweet-fw, read by bsd/dev/sweet_gpu.c (xnu patch 0106).
+FW_FILES = ('a640_gmu.bin', 'a630_sqe.fw', 'a640_zap.mdt', 'a640_zap.b02')
+
+
+def fw_node(fw):
+    if not fw:
+        return []
+    return [node('sweet-fw', [(f, open(os.path.join(fw, f), 'rb').read()) for f in FW_FILES])]
 
 
 if __name__ == '__main__':
@@ -290,7 +301,8 @@ if __name__ == '__main__':
             cpus_arg = int(a.split('=', 1)[1])
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, fullram='--fullram' in sys.argv,
                  fullram_base=next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--base=')), None),
-                 raphael='--raphael' in sys.argv, cpus=cpus_arg)
+                 raphael='--raphael' in sys.argv, cpus=cpus_arg,
+                 fw=next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--fw=')), None))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
