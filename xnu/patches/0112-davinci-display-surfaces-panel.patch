@@ -102,10 +102,10 @@ index 0000000..9c5c803
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_panel.c b/bsd/dev/sweet_panel.c
 new file mode 100644
-index 0000000..952ba84
+index 0000000..6e9fa25
 --- /dev/null
 +++ b/bsd/dev/sweet_panel.c
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,232 @@
 +/*
 + * SWEET panel hooks for raphael (Mi 9T Pro / Redmi K20 Pro, SM8150): the Samsung EA8076 AMOLED in command
 + * mode, which the boot loader leaves lit and refreshing itself from its framebuffer. What davinci's
@@ -130,7 +130,13 @@ index 0000000..952ba84
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
-+#define DSI0_PA                 0x0ae94000u
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO              0x7u            /* arm/memory_types.h: COHERENT | NOT_CACHEABLE | GUARDED */
++#endif
++#define ml_io_map(pa, size)     ml_io_map_unmappable((vm_offset_t)(pa), (vm_size_t)(size), VM_WIMG_IO)
++
++#define DSI0_PA                0x0ae94000u
 +#define DSI1_PA                 0x0ae96000u
 +#define DSI_LEN                 0x400u
 +#define DSI_CMD_DMA_CTRL        0x03cu
