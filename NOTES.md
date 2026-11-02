@@ -313,3 +313,13 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - Next (layer 4): port davinci's /dev/kgsl-3d0 + MSM-DRM UAPI (davinci sweet_gpu.c ~2979-5350: ring/fence,
   gpumem alloc/mmap, GPU_COMMAND/GEM_SUBMIT, iOS surface import, present) onto this ring/context-0 tables; then
   the userland stack (Mesa freedreno, libredwood-gl FD_MESA_GMEM 1 MB, SweetGLES/RedwoodMetal, root overlay).
+- **0111-0113 (commit a156ff7): davinci's kernel stack ported** (3-way: ios-sweet 0081 base built in
+  scratchpad m3/O, davinci = devtools/work/replay @0195, raphael = CI tree + 0105-0110).
+  0111 generic davinci deltas as-is (sched big cores SWEET_BIG_CPU=4 on SM8150, kmsg sig off, IOKit root,
+  profiler, AMFI dyld/extension policy, sweettrace). 0112 davinci SweetSurface/SweetFramebuffer/SweetBacklight/
+  sweet_dpu + SweetHID scaled touch (raphael 2340 rows) + new sweet_panel.c (raphael panel hooks over the DSI
+  TPG FIFO; NOTE Gsjsjzhznsz's brightness packet lacked the 0x51 byte, ours sends 0x51 hi lo) + fbcon globals.
+  0113 davinci KGSL/DRM front-ends (sliced from davinci sweet_gpu.c by scratchpad port_kgsl.py) on the A640
+  ring: sweetgpu=9 publishes ring (now contiguous + NC view) + result page (GPU VA 0x01800000) + buffers at
+  4..8 GB; chip 0x06040001, gpu_id 640, GMEM 1 MB, hbb 15; speed = HFI GX_BW_PERF_VOTE. Not ported (davinci
+  hardware): camera, qg battery, Wi-Fi, cpufreq/dvfs, PMIC fastboot reboot, davinci panel DSI driver.
