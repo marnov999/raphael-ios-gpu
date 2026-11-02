@@ -190,4 +190,8 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   /proc/device-tree/reserved-memory/badram@1016a0000, MemTotal 5633752 kB (= boot-resv.img's).
 - Menu default: `sweetdefault=miui` in the boot image's cmdline (DEFAULT=miui tools/mkiosimg.sh) makes the
   countdown boot MIUI: the image to flash while iOS has no root. t3 = t2 + that.
+- **14:01-14:03 t3 on the phone (sha256 f6fd80d8...):** countdown with no key -> MIUI by itself (shim
+  ~11.1 s from entry to hand-off = 10 s countdown + copy), `sweetdefault=miui` absent from MIUI's
+  /proc/cmdline, badram hole present; Boot iOS (vol-up, power) -> XNU console + mount-root loop as t1.
+  All three menu paths verified. Next: flash t3 to `boot` (user's OK pending); then test off-mode charging.
 
