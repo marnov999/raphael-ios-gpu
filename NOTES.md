@@ -299,3 +299,10 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   PHY): USB live log on raphael is OPEN, do not use sweetusb=2 until fixed.
 - Next: layer 3 = GPU SMMU context 0 (stream 0 mask 0x400 per dt, ACTLR 0x303), ringbuffer, SQE (a630_sqe.fw), CP init
   with A640 UBWC values, zap via PAS (a640_zap.mdt + .b02 in /sweet-fw), self tests.
+- **g4 (0109, commit 81f25f8, CI 41527020707; sweetgpu=7 sweetgpu_delay=5) 22:26: COMMAND PROCESSOR WORKS, lock screen.**
+  out/logs/g4-kernel.log: stream 0 mask 0x401 -> context 0 (smr 0x84010000, our 3-level tables, HUPCF); zap:
+  PAS_INIT_IMAGE(mdt as shipped) 0/0, MEM_SETUP(0x98f15000, 0x1000) 0/0, AUTH_AND_RESET 0/0 (dt
+  pil_gpu_region@98f15000; no PAS_SHUTDOWN first); hw_init a640 values; SQE start clean (sgfsr 0); ME_INIT (8 words)
+  consumed; SET_SECURE_MODE 0 consumed; CP_MEM_WRITE 0x600dc0de + CACHE_FLUSH_TS 0x12345678 read back.
+  GPU VAs: ring 0x01000000 (0x8000), SQE 0x01100000, scratch 0x01200000; RB_CNTL 0x800020c (no rptr shadow, poll
+  CP_RB_RPTR). Next: shader tests (compute store, triangle) on this ring, then port davinci's KGSL/DRM UAPI.
