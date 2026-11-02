@@ -224,4 +224,16 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   `fastboot format:ext4 userdata` (needed chmod +x platform-tools/mke2fs). 14:59 reboot into MIUI's
   first boot. Next: user does setup + USB debugging; verify ro.crypto.state=unencrypted; restore
   magisk/adb keys/wifi/chroot/tmp from the backup; then step 4 (iOS root into iosdata).
+- **15:05-15:20 MIUI fresh, unencrypted, restored.** `ro.crypto.state=unsupported`, /data = sda32 26 GB ext4
+  without inlinecrypt. Root: magiskd (ramdisk) installs the stub app; it fetched the full Magisk 30.7 app
+  over Wi-Fi, "additional setup" + reboot from the app -> `su` = /product/bin/su (before that only
+  /debug_ramdisk/su, prompt timed out once); shell granted on the phone.
+  Restored (exec-in `su -c 'tar -xf - -C /data'`, then restorecon): /data/linux (2.7 GB), /data/local/tmp,
+  /data/media/0. Not restored on purpose: magisk.db (policies keyed by old app UIDs; old modules dir was
+  empty), system settings, app data. adb_keys: old = the same single key. Wi-Fi: old store had one network
+  ("wifi", wpa2) -> `cmd wifi add-network` next to the new TP-Link_02E4_5G (no file replace).
+  /data/lxc.sh was NOT in the backup (lived in /data itself): recreated (bind /dev, /dev/pts, proc, sysfs,
+  resolv.conf, chroot bash -l); tested: Ubuntu 24.04.5, /dev/kgsl-3d0 visible, DNS ok.
+- Open: off-mode charging through the flashed image (power off, plug charger); 6 third-party apps
+  (packages-3rdparty.txt, APKs in apps.tar) if wanted. Next: step 4, the iOS root into iosdata.
 
