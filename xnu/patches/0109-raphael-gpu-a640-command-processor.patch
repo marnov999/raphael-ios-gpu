@@ -1,0 +1,498 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 80d9ab5..5209de9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -16,6 +16,8 @@
+  *      Each step is logged and the log put on the flash (sweet_log_sync) before it runs, so a step that
+  *      resets the phone is the last one in the log. sweetgpu_stop=N stops before step N;
+  *      sweetgpu_delay=S waits S seconds first (for the USB log to come up).
++ *   7  + the command processor (gpu_core_start): the core's memory in SMMU context 0, the zap shader,
++ *      a6xx_hw_init's registers for the a640, the SQE started, ME_INIT, out of secure mode, CP_MEM_WRITE.
+  *
+  * Firmware is not in this repository: tools/mkadt.py --fw DIR puts a640_gmu.bin, a630_sqe.fw and
+  * the a640_zap pieces (from the phone's own vendor partition) into the ADT's /sweet-fw node of the
+@@ -537,11 +539,11 @@ gmu_table_of(uint64_t entry)
+ 	return NULL;
+ }
+ 
+-/* One 4K page of the GMU's address `va` -> physical `pa`. */
++/* One 4K page at `va` of the address space with tables `root` -> physical `pa`. */
+ static bool
+-gmu_map(uint32_t va, uint64_t pa)
++space_map(uint64_t *root, uint32_t va, uint64_t pa, uint64_t pte)
+ {
+-	uint64_t *t = g_gmu_l1, tpa;
++	uint64_t *t = root, tpa;
+ 	unsigned idx[2] = { (va >> 30) & 0x1ffu, (va >> 21) & 0x1ffu };
+ 	for (unsigned lvl = 0; lvl < 2; lvl++) {
+ 		uint64_t *next;
+@@ -555,7 +557,7 @@ gmu_map(uint32_t va, uint64_t pa)
+ 		}
+ 		t = next;
+ 	}
+-	t[(va >> 12) & 0x1ffu] = (pa & PTE_ADDRESS) | PTE_GMU | PTE_PAGE;
++	t[(va >> 12) & 0x1ffu] = (pa & PTE_ADDRESS) | pte | PTE_PAGE;
+ 	return true;
+ }
+ 
+@@ -568,34 +570,40 @@ static struct gmu_block g_gmu_blocks[12];
+ static unsigned g_gmu_nblocks;
+ static struct gmu_block *g_gmu_log, *g_gmu_hfi;
+ 
+-static struct gmu_block *
+-gmu_block_new(uint32_t address, uint32_t size)
++/* Zeroed kernel memory for `size` bytes at `address` of the space with tables `root`. */
++static bool
++block_fill(struct gmu_block *b, uint64_t *root, uint32_t address, uint32_t size, uint64_t pte)
+ {
+-	struct gmu_block *b;
+ 	vm_size_t asize = ((vm_size_t)size + PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
+-	if (g_gmu_nblocks == sizeof(g_gmu_blocks) / sizeof(g_gmu_blocks[0]) || (address & 0xfffu)) {
+-		return NULL;
+-	}
+-	b = &g_gmu_blocks[g_gmu_nblocks];
+-	if (kmem_alloc(kernel_map, &b->va, asize, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		return NULL;
++	if ((address & 0xfffu) ||
++	    kmem_alloc(kernel_map, &b->va, asize, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
+ 	}
+ 	gpu_to_memory(b->va, asize);
+ 	for (uint32_t off = 0; off < size; off += 0x1000u) {
+ 		uint64_t pa = gpu_kvtophys(b->va + off);
+-		if (!pa || !gmu_map(address + off, pa)) {
+-			return NULL;
++		if (!pa || !space_map(root, address + off, pa, pte)) {
++			return false;
+ 		}
+ 	}
+ 	b->address = address;
+ 	b->size = size;
+-	g_gmu_nblocks++;
+-	return b;
++	return true;
++}
++
++static struct gmu_block *
++gmu_block_new(uint32_t address, uint32_t size)
++{
++	if (g_gmu_nblocks == sizeof(g_gmu_blocks) / sizeof(g_gmu_blocks[0]) ||
++	    !block_fill(&g_gmu_blocks[g_gmu_nblocks], g_gmu_l1, address, size, PTE_GMU)) {
++		return NULL;
++	}
++	return &g_gmu_blocks[g_gmu_nblocks++];
+ }
+ 
+ /* Give a context the tables and send a stream through it (entry `match`); every global write read back. */
+ static bool
+-smmu_context_on(uint32_t ctx, uint32_t match, uint32_t stream, uint32_t mask, uint64_t root_pa)
++smmu_context_on(uint32_t ctx, uint32_t match, uint32_t stream, uint32_t mask, uint64_t root_pa, uint32_t sctlr_more)
+ {
+ 	uint32_t cb = SMMU_CB(ctx), smr = SMMU_SMR_VALID | mask << 16 | stream;
+ 	uint64_t root = root_pa | (uint64_t)ctx << 48;           /* tagged with the context's number (ASID) */
+@@ -622,7 +630,7 @@ smmu_context_on(uint32_t ctx, uint32_t match, uint32_t stream, uint32_t mask, ui
+ 	for (polls = 0; polls < 1000u && (gpu_rd(g_smmu, cb + SMMU_CB_TLBSTATUS) & 1u); polls++) {
+ 		delay_for_interval(1, NSEC_PER_USEC);
+ 	}
+-	gpu_wr(g_smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON);
++	gpu_wr(g_smmu, cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON | sctlr_more);
+ 	gpu_wr(g_smmu, SMMU_S2CR(match), ctx);
+ 	gpu_wr(g_smmu, SMMU_SMR(match), smr);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -717,7 +725,7 @@ gmu_space_up(const uint8_t *fw, uint32_t fwlen)
+ 	if (!gmu_step(3, "SMMU context 1 and stream 5 (writes through the hypervisor)")) {
+ 		return false;
+ 	}
+-	return smmu_context_on(GMU_CONTEXT, GMU_MATCH, GMU_STREAM, 0x400u, g_gmu_l1_pa);
++	return smmu_context_on(GMU_CONTEXT, GMU_MATCH, GMU_STREAM, 0x400u, g_gmu_l1_pa, 0);
+ }
+ 
+ /* TCM blocks through the GMU's registers (written, then read back), the rest into its memory. */
+@@ -1170,6 +1178,374 @@ gpu_gmu_boot(void)
+ 	return 0;
+ }
+ 
++/* ============================== stage 7: the 3D core's command processor ============================== */
++/*
++ * The 3D core takes orders as words in a ring of memory, read by its command processor ("SQE", with
++ * microcode of its own: a630_sqe.fw, the same file as davinci's) up to where CP_RB_WPTR says. It reaches
++ * memory through the SMMU as stream 0, sent here to context 0 with tables of ours. On SM8150 the device
++ * tree's entry for the GPU is stream 0 mask 0x401: it takes stream 1 too (the second command processor,
++ * which fetches its own microcode at once; HeliumStudio's raphael port: nothing for stream 1 = the
++ * phone resets the moment the processor starts). Then the zap shader (TrustZone), the registers Linux
++ * writes in a6xx_hw_init for the a640, the processor started, ME_INIT, out of secure mode, and a word
++ * written to our memory on command.
++ */
++#define CORE_CONTEXT              0u
++#define CORE_MATCH                0u
++#define CORE_STREAM               0u
++#define CORE_STREAM_MASK          0x401u
++#define PTE_CORE                  (PTE_GMU | 1ull << 6)          /* the core's requests are unprivileged */
++#define SMMU_SCTLR_HUPCF          (1u << 8)                      /* serve the core's other requests after a fault */
++#define SMMU_SGFSR                0x48u
++#define CORE_RING_ADDRESS         0x01000000u
++#define CORE_RING_SIZE            0x8000u                        /* 8192 words, Linux's */
++#define CORE_SQE_ADDRESS          0x01100000u
++#define CORE_SCRATCH_ADDRESS      0x01200000u
++#define RING_WORDS                (CORE_RING_SIZE / 4u)
++#define RBBM_GBIF_CLIENT_QOS_CNTL GPU_W(0x0011)
++#define RBBM_GBIF_HALT            GPU_W(0x0016)
++#define RBBM_INTERFACE_HANG_INT   GPU_W(0x001f)
++#define RBBM_PERFCTR_CNTL         GPU_W(0x0500)
++#define RBBM_PERFCTR_BUSY_MASKED  GPU_W(0x050b)
++#define RBBM_NC_MODE_CNTL         GPU_W(0x0534)
++#define CP_RB_BASE                GPU_W(0x0800)
++#define CP_RB_CNTL                GPU_W(0x0802)
++#define CP_RB_RPTR                GPU_W(0x0806)
++#define CP_RB_WPTR                GPU_W(0x0807)
++#define CP_SQE_CNTL               GPU_W(0x0808)
++#define CP_HW_FAULT               GPU_W(0x0821)
++#define CP_INTERRUPT_STATUS       GPU_W(0x0823)
++#define CP_PROTECT_STATUS         GPU_W(0x0824)
++#define CP_SQE_INSTR_BASE         GPU_W(0x0830)
++#define CP_CHICKEN_DBG            GPU_W(0x0841)
++#define CP_ROQ_THRESHOLDS_1       GPU_W(0x08c1)
++#define CP_ROQ_THRESHOLDS_2       GPU_W(0x08c2)
++#define CP_MEM_POOL_SIZE          GPU_W(0x08c3)
++#define CP_AHB_CNTL               GPU_W(0x098d)
++#define UCHE_MODE_CNTL            GPU_W(0x0e01)
++#define UCHE_WRITE_RANGE_MAX      GPU_W(0x0e05)
++#define UCHE_WRITE_THRU_BASE      GPU_W(0x0e07)
++#define UCHE_TRAP_BASE            GPU_W(0x0e09)
++#define UCHE_GMEM_RANGE_MIN       GPU_W(0x0e0b)
++#define UCHE_GMEM_RANGE_MAX       GPU_W(0x0e0d)
++#define UCHE_CACHE_WAYS           GPU_W(0x0e17)
++#define UCHE_FILTER_CNTL          GPU_W(0x0e18)
++#define UCHE_CLIENT_PF            GPU_W(0x0e19)
++#define SP_NC_MODE_CNTL           GPU_W(0xae02)
++#define TPL1_NC_MODE_CNTL         GPU_W(0xb604)
++#define RB_DBG_ECO_CNTL           GPU_W(0x8e04)
++#define RB_NC_MODE_CNTL           GPU_W(0x8e08)
++#define PC_DBG_ECO_CNTL           GPU_W(0x9e00)
++#define SECVID_TSB_TRUSTED_BASE   GPU_W(0xf800)
++#define SECVID_TSB_TRUSTED_SIZE   GPU_W(0xf802)
++#define SECVID_TSB_CNTL           GPU_W(0xf803)
++#define GBIF_QSB_SIDE(n)          GPU_W(0x3c00 + 3 + (n))
++#define CP_RB_CNTL_VALUE          (12u | 2u << 8 | 1u << 27)      /* 2^12 pairs of words; no read position in memory */
++#define CP_WAIT_FOR_IDLE          0x26u
++#define CP_MEM_WRITE              0x3du
++#define CP_EVENT_WRITE            0x46u
++#define CP_ME_INIT                0x48u
++#define CP_SET_SECURE_MODE        0x66u
++#define EVENT_CACHE_FLUSH_TS      0x04u
++/* the zap shader: TrustZone's PAS calls (yielding SIP calls), its reserved memory (dt gpu zap region) */
++#define PAS_INIT_IMAGE            0x42000201ull
++#define PAS_MEM_SETUP             0x42000202ull
++#define PAS_AUTH_AND_RESET        0x42000205ull
++#define ZAP_MEMORY                0x98f15000ull
++#define ZAP_MEMORY_SIZE           0x2000u
++#define ZAP_SETUP_SIZE            0x1000u        /* Linux qcom_mdt_pas_init: its one segment's 4K span */
++
++static uint64_t *g_core_l1;
++static uint64_t g_core_l1_pa;
++static struct gmu_block g_ring, g_sqe, g_scratch;
++static uint32_t g_ring_at, g_ring_sent;
++
++/*
++ * A yielding SIP call: TrustZone may hand the CPU back mid-way (x0 = 1) with a token in x6 to resume
++ * with, or say it is busy (-12). x0 and x1 of the final answer are 0 when it went well.
++ */
++static uint64_t
++gpu_scm_pas(uint64_t fn, uint64_t arginfo, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t *x1_out)
++{
++	uint64_t cmd = fn, token = 0, r1 = 0;
++	for (unsigned resumed = 0, busy = 0; resumed < 200000u && busy < 20u;) {
++		register uint64_t x0 __asm__("x0") = cmd;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a2;
++		register uint64_t x3 __asm__("x3") = a3;
++		register uint64_t x4 __asm__("x4") = a4;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = token;
++		__asm__ volatile("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x6)
++		    : "r"(x4), "r"(x5)
++		    : "memory", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
++		r1 = x1;
++		token = x6;
++		if (x0 == 1ull) {
++			cmd = 1ull;
++			resumed++;
++			continue;
++		}
++		if ((int64_t)x0 == -12) {
++			delay_for_interval(30, NSEC_PER_MSEC);
++			cmd = fn;
++			token = 0;
++			busy++;
++			continue;
++		}
++		*x1_out = r1;
++		return x0;
++	}
++	*x1_out = r1;
++	return ~0ull;
++}
++
++static void
++ring_put(uint32_t word)
++{
++	((volatile uint32_t *)g_ring.va)[g_ring_at] = word;
++	g_ring_at = (g_ring_at + 1u) % RING_WORDS;
++}
++
++static uint32_t
++odd_parity(uint32_t v)
++{
++	return 0x9669u >> (0xfu & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28)) & 1u;
++}
++
++/* The header of a type-7 command with so many words after it. */
++static void
++ring_command(uint32_t op, uint32_t words)
++{
++	ring_put(7u << 28 | words | odd_parity(words) << 15 | op << 16 | odd_parity(op) << 23);
++}
++
++/* Out to memory what was written since the last time, the core told how far to read; wait until it has read
++ * it all and rests (2 s). */
++static bool
++ring_run(const char *what)
++{
++	uint32_t taken = ~0u, status = ~0u;
++	if (g_ring_at >= g_ring_sent) {
++		gpu_to_memory(g_ring.va + 4u * g_ring_sent, 4u * (g_ring_at - g_ring_sent));
++	} else {
++		gpu_to_memory(g_ring.va + 4u * g_ring_sent, 4u * (RING_WORDS - g_ring_sent));
++		gpu_to_memory(g_ring.va, 4u * g_ring_at);
++	}
++	g_ring_sent = g_ring_at;
++	gpu_wr(g_core, CP_RB_WPTR, g_ring_at);
++	for (int i = 0; i < 20000 && (taken != g_ring_at || (status & ~1u)); i++) {
++		delay_for_interval(100, NSEC_PER_USEC);
++		taken = gpu_rd(g_core, CP_RB_RPTR);
++		status = gpu_rd(g_core, RBBM_STATUS);
++	}
++	if (taken == g_ring_at && !(status & ~1u) && gpu_rd(g_core, CP_HW_FAULT) == 0 && !smmu_faulted(CORE_CONTEXT, what)) {
++		printf("SWEET GPU: [CP] the core has done it: %s (ring read up to %u, status %#x)\n", what, taken, status);
++		return true;
++	}
++	printf("SWEET GPU: [CP] the core does not get through %s: ring read up to %u of %u, status %#x, int0 %#x, cp fault %#x, "
++	    "cp int %#x, protect %#x\n", what, taken, g_ring_at, status, gpu_rd(g_core, RBBM_INT_0_STATUS),
++	    gpu_rd(g_core, CP_HW_FAULT), gpu_rd(g_core, CP_INTERRUPT_STATUS), gpu_rd(g_core, CP_PROTECT_STATUS));
++	(void)smmu_faulted(CORE_CONTEXT, what);
++	return false;
++}
++
++/* The zap shader: its header (.mdt) to TrustZone, its memory named, its one segment (.b02) put there, run. */
++static bool
++gpu_zap_load(void)
++{
++	const uint8_t *mdt, *seg;
++	uint32_t mdt_len = 0, seg_len = 0;
++	vm_offset_t header, zap;
++	uint64_t header_pa, x0, x1 = ~0ull;
++
++	if (!(mdt = gpu_fw("a640_zap.mdt", &mdt_len)) || !(seg = gpu_fw("a640_zap.b02", &seg_len)) ||
++	    mdt_len > PAGE_SIZE || seg_len > ZAP_SETUP_SIZE || (seg_len & 3u)) {
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &header, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    !(header_pa = gpu_kvtophys(header))) {
++		return false;
++	}
++	memcpy((void *)header, mdt, mdt_len);
++	gpu_to_memory(header, PAGE_SIZE);
++	x0 = gpu_scm_pas(PAS_INIT_IMAGE, 0x82u, QCOM_GPU_PAS_ID, header_pa, 0, &x1);
++	printf("SWEET GPU: [ZAP] PAS_INIT_IMAGE(header at %#llx, %u bytes) -> %#llx %#llx\n", (unsigned long long)header_pa,
++	    mdt_len, x0, x1);
++	if (x0 != 0 || x1 != 0) {
++		printf("SWEET GPU: [ZAP] taken to mean TrustZone keeps a zap shader from before: used as it is\n");
++		return true;
++	}
++	x0 = gpu_scm_pas(PAS_MEM_SETUP, 0x03u, QCOM_GPU_PAS_ID, ZAP_MEMORY, ZAP_SETUP_SIZE, &x1);
++	printf("SWEET GPU: [ZAP] PAS_MEM_SETUP(%#llx, %#x) -> %#llx %#llx\n", ZAP_MEMORY, ZAP_SETUP_SIZE, x0, x1);
++	if (x0 != 0 || x1 != 0) {
++		return false;
++	}
++	if (!(zap = ml_io_map(ZAP_MEMORY, ZAP_MEMORY_SIZE))) {
++		return false;
++	}
++	for (uint32_t off = 0; off < ZAP_SETUP_SIZE; off += 4u) {
++		uint32_t w = 0;
++		if (off < seg_len) {
++			memcpy(&w, seg + off, 4);
++		}
++		*(volatile uint32_t *)(zap + off) = w;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	x0 = gpu_scm_pas(PAS_AUTH_AND_RESET, 0x01u, QCOM_GPU_PAS_ID, 0, 0, &x1);
++	printf("SWEET GPU: [ZAP] PAS_AUTH_AND_RESET -> %#llx %#llx%s\n", x0, x1,
++	    x0 == 0 && x1 == 0 ? ": TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER" : "");
++	return x0 == 0 && x1 == 0;
++}
++
++/* Stage 7: the core's memory, the zap shader, its registers, its command processor, its first commands. */
++static int
++gpu_core_start(void)
++{
++	static const uint32_t address_modes[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0x0e00,
++		                                  0xae01, 0xb601, 0xf810 };
++	const uint8_t *sqe;
++	uint32_t sqe_len = 0;
++	volatile uint32_t *scratch;
++
++	if (!gmu_step(15, "the 3D core's memory (ring, microcode, scratch) in SMMU context 0, streams 0+1")) {
++		return -1;
++	}
++	if (!(sqe = gpu_fw("a630_sqe.fw", &sqe_len)) || sqe_len < 8u || sqe_len > 0x40000u ||
++	    !(g_core_l1 = gmu_table_new(&g_core_l1_pa)) ||
++	    !block_fill(&g_ring, g_core_l1, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
++	    !block_fill(&g_sqe, g_core_l1, CORE_SQE_ADDRESS, sqe_len - 4u, PTE_CORE) ||
++	    !block_fill(&g_scratch, g_core_l1, CORE_SCRATCH_ADDRESS, 0x1000u, PTE_CORE)) {
++		printf("SWEET GPU: [CP] no memory for the core\n");
++		return -1;
++	}
++	memcpy((void *)g_sqe.va, sqe + 4, sqe_len - 4u);         /* the file's first word is not microcode */
++	gpu_to_memory(g_sqe.va, sqe_len - 4u);
++	if (!smmu_context_on(CORE_CONTEXT, CORE_MATCH, CORE_STREAM, CORE_STREAM_MASK, g_core_l1_pa, SMMU_SCTLR_HUPCF)) {
++		return -1;
++	}
++
++	if (!gmu_step(16, "the zap shader (TrustZone)")) {
++		return -2;
++	}
++	if (!gpu_zap_load()) {
++		printf("SWEET GPU: [ZAP] no zap shader: the core would stay in secure mode\n");
++		return -2;
++	}
++
++	if (!gmu_step(17, "the core's registers (a6xx_hw_init for the a640)")) {
++		return -3;
++	}
++	gpu_wr(g_core, GBIF_HALT, 0);
++	gpu_wr(g_core, RBBM_GBIF_HALT, 0);
++	gpu_wr(g_core, SECVID_TSB_CNTL, 0);
++	gpu_wr(g_core, SECVID_TSB_TRUSTED_BASE, 0);
++	gpu_wr(g_core, SECVID_TSB_TRUSTED_BASE + 4u, 0);
++	gpu_wr(g_core, SECVID_TSB_TRUSTED_SIZE, 0);
++	for (unsigned i = 0; i < sizeof(address_modes) / sizeof(address_modes[0]); i++) {
++		gpu_wr(g_core, GPU_W(address_modes[i]), 1);         /* every block: 64-bit addresses */
++	}
++	for (unsigned i = 0; i < 4u; i++) {
++		gpu_wr(g_core, GBIF_QSB_SIDE(i), 0x00071620u);
++	}
++	gpu_wr(g_core, RBBM_GBIF_CLIENT_QOS_CNTL, 3);
++	gpu_wr(g_core, RBBM_PERFCTR_BUSY_MASKED, 0xffffffffu);
++	gpu_wr(g_core, UCHE_WRITE_RANGE_MAX, 0xffffffc0u);
++	gpu_wr(g_core, UCHE_WRITE_RANGE_MAX + 4u, 0x0001ffffu);
++	gpu_wr(g_core, UCHE_TRAP_BASE, 0xfffff000u);
++	gpu_wr(g_core, UCHE_TRAP_BASE + 4u, 0x0001ffffu);
++	gpu_wr(g_core, UCHE_WRITE_THRU_BASE, 0xfffff000u);
++	gpu_wr(g_core, UCHE_WRITE_THRU_BASE + 4u, 0x0001ffffu);
++	gpu_wr(g_core, UCHE_GMEM_RANGE_MIN, 0x00100000u);         /* GMEM 1 MiB */
++	gpu_wr(g_core, UCHE_GMEM_RANGE_MIN + 4u, 0);
++	gpu_wr(g_core, UCHE_GMEM_RANGE_MAX, 0x001fffffu);
++	gpu_wr(g_core, UCHE_GMEM_RANGE_MAX + 4u, 0);
++	gpu_wr(g_core, UCHE_FILTER_CNTL, 0x804);
++	gpu_wr(g_core, UCHE_CACHE_WAYS, 0x4);
++	gpu_wr(g_core, CP_ROQ_THRESHOLDS_2, 0x02000140u);
++	gpu_wr(g_core, CP_ROQ_THRESHOLDS_1, 0x8040362cu);
++	gpu_wr(g_core, CP_MEM_POOL_SIZE, 128);
++	gpu_wr(g_core, PC_DBG_ECO_CNTL, 0x00200200u);
++	gpu_wr(g_core, CP_AHB_CNTL, 1);
++	/* UBWC (a6xx_calc_ubwc_config for the a640: highest bank bit 15 -> 2 here, amsbc) */
++	gpu_wr(g_core, RB_NC_MODE_CNTL, 1u << 4 | 2u << 1);
++	gpu_wr(g_core, TPL1_NC_MODE_CNTL, 2u << 1);
++	gpu_wr(g_core, SP_NC_MODE_CNTL, 2u << 1);
++	gpu_wr(g_core, UCHE_MODE_CNTL, 2u << 21);
++	gpu_wr(g_core, RBBM_NC_MODE_CNTL, 0);
++	gpu_wr(g_core, RBBM_PERFCTR_CNTL, 1);
++	gpu_wr(g_core, RBBM_INTERFACE_HANG_INT, 1u << 30 | 0xcfffffu);
++	gpu_wr(g_core, UCHE_CLIENT_PF, 1);
++	gpu_wr(g_core, CP_CHICKEN_DBG, 1);
++	gpu_wr(g_core, RBBM_GBIF_CLIENT_QOS_CNTL, 0);
++	gpu_wr(g_core, RB_DBG_ECO_CNTL, 0);
++	gpu_wr(g_core, CP_SQE_INSTR_BASE, CORE_SQE_ADDRESS);
++	gpu_wr(g_core, CP_SQE_INSTR_BASE + 4u, 0);
++	gpu_wr(g_core, CP_RB_BASE, CORE_RING_ADDRESS);
++	gpu_wr(g_core, CP_RB_BASE + 4u, 0);
++	gpu_wr(g_core, CP_RB_CNTL, CP_RB_CNTL_VALUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET GPU: [CP] registers: sqe_base %#x rb_base %#x rb_cntl %#x gmem_max %#x rbbm_status %#x\n",
++	    gpu_rd(g_core, CP_SQE_INSTR_BASE), gpu_rd(g_core, CP_RB_BASE), gpu_rd(g_core, CP_RB_CNTL),
++	    gpu_rd(g_core, UCHE_GMEM_RANGE_MAX), gpu_rd(g_core, RBBM_STATUS));
++
++	if (!gmu_step(18, "the command processor started")) {
++		return -4;
++	}
++	gpu_wr(g_core, CP_SQE_CNTL, 1);
++	delay_for_interval(20, NSEC_PER_MSEC);
++	printf("SWEET GPU: [CP] alive after the start: status %#x int0 %#x cp fault %#x cp int %#x protect %#x rptr %u; "
++	    "smmu sgfsr %#x\n", gpu_rd(g_core, RBBM_STATUS), gpu_rd(g_core, RBBM_INT_0_STATUS), gpu_rd(g_core, CP_HW_FAULT),
++	    gpu_rd(g_core, CP_INTERRUPT_STATUS), gpu_rd(g_core, CP_PROTECT_STATUS), gpu_rd(g_core, CP_RB_RPTR),
++	    gpu_rd(g_smmu, SMMU_SGFSR));
++	if (smmu_faulted(CORE_CONTEXT, "the start")) {
++		return -4;
++	}
++
++	if (!gmu_step(19, "ME_INIT")) {
++		return -5;
++	}
++	ring_command(CP_ME_INIT, 8);                    /* a6xx_cp_init */
++	ring_put(0x0000002fu);
++	ring_put(0x00000003u);                          /* several hardware contexts */
++	ring_put(0x20000000u);                          /* error detection */
++	for (int i = 0; i < 5; i++) {
++		ring_put(0);
++	}
++	if (!ring_run("ME_INIT")) {
++		return -5;
++	}
++	printf("SWEET GPU: [CP] THE 3D CORE TAKES COMMANDS\n");
++
++	if (!gmu_step(20, "out of secure mode, a word written on command")) {
++		return -6;
++	}
++	ring_command(CP_SET_SECURE_MODE, 1);
++	ring_put(0);
++	if (!ring_run("SET_SECURE_MODE 0")) {
++		return -6;
++	}
++	ring_command(CP_MEM_WRITE, 3);
++	ring_put(CORE_SCRATCH_ADDRESS);
++	ring_put(0);
++	ring_put(0x600dc0deu);
++	ring_command(CP_EVENT_WRITE, 4);
++	ring_put(EVENT_CACHE_FLUSH_TS);
++	ring_put(CORE_SCRATCH_ADDRESS + 8u);
++	ring_put(0);
++	ring_put(0x12345678u);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	if (!ring_run("CP_MEM_WRITE + CACHE_FLUSH_TS")) {
++		return -7;
++	}
++	gpu_to_memory(g_scratch.va, 64);
++	scratch = (volatile uint32_t *)g_scratch.va;
++	printf("SWEET GPU: [CP] scratch reads %#x, timestamp %#x: %s\n", scratch[0], scratch[2],
++	    scratch[0] == 0x600dc0deu && scratch[2] == 0x12345678u ? "THE 3D CORE WRITES OUR MEMORY ON COMMAND" :
++	    "not what it was told to write");
++	return scratch[0] == 0x600dc0deu && scratch[2] == 0x12345678u ? 0 : -8;
++}
++
+ static void
+ gpu_probe(void)
+ {
+@@ -1208,7 +1584,11 @@ gpu_probe(void)
+ 		gpu_gmu_step2();
+ 	}
+ 	if (gpu_level >= 6 && gpu_gmu) {
+-		printf("SWEET GMU: boot -> %d\n", gpu_gmu_boot());
++		int r = gpu_gmu_boot();
++		printf("SWEET GMU: boot -> %d\n", r);
++		if (r == 0 && gpu_level >= 7) {
++			printf("SWEET GPU: command processor -> %d\n", gpu_core_start());
++		}
+ 	}
+ }
+ 
