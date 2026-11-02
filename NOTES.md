@@ -267,3 +267,23 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - **20:51 flashed f10** (FLASH=1: no sweetnocharger; iOS default; kernel run 41507798047 = 0103+0104;
   sha256 d8ac15f2...). Rollback: backup/boot-current-20261102.img or backup/flashed/*.
 
+
+### 2026-11-02 (step 5: Adreno 640, layers 1-2)
+- Firmware (NOT in git): research/fw-raphael/ from the vendor partition backup (debugfs on
+  raphael_backup/full/lun4/vendor.bin): a640_gmu.bin, a630_sqe.fw (= davinci's), a640_zap.mdt/.b00-.b02, SHA256SUMS.
+  `tools/mkadt.py OUT --raphael --fullram --fw=research/fw-raphael` puts the GMU/SQE/zap pieces into ADT /sweet-fw
+  (out/raphael-full-fw.adt, 91652 bytes); sweet_gpu.c reads them from there.
+- **0105 (layer 1, sweetgpu=1..5), g1 via fastboot boot, verified:** `CX: gdscr 0xf8222000 hw_ctrl 0x80001fe0 -> on`,
+  `gmu_clk_src cfg 0x602 (was 0)`, GMU window reachable (cm3_sysreset=1, fw_init=0). Open: PAS_IS_SUPPORTED(13)
+  answered x0=0 x1=0 (query form? retest with a real zap load in layer 3). Log: out/logs/g1-kernel.log.
+- **0106 (layer 2, sweetgpu=6) = GMU boot, written, compiles (proton-clang via tools/xnu-cc.py), commit 9038dd4,
+  CI run 41519518380.** Sequence (Helium hakios.adreno.c + Linux a6xx_gmu.c + davinci values): GMU memory through
+  GPU SMMU context 1 (SMR 1 = stream 5 mask 0x400, ACTLR 0x303, 39-bit 3-level 4K tables, PTE 0xE03),
+  blocks 0x4000/0x44000 (0x3c000), 0x60000000, firmware "needs" blocks, log 0x60002000, HFI 0x60006000;
+  a640_gmu.bin TCM blocks via registers (read back); PDC (TCS1/TCS3 from cmd-db mx/cx/xo.lvl) + RSCC sequencer;
+  register_config; release reset -> wait 0xBABEFACE; HFI v2 table (3 queues); PERF_TABLE (speed bin 0 levels
+  257..585 MHz), BW_TABLE, CORE_FW_START, GX_BW_PERF_VOTE (sweetgpu_speed=N, default 1 = 257 MHz); OOB bit 30 ->
+  bit 31; HFI START; RBBM readout. Every failure prints the SMMU fault registers.
+- Test plan g2: `ADT=out/raphael-full-fw.adt ROOT=iosdata MIUI=backup/miui-unenc tools/mkiosimg.sh g2 K sweetgpu=6
+  sweetusb=2`; live log over USB ethernet: host nmcli con `sweetusb` (enx02005e77ee01, 192.168.7.1), `nc -ukl 5140`.
+  NOTE the gadget MAC/IPs equal davinci's: only one phone may run sweetusb=2 at a time.
