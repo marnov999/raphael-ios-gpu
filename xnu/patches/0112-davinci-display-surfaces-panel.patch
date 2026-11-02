@@ -1,0 +1,3640 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 316138b..abb32e8 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,8 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_prof.c			standard
++bsd/dev/sweet_dpu.c			standard
++bsd/dev/sweet_panel.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_dpu.c b/bsd/dev/sweet_dpu.c
+new file mode 100644
+index 0000000..9c5c803
+--- /dev/null
++++ b/bsd/dev/sweet_dpu.c
+@@ -0,0 +1,83 @@
++/*
++ * The display engine (MDSS MDP / "DPU", dt qcom,mdss_mdp@ae00000), step 1 of scanning iOS's frames
++ * out directly instead of copying them into the boot loader's framebuffer: what the boot loader
++ * left programmed, read and printed. Reads only.
++ *
++ * Block offsets from davinci's dt (qcom,sde-*-off); register layout from the vendor's SDE driver
++ * (drivers/gpu/drm/msm/sde: sde_hw_sspp.c, sde_hw_ctl.c, sde_hw_lm.c, sde_hw_pingpong.c,
++ * sde_hw_intf.c). Every block is printed as its non-zero words, so what is live stands out: the
++ * pipe that fetches the framebuffer (its address, stride, format, sizes), the mixer and control
++ * path it goes through, the pingpong's tear check and autorefresh (a command-mode panel), and the
++ * DSI interface. And VIG0's pixel extension and scaler (QSEED3 lite at +0xa00), which
++ * SweetFramebuffer.cpp's scalerOn sets up to fetch 1125x2436 and give the panel 1080x2340.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <mach/memory_object_types.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO 0x7u
++#endif
++
++void sweet_dpu_survey(void);
++
++#define MDP_PA    0x0ae00000u
++#define MDP_SIZE  0x90000u
++
++static const struct {
++	const char *name;
++	uint32_t off, len;
++} dpu_blocks[] = {
++	{ "top", 0x1000u, 0x460u },
++	{ "ctl0", 0x2000u, 0x100u }, { "ctl1", 0x2200u, 0x100u }, { "ctl2", 0x2400u, 0x100u },
++	{ "ctl3", 0x2600u, 0x100u }, { "ctl4", 0x2800u, 0x100u }, { "ctl5", 0x2a00u, 0x100u },
++	{ "vig0", 0x5000u, 0x80u }, { "vig0 pe", 0x5100u, 0x30u }, { "vig0 qseed", 0x5a00u, 0xa0u },
++	{ "vig1", 0x7000u, 0x80u },
++	{ "dma0", 0x25000u, 0x80u }, { "dma1", 0x27000u, 0x80u }, { "dma2", 0x29000u, 0x80u },
++	{ "lm0", 0x45000u, 0x60u }, { "lm1", 0x46000u, 0x60u }, { "lm2", 0x47000u, 0x60u }, { "lm3", 0x48000u, 0x60u },
++	{ "intf1(dsi)", 0x6b800u, 0x2c0u }, { "intf2(dsi)", 0x6c000u, 0x2c0u },
++	{ "pp0", 0x71000u, 0x40u }, { "pp1", 0x71800u, 0x40u }, { "pp2", 0x72000u, 0x40u }, { "pp3", 0x72800u, 0x40u },
++};
++
++void
++sweet_dpu_survey(void)
++{
++	static bool done;
++	vm_offset_t mdp;
++	unsigned b;
++	if (done) {
++		return;
++	}
++	done = true;
++	mdp = ml_io_map_unmappable(MDP_PA, MDP_SIZE, VM_WIMG_IO);
++	if (!mdp) {
++		printf("SWEET DPU: cannot map the MDP\n");
++		return;
++	}
++	printf("SWEET DPU: [1] the display engine as the boot loader left it (non-zero words; reads only)\n");
++	for (b = 0; b < sizeof(dpu_blocks) / sizeof(dpu_blocks[0]); b++) {
++		char line[320];
++		int at = 0;
++		unsigned nz = 0;
++		for (uint32_t o = 0; o < dpu_blocks[b].len; o += 4u) {
++			uint32_t v = *(volatile uint32_t *)(mdp + dpu_blocks[b].off + o);
++			if (v == 0) {
++				continue;
++			}
++			nz++;
++			if (at > (int)sizeof(line) - 24) {
++				printf("SWEET DPU: %s:%s\n", dpu_blocks[b].name, line);
++				at = 0;
++			}
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " %03x=%x", o, v);
++		}
++		if (nz) {
++			printf("SWEET DPU: %s:%s\n", dpu_blocks[b].name, line);
++		}
++	}
++	printf("SWEET DPU: [1] done\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_panel.c b/bsd/dev/sweet_panel.c
+new file mode 100644
+index 0000000..952ba84
+--- /dev/null
++++ b/bsd/dev/sweet_panel.c
+@@ -0,0 +1,226 @@
++/*
++ * SWEET panel hooks for raphael (Mi 9T Pro / Redmi K20 Pro, SM8150): the Samsung EA8076 AMOLED in command
++ * mode, which the boot loader leaves lit and refreshing itself from its framebuffer. What davinci's
++ * bsd/dev/sweet_gpu.c gives SweetFramebuffer.cpp and SweetBacklight.cpp for its panel, here:
++ *
++ *   sweet_panel_brightness(0..2047)  DCS 0x51, the 11-bit level big-endian (the vendor's _ss variant,
++ *                                    qcom,mdss-brightness-max-level 2047)
++ *   sweet_panel_power(0/1)           DCS 0x28 display off (and 0x10 sleep in with sweetpanel_sleep=1);
++ *                                    on: 0x11 / 0x29 and the brightness once the first new frame is drawn
++ *   sweet_panel_new_frame()          (davinci: the panel stays dark after a wake until then, or 1 s)
++ *
++ * The commands go through the DSI controller's test-pattern DMA FIFO as Gsjsjzhznsz's raphael port does
++ * (vendor dsi_ctrl_hw_cmn_kickoff_fifo_command): header dword [wc_lo wc_hi data_type flags], payload,
++ * flags bit 7 the last command, bit 6 a payload follows. The controller is the first of ctrl0/ctrl1 that
++ * completes a command.
++ */
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#define DSI0_PA                 0x0ae94000u
++#define DSI1_PA                 0x0ae96000u
++#define DSI_LEN                 0x400u
++#define DSI_CMD_DMA_CTRL        0x03cu
++#define DSI_DMA_CMD_LENGTH      0x04cu
++#define DSI_SW_TRIGGER          0x090u
++#define DSI_INT_CTRL            0x110u          /* bit 0: command DMA done (write 1 to clear) */
++#define DSI_TPG_CTRL            0x15cu
++#define DSI_TPG_CMD_INIT_VAL    0x17cu
++#define DSI_TPG_FIFO_RESET      0x1ecu
++#define DCS_SHORT_WRITE         0x05u
++#define DCS_LONG_WRITE          0x39u
++#define LEVEL_MAX               2047u
++
++int sweet_panel_brightness(uint32_t level);
++int sweet_panel_power(int on);
++void sweet_panel_new_frame(void);
++void sweet_panel_wake_tick(void);
++
++static vm_offset_t g_dsi;
++static int g_dsi_state;                 /* 0 not tried, 1 working, -1 none answers */
++static uint32_t g_level = 0x218u;       /* asked for; shown unless off */
++static bool g_off;
++static volatile uint32_t g_wake_pending;
++static thread_call_t g_wake_call;
++
++static void
++dsi_w(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(g_dsi + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++dsi_r(uint32_t off)
++{
++	return *(volatile uint32_t *)(g_dsi + off);
++}
++
++/* One packet of `count` dwords; true once the controller says the command DMA is done. */
++static bool
++dsi_send(const uint32_t *dw, uint32_t count)
++{
++	dsi_w(DSI_TPG_CTRL, 0);
++	dsi_w(DSI_TPG_FIFO_RESET, 1);
++	delay(1);
++	dsi_w(DSI_TPG_FIFO_RESET, 0);
++	dsi_w(DSI_TPG_CTRL, 1u << 1 | 1u << 2 | 3u << 16);
++	for (uint32_t i = 0; i < count; i++) {
++		dsi_w(DSI_TPG_CMD_INIT_VAL, dw[i]);
++	}
++	if (count & 1u) {
++		dsi_w(DSI_TPG_CMD_INIT_VAL, 0);
++	}
++	uint32_t dma = dsi_r(DSI_CMD_DMA_CTRL) & ~(1u << 31 | 1u << 30 | 1u << 29 | 1u << 24);
++	dsi_w(DSI_CMD_DMA_CTRL, dma | 1u << 28 | 1u << 26);        /* embedded mode, low-power commands */
++	dsi_w(DSI_DMA_CMD_LENGTH, count * 4u);
++	dsi_w(DSI_SW_TRIGGER, 1);
++	for (int i = 0; i < 5000; i++) {
++		if (dsi_r(DSI_INT_CTRL) & 1u) {
++			dsi_w(DSI_INT_CTRL, 1);
++			dsi_w(DSI_TPG_CTRL, 0);
++			return true;
++		}
++		delay(10);
++	}
++	dsi_w(DSI_TPG_CTRL, 0);
++	return false;
++}
++
++static bool
++dsi_ready(void)
++{
++	static const uint32_t pas[2] = { DSI0_PA, DSI1_PA };
++	const uint32_t on = 0x29u | DCS_SHORT_WRITE << 16 | 0x80u << 24;      /* display on: no-op on a lit panel */
++
++	if (g_dsi_state != 0) {
++		return g_dsi_state > 0;
++	}
++	g_dsi_state = -1;
++	for (int i = 0; i < 2; i++) {
++		if ((g_dsi = ml_io_map(pas[i], DSI_LEN)) != 0 && dsi_send(&on, 1)) {
++			g_dsi_state = 1;
++			printf("SWEET PANEL: DSI ctrl%d takes commands\n", i);
++			return true;
++		}
++	}
++	printf("SWEET PANEL: no DSI controller completes a command: no brightness or display off\n");
++	return false;
++}
++
++static int
++dcs_short(uint8_t cmd)
++{
++	uint32_t dw = cmd | DCS_SHORT_WRITE << 16 | 0x80u << 24;
++	return dsi_ready() && dsi_send(&dw, 1) ? 0 : -1;
++}
++
++static int
++dcs_brightness(uint32_t level)
++{
++	uint32_t dw[2] = { 3u | DCS_LONG_WRITE << 16 | 0xc0u << 24,
++		           0x51u | (level >> 8 & 0xffu) << 8 | (level & 0xffu) << 16 | 0xffu << 24 };
++	return dsi_ready() && dsi_send(dw, 2) ? 0 : -1;
++}
++
++int
++sweet_panel_brightness(uint32_t level)
++{
++	static uint32_t most;
++	static uint32_t last_lit = 0x218u;
++	if (most == 0) {
++		most = LEVEL_MAX;
++		(void)PE_parse_boot_argn("sweetbl_max", &most, sizeof(most));
++		if (most == 0 || most > LEVEL_MAX) {
++			most = LEVEL_MAX;
++		}
++	}
++	if (level > most) {
++		level = most;
++	}
++	/* backboardd: 0 is off, 1 is "back to where it was" (davinci, 2026-10-26) */
++	if (level == 1u && last_lit > 1u) {
++		level = last_lit;
++	} else if (level > 1u) {
++		last_lit = level;
++	}
++	g_level = level;
++	return g_off || g_wake_pending ? 0 : dcs_brightness(level);
++}
++
++static void
++panel_reveal(const char *why)
++{
++	if (!__atomic_exchange_n(&g_wake_pending, 0u, __ATOMIC_ACQ_REL)) {
++		return;
++	}
++	int a = dcs_short(0x29), b = dcs_brightness(g_level);
++	printf("SWEET PANEL: shown after the wake (%s; display on %d, brightness %d)\n", why, a, b);
++}
++
++static void
++panel_wake_timeout(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	panel_reveal("no frame in 1 s");
++}
++
++void
++sweet_panel_new_frame(void)
++{
++	if (g_wake_pending) {
++		panel_reveal("first frame");
++	}
++}
++
++void
++sweet_panel_wake_tick(void)
++{
++}
++
++int
++sweet_panel_power(int on)
++{
++	static int sleep_ok = -1;
++	int r;
++	if (sleep_ok < 0) {
++		sleep_ok = 0;
++		(void)PE_parse_boot_argn("sweetpanel_sleep", &sleep_ok, sizeof(sleep_ok));
++	}
++	if (!on) {
++		g_off = true;
++		g_wake_pending = 0;
++		r = dcs_short(0x28);
++		if (sleep_ok) {
++			r |= dcs_short(0x10);
++		}
++		return r;
++	}
++	if (!g_off) {
++		return 0;
++	}
++	g_off = false;
++	r = 0;
++	if (sleep_ok) {
++		r = dcs_short(0x11);
++		delay(120000);                  /* sleep out: 120 ms before the next command */
++	}
++	/* dark until the first new frame (no stale frame from before the sleep), or 1 s */
++	g_wake_pending = 1;
++	if (g_wake_call == NULL) {
++		g_wake_call = thread_call_allocate(panel_wake_timeout, NULL);
++	}
++	if (g_wake_call != NULL) {
++		uint64_t deadline;
++		clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++		thread_call_enter_delayed(g_wake_call, deadline);
++	} else {
++		panel_reveal("no timer");
++	}
++	return r;
++}
++#endif /* ARM64_BOARD_CONFIG_RAPHAEL */
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+new file mode 100644
+index 0000000..7031302
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -0,0 +1,152 @@
++/*
++ * SweetBacklight: the panel's brightness for iOS. backboardd's CoreBrightness looks for a service
++ * with the property backlight-control (IOPropertyMatch, IOServiceNotificationUser) and, failing to
++ * find one, has nothing to send the brightness slider's value to. This is that service: it carries
++ * backlight-control and an IODisplayParameters "brightness" range, takes what is set on it
++ * (setProperties), and sends the panel DCS 0x51 through bsd/dev/sweet_gpu.c's
++ * sweet_panel_brightness() (davinci's Samsung AMOLED: 0..2047).
++ *
++ * What iOS sets, and how, is logged (the first sixty times), so the mapping can follow what
++ * CoreBrightness really does; a number under "brightness" (or IODisplayParameters.brightness.value)
++ * is taken on the published scale.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSerialize.h>
++
++extern "C" int sweet_panel_brightness(uint32_t level);
++
++#define SWEET_BL_SCALE  65536u          /* the published range: 0..65536 (IODisplayParameters, as on a Mac) */
++#define SWEET_BL_PANEL  2047u           /* the panel's own maximum */
++#define SWEET_BL_START  0x218u          /* dt qcom,mdss-dsi-bl-default-level */
++
++/* The class is called what CoreBrightness matches (CBDisplayContaineriOS: IOServiceMatching("AppleARMBacklight")). */
++#define SweetBacklight AppleARMBacklight
++class SweetBacklight : public IOService {
++	OSDeclareDefaultStructors(SweetBacklight);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++private:
++	unsigned fLogged;
++	uint32_t fValue;                     /* on the published scale */
++	void publish(uint32_t value);
++	void take(uint32_t value, const char *how);
++};
++
++OSDefineMetaClassAndStructors(SweetBacklight, IOService);
++
++void
++SweetBacklight::publish(uint32_t value)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSNumber *min = OSNumber::withNumber(0ull, 32), *max = OSNumber::withNumber(SWEET_BL_SCALE, 32),
++	    *cur = OSNumber::withNumber(value, 32);
++	if (params && brightness && min && max && cur) {
++		brightness->setObject("min", min);
++		brightness->setObject("max", max);
++		brightness->setObject("value", cur);
++		params->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", params);
++		setProperty("brightness", cur);
++	}
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(cur);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(params);
++}
++
++void
++SweetBacklight::take(uint32_t value, const char *how)
++{
++	uint32_t level;
++	if (value > SWEET_BL_SCALE) {
++		value = SWEET_BL_SCALE;
++	}
++	level = (uint32_t)(((uint64_t)value * SWEET_BL_PANEL + SWEET_BL_SCALE / 2) / SWEET_BL_SCALE);
++	if (level == 0 && value != 0) {
++		level = 1;                       /* the slider's bottom is dim, not black */
++	}
++	fValue = value;
++	publish(value);
++	IOLog("SWEET BACKLIGHT: %s %u/%u -> panel %u: %d\n", how, value, SWEET_BL_SCALE, level, sweet_panel_brightness(level));
++}
++
++bool
++SweetBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fValue = (uint32_t)(((uint64_t)SWEET_BL_START * SWEET_BL_SCALE) / SWEET_BL_PANEL);
++	setProperty("backlight-control", kOSBooleanTrue);
++	publish(fValue);
++	registerService();
++	IOLog("SWEET BACKLIGHT: published (backlight-control), brightness %u/%u\n", fValue, SWEET_BL_SCALE);
++	return true;
++}
++
++static bool
++sweet_bl_number(OSObject *o, uint32_t *out)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, o);
++	if (n) {
++		*out = n->unsigned32BitValue();
++		return true;
++	}
++	return false;
++}
++
++IOReturn
++SweetBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	uint32_t value = 0;
++	if (fLogged < 60) {
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		fLogged++;
++		if (s && properties->serialize(s)) {
++			IOLog("SWEET BACKLIGHT: set %.400s\n", s->text());
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (!dict) {
++		return kIOReturnBadArgument;
++	}
++	if (sweet_bl_number(dict->getObject("IOMFBBrightnessLevel"), &value)) {   /* CoreBrightness Display.m */
++		take(value, "IOMFBBrightnessLevel");
++		return kIOReturnSuccess;
++	}
++	if (sweet_bl_number(dict->getObject("brightness"), &value)) {
++		take(value, "brightness");
++		return kIOReturnSuccess;
++	}
++	{
++		OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++		OSDictionary *b = params ? OSDynamicCast(OSDictionary, params->getObject("brightness")) : NULL;
++		if (b && sweet_bl_number(b->getObject("value"), &value)) {
++			take(value, "IODisplayParameters");
++			return kIOReturnSuccess;
++		}
++	}
++	return kIOReturnSuccess;                 /* accepted (and logged) */
++}
++
++IOReturn
++SweetBacklight::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++    IOUserClient **handler)
++{
++	IOLog("SWEET BACKLIGHT: a user client of type %u asked for\n", (unsigned)type);
++	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2247a50..847d6d4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -24,10 +24,12 @@
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+  *
+- * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
+- * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+- * enabled it, through the port they registered (IOConnectSetNotificationPort).
++ * SwapEnd copies the enabled layers' surfaces into the panel memory (CPU
++ * copy; scaled to the panel unless sweetfb_scale=0, below), or has the
++ * display engine fetch the frame itself (sweetfb_scanout=1). Vsync
++ * (notification type 5) is a 60 Hz timer that sends (count,
++ * mach_absolute_time, 0) as 32-bit halves to clients that enabled it,
++ * through the port they registered (IOConnectSetNotificationPort).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+@@ -37,7 +39,6 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+-extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -47,92 +48,21 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+-#include <libkern/c++/OSCollectionIterator.h>
++#include <kern/thread_call.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+-
+-#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-/* Raphael panel control through the DSI command DMA, exactly the vendor
+- * path (MiCode raphael-p-oss, samsung EA8076 AMOLED, dsi_lp_mode):
+- * brightness is DCS 0x51 with a big-endian 11-bit level
+- * (mipi_dsi_dcs_set_display_brightness_ss, max 2047 per
+- * qcom,mdss-brightness-max-level); display off/on is DCS 0x28/0x29.
+- * Controller: mdss_dsi_ctrl0 @ 0x0ae94000 (DSI 6G v2.2). Commands go
+- * through the TPG DMA FIFO like vendor dsi_ctrl_hw_cmn_kickoff_fifo_command
+- * in secure sessions: dwords [wc_lo wc_hi data_id flags] then payload,
+- * padded with 0xff; flags bit7 = last command, bit6 = payload present
+- * (dsi_ctrl_copy_and_pad_cmd / MIPI_DSI_MSG_LASTCOMMAND). */
+-#define SWEET_FB_DSI0_PA              0x0ae94000ull   /* DSI controller 0 */
+-#define SWEET_FB_DSI1_PA              0x0ae96000ull   /* DSI controller 1 */
+-#define SWEET_FB_DSI_LEN              0x400ull
+-#define SWEET_FB_DSI_CTRL             0x000u
+-#define SWEET_FB_DSI_CMD_DMA_CTRL     0x03cu
+-#define SWEET_FB_DSI_DMA_CMD_LENGTH   0x04cu
+-#define SWEET_FB_DSI_SW_TRIGGER       0x090u
+-#define SWEET_FB_DSI_INT_CTRL         0x110u
+-#define SWEET_FB_DSI_TPG_CTRL         0x15cu
+-#define SWEET_FB_DSI_TPG_CMD_INIT_VAL 0x17cu
+-#define SWEET_FB_DSI_TPG_FIFO_RESET   0x1ecu
+-#define SWEET_FB_BRIGHT_MIN           4u      /* first clearly visible level */
+-#define SWEET_FB_BRIGHT_MAX           2047u   /* qcom,mdss-brightness-max-level */
+-
+-static uint32_t
+-fbDsiR(vm_offset_t base, uint32_t off)
+-{
+-	return *(volatile uint32_t *)(base + off);
+-}
+-
+-static void
+-fbDsiW(vm_offset_t base, uint32_t off, uint32_t v)
+-{
+-	*(volatile uint32_t *)(base + off) = v;
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
+-
+-/* One embedded-mode DCS packet through the TPG DMA FIFO. count is the
+- * number of packet dwords already padded to a dword boundary. Returns
+- * true once the controller reports CMD_MODE_DMA_DONE (INT_CTRL bit 0,
+- * write-1-to-clear); a timeout disqualifies the path (returns false). */
+-static bool
+-fbDsiSend(vm_offset_t dsi, const uint32_t *dw, uint32_t count)
+-{
+-	/* Liveness is proven by the command DMA completing, not by the
+-	 * enable bit: t21 read ctrl=0x20030000 on ctrl0 with the panel
+-	 * clearly on, so a register gate disabled the whole DCS path. */
+-	/* Reset the TPG DMA FIFO, then FIFO mode with the custom pattern. */
+-	fbDsiW(dsi, SWEET_FB_DSI_TPG_CTRL, 0x0);
+-	fbDsiW(dsi, SWEET_FB_DSI_TPG_FIFO_RESET, 0x1);
+-	delay(1);
+-	fbDsiW(dsi, SWEET_FB_DSI_TPG_FIFO_RESET, 0x0);
+-	fbDsiW(dsi, SWEET_FB_DSI_TPG_CTRL, (1u << 1) | (1u << 2) | (0x3u << 16));
+-	for (uint32_t i = 0; i < count; i++) {
+-		fbDsiW(dsi, SWEET_FB_DSI_TPG_CMD_INIT_VAL, dw[i]);
+-	}
+-	if ((count & 1u) != 0u) {
+-		fbDsiW(dsi, SWEET_FB_DSI_TPG_CMD_INIT_VAL, 0);
+-	}
+-	/* Embedded mode (bit 28) + low-power commands (bit 26); clear the
+-	 * broadcast/master/WC_SEL/packet-type bits the vendor clears. */
+-	uint32_t dma = fbDsiR(dsi, SWEET_FB_DSI_CMD_DMA_CTRL);
+-	dma &= ~((1u << 31) | (1u << 30) | (1u << 29) | (1u << 24));
+-	dma |= (1u << 28) | (1u << 26);
+-	fbDsiW(dsi, SWEET_FB_DSI_CMD_DMA_CTRL, dma);
+-	fbDsiW(dsi, SWEET_FB_DSI_DMA_CMD_LENGTH, count * 4u);
+-	fbDsiW(dsi, SWEET_FB_DSI_SW_TRIGGER, 0x1);
+-	for (uint32_t i = 0; i < 5000; i++) {
+-		if (fbDsiR(dsi, SWEET_FB_DSI_INT_CTRL) & 1u) {
+-			fbDsiW(dsi, SWEET_FB_DSI_INT_CTRL, 1u);
+-			fbDsiW(dsi, SWEET_FB_DSI_TPG_CTRL, 0x0);
+-			return true;
+-		}
+-		delay(10);	/* 10 us; up to 50 ms total */
+-	}
+-	fbDsiW(dsi, SWEET_FB_DSI_TPG_CTRL, 0x0);
+-	return false;
+-}
+-#endif /* ARM64_BOARD_CONFIG_RAPHAEL */
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSSerialize.h>
++extern "C" int sweet_panel_power(int on);
++extern "C" void sweet_panel_new_frame(void);   /* bsd/dev/sweet_gpu.c: light the panel after a wake */
++extern "C" uint32_t sweet_fb_scanout_id;       /* bsd/kern/sweet_amfi.c kern.sweet_scanout_id: the surface on the panel */
++extern "C" void sweet_dpu_survey(void);
++extern "C" void sweet_prof_start(void);
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern "C" void sweet_dvfs_kick(void);      /* bsd/dev/sweet_gpu.c: wake the clocks (something is drawn) */
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -146,9 +76,119 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBSupportedFrameInfo      = 74,
++	kSweetFBGetCurrentAbsoluteTime  = 77,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
++/* the display engine's registers (scanOut) */
++#define SWEET_MDP_PA            0x0ae00000u
++#define SWEET_MDP_CTL0_FLUSH    (0x2000u + 0x018u)
++#define SWEET_MDP_VIG0_ADDR     (0x5000u + 0x014u)
++#define SWEET_MDP_VIG0_STRIDE   (0x5000u + 0x024u)
++#define SWEET_MDP_FLUSH_VIG0    0x1u
++/*
++ * VIG0's sizes, its pixel extension and its scaler (scalerOn): sde_hw_sspp.c, sde_hw_util.c
++ * (SDE_SCALER_QSEED3 / QSEED3LITE), the scaler at dt qcom,sde-vig-qseed-off 0xa00 into the pipe.
++ */
++#define SWEET_MDP_VIG0              0x5000u                     /* dt qcom,sde-sspp-off */
++#define SWEET_MDP_VIG0_SRC_SIZE     (SWEET_MDP_VIG0 + 0x000u)   /* h << 16 | w, fetched */
++#define SWEET_MDP_VIG0_SRC_XY       (SWEET_MDP_VIG0 + 0x008u)
++#define SWEET_MDP_VIG0_OUT_SIZE     (SWEET_MDP_VIG0 + 0x00cu)   /* h << 16 | w, into LM0 */
++#define SWEET_MDP_VIG0_OUT_XY       (SWEET_MDP_VIG0 + 0x010u)
++#define SWEET_MDP_VIG0_FORMAT       (SWEET_MDP_VIG0 + 0x030u)
++#define SWEET_MDP_VIG0_FORMAT_ALPHA (1u << 8)                   /* SRCC3_EN: the format's alpha is used */
++#define SWEET_MDP_VIG0_DECIMATION   (SWEET_MDP_VIG0 + 0x0b4u)
++#define SWEET_MDP_VIG0_PE(c)        (SWEET_MDP_VIG0 + 0x100u + 0x10u * (c))     /* c 0, 1 (1 and 2), 2 (3): +0 LR, +4 TB, +8 REQ_PIXELS */
++#define SWEET_MDP_VIG0_QSEED        (SWEET_MDP_VIG0 + 0xa00u)
++#define SWEET_QSEED_VERSION         0x00u
++#define SWEET_QSEED_OP_MODE         0x04u
++#define SWEET_QSEED_STEP_Y_H        0x10u       /* (and _Y_V 0x14, _UV_H 0x18, _UV_V 0x1c) */
++#define SWEET_QSEED_PRELOAD         0x20u
++#define SWEET_QSEED_SRC_SIZE_Y      0x40u       /* (and _UV 0x44) */
++#define SWEET_QSEED_DST_SIZE        0x48u
++#define SWEET_QSEED_INIT_Y_H        0x90u       /* (and _Y_V 0x94, _UV_H 0x98, _UV_V 0x9c; not on version 0x1002) */
++#define SWEET_QSEED_PHASE_SHIFT     21          /* sde_plane.c PHASE_STEP_SHIFT: a source pixel is 1 << 21 */
++#define SWEET_QSEED_PRELOAD_H       4           /* sde_hw_util.c QSEED3_DEFAULT_PRELOAD_H / _V */
++#define SWEET_QSEED_PRELOAD_V       3
++#define SWEET_QSEED_OP_ENABLE       (1u << 0)
++#define SWEET_QSEED_OP_ALPHA        (1u << 10)  /* the format has alpha... */
++#define SWEET_QSEED_OP_8BIT         (1u << 14)  /* ...and is not a 10-bit one */
++#define SWEET_QSEED_OP_Y_BILINEAR   (3u << 16)  /* y_rgb_filter_cfg SDE_SCALE_BIL: no coefficient tables */
++#define SWEET_QSEED_OP_A_BILINEAR   (1u << 29)  /* alpha_filter_cfg SDE_SCALE_ALPHA_BIL */
++#define SWEET_QSEED_OP_BLEND        (1u << 31)  /* blend_cfg 1 */
++#define SWEET_FB_SCALER_REGS        32
++
++struct sweet_fb_reg {
++	uint32_t off, val;
++};
++
++/*
++ * The frame timeline (asked with the profiler, bsd/dev/sweet_prof.c): for every swap, when it came
++ * (SwapEnd), when the GPU was done with it, when it was flipped, when the display engine took the
++ * flip, and when SwapWait for it was entered and returned; and every vsync tick. Microseconds of
++ * mach_absolute_time, as the GL bridge's "tl:" lines, for tools/sweet-timeline.py.
++ */
++struct sweet_tl_swap {
++	uint32_t id;
++	uint64_t arrive, gpu, flip, latch, win, wout;
++};
++#define SWEET_TL_SWAPS 600
++#define SWEET_TL_TICKS 2000
++static struct sweet_tl_swap sweet_tl[SWEET_TL_SWAPS];
++static uint64_t sweet_tl_tick[SWEET_TL_TICKS];
++static volatile uint32_t sweet_tl_on, sweet_tl_n, sweet_tl_nt;
++
++static uint64_t
++sweet_tl_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000ull;
++}
++
++static struct sweet_tl_swap *
++sweet_tl_find(uint32_t id)
++{
++	uint32_t n = sweet_tl_n < SWEET_TL_SWAPS ? sweet_tl_n : SWEET_TL_SWAPS;
++	for (uint32_t i = n; i > 0 && i + 16 > n; i--) {
++		if (sweet_tl[i - 1].id == id) {
++			return &sweet_tl[i - 1];
++		}
++	}
++	return NULL;
++}
++
++extern "C" void sweet_fb_timeline(int on);
++extern "C" void
++sweet_fb_timeline(int on)
++{
++	if (on) {
++		sweet_tl_n = sweet_tl_nt = 0;
++		sweet_tl_on = 1;
++		return;
++	}
++	sweet_tl_on = 0;
++	uint32_t n = sweet_tl_n < SWEET_TL_SWAPS ? sweet_tl_n : SWEET_TL_SWAPS;
++	uint32_t nt = sweet_tl_nt < SWEET_TL_TICKS ? sweet_tl_nt : SWEET_TL_TICKS;
++	IOLog("TL begin %u swaps %u ticks\n", n, nt);
++	for (uint32_t i = 0; i < nt; i++) {
++		IOLog("TL v %llu\n", sweet_tl_tick[i]);
++		if ((i & 63u) == 63u) {
++			IOSleep(40);
++		}
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		struct sweet_tl_swap *t = &sweet_tl[i];
++		IOLog("TL s %u %llu %llu %llu %llu %llu %llu\n", t->id, t->arrive, t->gpu, t->flip, t->latch, t->win, t->wout);
++		if ((i & 63u) == 63u) {
++			IOSleep(40);
++		}
++	}
++	IOLog("TL end\n");
++}
++
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+@@ -159,11 +199,11 @@ enum {
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and
+- * CoreAnimation's logical frame is SCALED to the physical panel with
+- * nearest-neighbour tables (one source column per panel column and one
+- * source row per panel row), so nothing is cropped off. Boot-arg
+- * sweetscale=0 restores the old centered-crop behaviour; sweetfb_native=1
+- * presents the real panel size instead (no scaling, but no iPhone layout).
++ * shown scaled onto the whole 1080x2340 panel (the same 19.5:9), as an
++ * iPhone 12 mini shows the same 1125x2436 on its 1080x2340 one: by the
++ * display engine's scaler when it fetches the frame itself, else by the
++ * copy. Boot-arg sweetfb_scale=0 shows the centered 1080x2340 part of it
++ * instead (cropped), sweetfb_native=1 presents the real panel size.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+@@ -186,14 +226,43 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
++	/*
++	 * Putting a frame on the panel is a copy of ~10 MB by the CPU (there is no display
++	 * controller of ours behind the framebuffer). As HackiOS MiniIOMobileFramebuffer does it:
++	 * read from the surface's own cached kernel address (the GPU's surfaces are pushed out of
++	 * this processor's cache before every submission that names them, so nothing stale is
++	 * there), not the write-combined mapping -- reads through that one are uncached, and a
++	 * frame took tens of milliseconds -- and share the rows out among helper threads on the
++	 * other cores (boot-arg sweetfb_threads, default 3: the presenting thread and two helpers).
++	 */
++	/* scaled (fScale): a panel row is runs of consecutive source pixels (1125 -> 1080: 46 runs, 24 of every 25) */
++	struct ScaleRun {
++		uint32_t dst, src, n;   /* panel pixel (from the job's first), source pixel (likewise), how many */
++	};
++	struct RowJob {
++		uintptr_t src;          /* first pixel of the first row to copy */
++		uint64_t  stride;       /* bytes from one source row to the next */
++		uintptr_t dst;          /* first pixel of the first panel row */
++		uint64_t  rowBytes;     /* bytes from one panel row to the next */
++		size_t    bytes;        /* bytes of a row */
++		int32_t   rows;
++		const ScaleRun *runs;   /* scaled: the row's runs (NULL: the row as it is) */
++		uint32_t  nruns;
++		const uint32_t *rowMap; /* scaled: the source row (from the first) of each panel row */
++	};
++	IOLock            *fHelperLock;
++	const RowJob      *fHelperJob;
++	uint64_t           fHelperGeneration;
++	unsigned           fHelpersBusy, fHelpersStarted, fThreads;
++	static void helperMain(void *self, wait_result_t wr);
++	static void copyRows(const RowJob *job, int32_t y0, int32_t y1);
++	void copyFrame(const RowJob *job);
++
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+-	bool          fScaling;                 /* scale logical frame to panel */
+-	int32_t      *fColMap;                  /* panel column -> logical column */
+-	int32_t      *fRowMap;                  /* panel row -> logical row */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -203,26 +272,79 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	uint8_t       fEarly[SWEET_FB_SWAP_REC_SIZE];       /* the one before it, not shown yet either: */
++	bool          fHasEarly;                            /* shown first, at the next tick */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
++	int           fScanout;       /* boot-arg sweetfb_scanout: the display engine fetches the surface itself */
++	vm_offset_t   fMdp;           /* MDP registers: CTL0 and VIG0 */
++	bool          fScanning;      /* VIG0 is on a surface of iOS's, not on the boot framebuffer */
++	SweetSurface *fShown[2];      /* the surface on screen, and the one before it (still fetched for a frame) */
++	uint32_t      fFlips;
++	volatile uint32_t fShownSwap;   /* the id of the last swap shown (SwapWait waits for it) */
++	volatile uint64_t fLatchAt;     /* when the display engine last took a flip: a panel frame's start */
++	IOLock       *fPresentLock;     /* one present at a time (the tick's, SwapEnd's) */
++	thread_call_t fPresentCall;     /* SwapEnd's present, on a thread of its own (not the caller's) */
++	static void   presentCallout(thread_call_param_t self, thread_call_param_t unused);
++	bool          fImmediate;       /* boot-arg sweetfb_immediate (default 1): SwapEnd flips at once */
++	void          presentPending(void);
++	void          publishModes(void);
++	bool          swapShown(uint32_t id, uint64_t timeoutMS);
++	/* the frame rate, per second (boot-arg sweetfb_fps=1): swaps from backboardd, frames shown, of
++	 * which scanned out, and gaps of more than 20 ms between shown frames */
++	uint32_t      fRateSwaps, fRateShown, fRateFlips, fRateLate;
++	uint64_t      fRateSince, fLastShown;
++	uint64_t      fNextTick;      /* the timer's next deadline: a fixed 60 Hz cadence, not 16.7 ms after the work */
++	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled);
++	void scanBack(void);
++	bool          fScale;         /* boot-arg sweetfb_scale (default 1): the presented size onto the whole panel */
++	bool          fScaled;        /* VIG0 fetches the presented size and its scaler shrinks it (scalerOn) */
++	int           fScalerState;   /* 0 not looked at yet, 1 the boot loader's values kept, -1 not usable */
++	struct sweet_fb_reg fScalerSave[SWEET_FB_SCALER_REGS];    /* the boot loader's (put back by scalerOff) */
++	unsigned      fScalerRegs;
++	ScaleRun     *fRuns;          /* scaled copies: a panel row's runs, and each panel row's source row */
++	uint32_t     *fRowMap;
++	bool          scalerOn(void);
++	void          scalerOff(void);
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+-	vm_offset_t   fDsi;           /* raphael: winning DSI host, or 0 */
+-	bool          fDsiOk;         /* panel DCS path proven working */
+-	uint32_t      fBrightness;    /* last panel brightness level */
+-	bool          fInstantOff;    /* blank at once instead of fading */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+-	void setPanelBrightness(uint32_t level);
+-	bool dsiDisplayOnOff(bool on);
+-	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * What iOS sets on the framebuffer (logged, the first forty times): CoreBrightness's Display.m
++ * names IOMFBBrightnessLevel among the panel's properties; a number under it goes to the panel as
++ * on SweetBacklight (AppleARMBacklight), on a 0..65536 scale.
++ */
++extern "C" int sweet_panel_brightness(uint32_t level);
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	static unsigned logged;
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSNumber *n = dict ? OSDynamicCast(OSNumber, dict->getObject("IOMFBBrightnessLevel")) : NULL;
++	if (logged < 40) {
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		logged++;
++		if (s && properties->serialize(s)) {
++			IOLog("SWEET FB: set %.400s\n", s->text());
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (n) {
++		uint32_t v = n->unsigned32BitValue(), level = (uint32_t)(((uint64_t)(v > 65536u ? 65536u : v) * 2047u) / 65536u);
++		IOLog("SWEET FB: IOMFBBrightnessLevel %u -> panel %u: %d\n", v, level, sweet_panel_brightness(level ? level : (v ? 1 : 0)));
++	}
++	return kIOReturnSuccess;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -241,15 +363,74 @@ public:
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+-	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void notify(uint32_t type, const uint64_t *values, uint32_t count);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * The graphics accelerator Metal looks for (HackiOS MiniIOMobileFramebuffer.cpp IOAcceleratorES): its
++ * MetalPluginName is the bundle Metal opens, /System/Library/Extensions/<name>.bundle, and its
++ * MetalPluginClassName the device class in it (RedwoodMetal, from HackiOS's redwoodmetal.m). Only
++ * with boot-arg sweetmetal=1: a process handed a half-made device aborts rather than falls back, so
++ * the bundle itself says which processes get one (/usr/local/gltest/metal_allow) -- the window
++ * server stays on OpenGL ES.
++ */
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static void
++sweet_publish_accelerator(IOService *provider)
++{
++	uint32_t metal = 0;
++	if (!PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) || metal == 0) {
++		return;
++	}
++	IOAcceleratorES *accelerator = OSTypeAlloc(IOAcceleratorES);
++	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
++		accelerator->setName("sgx");
++		accelerator->setProperty("MetalPluginName", "RedwoodMetal");
++		accelerator->setProperty("MetalPluginClassName", "RedwoodMetalDevice");
++		/*
++		 * OpenGL ES: libGFXShared (gfxInitializeLibrary) reads these off this same service and
++		 * opens /System/Library/Extensions/<name>.bundle/<name> -- the Metal one when
++		 * IOGLESDefaultUseMetal is true. AppleMetalGLRenderer is Apple's GLES on Metal, so an
++		 * application's own EAGLContext runs on RedwoodMetal (the processes metal_allow names).
++		 * Without them EAGLContext found no renderer at all and gave applications no context.
++		 */
++		/* SweetGLES (/System/Library/Extensions/SweetGLES.bundle) is this port's OpenGL ES: loaded
++		 * by GLEngine in every process that makes a GL context, it hands the application's gl*
++		 * straight to Mesa (freedreno) and keeps GLEngine out of every call. Apple's GLES-on-Metal
++		 * stays named as the Metal renderer, chosen with the com.apple.opengles UseMetal default. */
++		accelerator->setProperty("IOGLESBundleName", "SweetGLES");
++		accelerator->setProperty("IOGLESMetalBundleName", "AppleMetalGLRenderer");
++		accelerator->setProperty("IOGLESDefaultUseMetal", kOSBooleanFalse);
++		accelerator->registerService();
++		IOLog("SWEET FB: IOAcceleratorES published (sweetmetal=%u): MetalPluginName RedwoodMetal\n", metal);
++	}
++	OSSafeReleaseNULL(accelerator);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
++	fScanout = -1;
++	{
++		int v = 0;
++		if (PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0) {
++			sweet_surface_display_pool_init();    /* early: while memory is in one piece */
++		}
++	}
++	/*
++	 * present() waits for the GPU to be done with a surface before it shows it (sweet_gpu_surface_wait,
++	 * on the vsync timer's thread): said so for the GL bridge (HackiOS eagl.c display_waits), which
++	 * then no longer glFinish()es every frame -- the window server goes on with its next frame while
++	 * the GPU draws this one, instead of waiting for it (3-14 ms of every frame).
++	 */
++	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
+ 	PE_Video video;
+ 
+ 	if (!IOService::start(provider)) {
+@@ -274,40 +455,25 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+-	fScaling = false;
+-	fColMap = fRowMap = NULL;
+-	if (fLogicalW != fWidth || fLogicalH != fHeight) {
+-		int scale = 1;
+-		PE_parse_boot_argn("sweetscale", &scale, sizeof(scale));
+-		if (scale != 0) {
+-			fColMap = (int32_t *)IOMalloc(fWidth * sizeof(int32_t));
+-			fRowMap = (int32_t *)IOMalloc(fHeight * sizeof(int32_t));
+-			if (fColMap != NULL && fRowMap != NULL) {
+-				fScaling = true;
+-				/* Nearest-neighbour maps: the logical pixel shown on each
+-				 * panel pixel, centres aligned:
+-				 * src = (p * logical + panel / 2) / panel. */
+-				for (uint32_t x = 0; x < fWidth; x++) {
+-					fColMap[x] = (int32_t)(((uint64_t)x *
+-					    fLogicalW + fWidth / 2) / fWidth);
+-				}
+-				for (uint32_t y = 0; y < fHeight; y++) {
+-					fRowMap[y] = (int32_t)(((uint64_t)y *
+-					    fLogicalH + fHeight / 2) / fHeight);
+-				}
+-			} else {
+-				if (fColMap != NULL) {
+-					IOFree(fColMap, fWidth * sizeof(int32_t));
+-					fColMap = NULL;
+-				}
+-				if (fRowMap != NULL) {
+-					IOFree(fRowMap, fHeight * sizeof(int32_t));
+-					fRowMap = NULL;
+-				}
+-			}
++	{
++		/* (SweetHID.cpp maps the touches by the same boot-args) */
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetfb_scale", &v, sizeof(v));
++		fScale = v != 0 && (fLogicalW != fWidth || fLogicalH != fHeight);
++		if (fScale) {
++			fRuns = (ScaleRun *)IOMallocData(sizeof(ScaleRun) * fWidth);
++			fRowMap = (uint32_t *)IOMallocData(sizeof(uint32_t) * fHeight);
+ 		}
+ 	}
++	publishModes();
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
++	fPresentCall = thread_call_allocate_with_priority(&AppleCLCD::presentCallout, this, THREAD_CALL_PRIORITY_HIGH);
++	{
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetfb_immediate", &v, sizeof(v));
++		fImmediate = v != 0;
++	}
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -323,80 +489,147 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+-
+-#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-	/* Panel DCS path: ABL leaves the DSI host streaming the splash, but the
+-	 * controller enable bit is not a reliable liveness signal (t21 read
+-	 * ctrl=0x20030000 with the panel clearly on). Prove the FIFO command
+-	 * path with a real command instead: try ctrl0 then ctrl1 and keep the
+-	 * first host that completes a command DMA. The probe is DCS 0x29
+-	 * (display on): a no-op for an already-live panel. */
+-	fInstantOff = true;   /* blank at once; sweetfb_fade=1 restores it */
+-	int fade = 0;
+-	if (PE_parse_boot_argn("sweetfb_fade", &fade, sizeof(fade)) && fade == 1) {
+-		fInstantOff = false;      /* legacy multi-vsync fade */
+-	}
+-	fDsi = 0;
+-	fDsiOk = false;
+-	fBrightness = 0;
+-	const uint32_t probeDw = 0x29u | (0x05u << 16) | (0x80u << 24);
+-	const vm_offset_t dsiPas[2] = { SWEET_FB_DSI0_PA, SWEET_FB_DSI1_PA };
+-	const char *const dsiNames[2] = { "ctrl0", "ctrl1" };
+-	for (unsigned i = 0; i < 2 && !fDsiOk; i++) {
+-		vm_offset_t dsi = ml_io_map(dsiPas[i], SWEET_FB_DSI_LEN);
+-		if (dsi == 0) {
+-			continue;
++	{
++		uint32_t threads = 3;
++		thread_t thread;
++		PE_parse_boot_argn("sweetfb_threads", &threads, sizeof(threads));
++		fThreads = threads >= 1 && threads <= 8 ? threads : 1;
++		fHelperLock = IOLockAlloc();
++		for (unsigned i = 0; fHelperLock != NULL && i + 1 < fThreads; i++) {
++			if (kernel_thread_start(&AppleCLCD::helperMain, this, &thread) != KERN_SUCCESS) {
++				fThreads = i + 1;
++				break;
++			}
++			thread_deallocate(thread);
+ 		}
+-		IOLog("SWEET FB: DSI %s @0x%llx ctrl=0x%x int=0x%x dma=0x%x tpg=0x%x\n",
+-		    dsiNames[i], (uint64_t)dsi, fbDsiR(dsi, SWEET_FB_DSI_CTRL),
+-		    fbDsiR(dsi, SWEET_FB_DSI_INT_CTRL),
+-		    fbDsiR(dsi, SWEET_FB_DSI_CMD_DMA_CTRL),
+-		    fbDsiR(dsi, SWEET_FB_DSI_TPG_CTRL));
+-		if (fbDsiSend(dsi, &probeDw, 1)) {
+-			fDsi = dsi;
+-			fDsiOk = true;
+-			IOLog("SWEET FB: DSI %s probe ok; panel DCS enabled\n",
+-			    dsiNames[i]);
+-		} else {
+-			IOLog("SWEET FB: DSI %s probe timeout\n", dsiNames[i]);
++		if (fHelperLock == NULL) {
++			fThreads = 1;
+ 		}
+ 	}
+-	int bright = -1;
+-	PE_parse_boot_argn("sweetfb_bright", &bright, sizeof(bright));
+-	if (bright >= 0 && fDsiOk) {
+-		setPanelBrightness((uint32_t)bright);
+-	}
+-#else
+-	fDsi = 0;
+-	fDsiOk = false;
+-	fBrightness = 0;
+-	fInstantOff = false;     /* SWEET keeps the legacy fade */
+-#endif
++	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * As Apple's display drivers publish it: a dictionary (QuartzCore and VideoToolbox read
++	 * PlaneBaseAlignmentLinear out of it; VideoToolbox's FigGetAlignmentForIOSurfaceOutputToDisplayService sent
++	 * a plain number CFDictionaryGetValue and mediaserverd died building Camera.app's preview). No
++	 * DisplayPipeStrideRequirements: the panel's own rows (4320 bytes) are not 64-aligned; both fall back.
++	 */
++	{
++		OSDictionary *alignment = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++
++		if (alignment != NULL && linear != NULL) {
++			alignment->setObject("PlaneBaseAlignmentLinear", linear);
++			setProperty("DisplayPipePlaneBaseAlignment", alignment);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(alignment);
++	}
+ 	registerService();
++	sweet_publish_accelerator(provider);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+-	    fScaling ? " (scaled)" : "");
++	    fScale ? ", scaled to the panel" : (fLogicalW != fWidth || fLogicalH != fHeight) ? ", centered crop" : "");
+ 	return true;
+ }
+ 
++void
++AppleCLCD::copyRows(const RowJob *job, int32_t y0, int32_t y1)
++{
++	for (int32_t y = y0; y < y1; y++) {
++		uintptr_t to = job->dst + (uint64_t)y * job->rowBytes;
++		uintptr_t from = job->src + (uint64_t)(job->rowMap != NULL ? job->rowMap[y] : (uint32_t)y) * job->stride;
++		if (job->runs == NULL) {
++			memcpy((void *)to, (const void *)from, job->bytes);
++			continue;
++		}
++		for (uint32_t i = 0; i < job->nruns; i++) {
++			const ScaleRun *run = &job->runs[i];
++			memcpy((void *)(to + (uint64_t)run->dst * 4), (const void *)(from + (uint64_t)run->src * 4), (size_t)run->n * 4);
++		}
++	}
++}
++
++/* A helper: waits for a frame, copies its share of the rows (share index + 1; the presenter takes 0). */
++void
++AppleCLCD::helperMain(void *self, __unused wait_result_t wr)
++{
++	AppleCLCD *fb = (AppleCLCD *)self;
++	uint64_t done = 0;
++	unsigned index;
++
++	IOLockLock(fb->fHelperLock);
++	index = fb->fHelpersStarted++;
++	IOLockUnlock(fb->fHelperLock);
++	for (;;) {
++		const RowJob *job;
++		IOLockLock(fb->fHelperLock);
++		while (fb->fHelperGeneration == done) {
++			IOLockSleep(fb->fHelperLock, &fb->fHelperGeneration, THREAD_UNINT);
++		}
++		done = fb->fHelperGeneration;
++		job = fb->fHelperJob;
++		IOLockUnlock(fb->fHelperLock);
++		copyRows(job, (int32_t)((int64_t)job->rows * (index + 1) / fb->fThreads),
++		    (int32_t)((int64_t)job->rows * (index + 2) / fb->fThreads));
++		IOLockLock(fb->fHelperLock);
++		if (--fb->fHelpersBusy == 0) {
++			IOLockWakeup(fb->fHelperLock, &fb->fHelpersBusy, true);
++		}
++		IOLockUnlock(fb->fHelperLock);
++	}
++}
++
++/* The rows shared out: the helpers take theirs, this thread the first share, then waits for them. */
++void
++AppleCLCD::copyFrame(const RowJob *job)
++{
++	if (fThreads <= 1 || fHelpersStarted + 1 < fThreads) {
++		copyRows(job, 0, job->rows);
++		return;
++	}
++	IOLockLock(fHelperLock);
++	fHelperJob = job;
++	fHelpersBusy = fThreads - 1;
++	fHelperGeneration++;
++	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
++	IOLockUnlock(fHelperLock);
++	copyRows(job, 0, (int32_t)((int64_t)job->rows / fThreads));
++	IOLockLock(fHelperLock);
++	while (fHelpersBusy != 0) {
++		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
++	}
++	IOLockUnlock(fHelperLock);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (sweet_tl_on && sweet_tl_nt < SWEET_TL_TICKS) {
++		sweet_tl_tick[sweet_tl_nt] = sweet_tl_us();
++		sweet_tl_nt = sweet_tl_nt + 1;
++	}
++	/*
++	 * What a vsync says, as IOMobileFramebuffer says it (and HackiOS's MiniIOMobileFramebuffer):
++	 * three 64-bit numbers in six halves -- the time of this refresh, the same again (when it was
++	 * presented), and the count. This sent the count first and the time second: CoreAnimation took
++	 * the count for the refresh's time, long past, and planned its frames from that -- starting
++	 * each one ~11 ms after the tick, too late to be done by the next. The time is the tick's
++	 * deadline, not whenever this ran.
++	 */
++	uint64_t at = fb->fNextTick != 0 && fb->fNextTick <= now ? fb->fNextTick : now;
+ 	uint64_t values[6] = {
++		(uint32_t)at, (uint32_t)(at >> 32),
++		(uint32_t)at, (uint32_t)(at >> 32),
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+@@ -405,21 +638,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-	if (fb->fPowerOff) {
+-		if (fb->fInstantOff) {
+-			/* Already blanked in RequestPowerChange(0): keep the
+-			 * vsync cadence for clients, nothing to render. */
+-			IOLockUnlock(fb->fLock);
+-			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+-			return;
+-		}
++	if (0 && fb->fPowerOff) {   /* POWER-OFF HANDLING DISABLED: backboardd auto-dims the display
++	                             * seconds after boot (no backlight service), which skipped the panel
++	                             * flush and left the screen black. Keep flushing the live rendered
++	                             * frame regardless of power state on this research bench. */
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
++		if (0 && step <= 6) {   /* fade/blank DISABLED: keep the last rendered frame on the panel
++		                         * when backboardd auto-dims (no backlight svc), so the rendered
++		                         * lock/home screen stays visible on this research bench. */
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+@@ -431,20 +662,106 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
++	IOLockUnlock(fb->fLock);
+ 	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
++		/*
++		 * On the present thread, not here: a present waits for the GPU to be done with the frame
++		 * (up to SWEET_SWAP_GPU_MS), and while this waited no tick came -- with the GPU behind
++		 * (the widget panel, ~28 ms of GPU a frame) the ticks stopped for 70-110 ms at a time,
++		 * and CoreAnimation, which draws on them, with them. Boot-arg sweetfb_tickpresent=1: here.
++		 */
++		static int here = -1;
++		if (here < 0) {
++			int v = 0;
++			(void)PE_parse_boot_argn("sweetfb_tickpresent", &v, sizeof(v));
++			here = v != 0;
++		}
++		if (!here && fb->fPresentCall != NULL) {
++			thread_call_enter(fb->fPresentCall);
++		} else {
++			fb->presentPending();
+ 		}
+ 	}
+-	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		fb->present(rec);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	{
++		static int want = -1;
++		uint64_t now = mach_absolute_time(), ns = 0;
++		if (want < 0) {
++			int v = 0;
++			want = PE_parse_boot_argn("sweetfb_fps", &v, sizeof(v)) && v != 0;
++		}
++		if (fb->fRateSince == 0) {
++			fb->fRateSince = now;
++		}
++		absolutetime_to_nanoseconds(now - fb->fRateSince, &ns);
++		if (ns >= 1000000000ull) {
++			if (want && fb->fRateSwaps != 0) {
++				/*
++				 * And how often the panel itself is refreshed: INTF1's frame counter (sde_hw_intf.c
++				 * INTF_FRAME_COUNT 0x0AC, INTF1 at MDP + 0x6b800). The frames CoreAnimation can show
++				 * are no more than that, whatever this timer says.
++				 */
++				static vm_offset_t intf;
++				static uint32_t last_frames;
++				uint32_t frames = 0;
++				if (intf == 0) {
++					intf = ml_io_map_unmappable(SWEET_MDP_PA + 0x6b000u, 0x1000u, 0x7u /* VM_WIMG_IO */);
++				}
++				if (intf != 0) {
++					frames = *(volatile uint32_t *)(intf + 0x800u + 0x0acu);
++				}
++				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u frames\n", fb->fRateSwaps,
++				    fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull, frames - last_frames);
++				last_frames = frames;
++			}
++			fb->fRateSwaps = fb->fRateShown = fb->fRateFlips = fb->fRateLate = 0;
++			fb->fRateSince = now;
++		}
++		/* re-armed for the next 1/60 s from the last deadline, not from now: re-armed after the
++		 * work (which waits for the GPU) every tick was longer than 16.7 ms and "60 Hz" ran at 40-50 */
++		uint64_t period = 0;
++		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ull, &period);
++		if (fb->fNextTick == 0) {
++			fb->fNextTick = now;
++		}
++		fb->fNextTick += period;
++		static int phase_lock = -1;
++		if (phase_lock < 0) {
++			/*
++			 * Off unless boot-arg sweetfb_phaselock=1: since a swap is flipped as it comes (0107), the
++			 * moment the engine takes a flip follows CoreAnimation's frame, which follows this tick --
++			 * chasing it stretched the tick to 17-18 ms, and CoreAnimation, which draws on it, to
++			 * ~53 frames a second. The panel itself runs at 60 Hz (XBL's SAMSUNG_EA_NOTCH_FHD: 60 Hz,
++			 * DSC, 682 MHz bit clock): a fixed 16.67 ms is what to give.
++			 */
++			int v = 0;
++			(void)PE_parse_boot_argn("sweetfb_phaselock", &v, sizeof(v));
++			phase_lock = v != 0;
++		}
++		if (phase_lock && fb->fLatchAt != 0 && now - fb->fLatchAt < period * 60u) {
++			/*
++			 * In step with the panel: the display engine takes a flip at the start of the panel's
++			 * frame (its own timing, not this timer's), and SwapWait waits for that. A tick just
++			 * before a frame starts has its flip on the panel at once, and CoreAnimation the whole
++			 * frame for the next; one just after waited a whole frame, and the next swap came late.
++			 * Each tick moves at most 1 ms towards LEAD before the panel's frame start.
++			 */
++			uint64_t lead = 0, step = 0;
++			nanoseconds_to_absolutetime(2500000ull, &lead);
++			nanoseconds_to_absolutetime(1000000ull, &step);
++			int64_t off = (int64_t)((fb->fNextTick + lead - fb->fLatchAt) % period);   /* past a frame start */
++			if (off > (int64_t)period / 2) {
++				off -= (int64_t)period;
++			}
++			off = off > (int64_t)step ? (int64_t)step : off < -(int64_t)step ? -(int64_t)step : off;
++			fb->fNextTick -= off;
++		}
++		if (fb->fNextTick <= now) {
++			fb->fNextTick = now + period;   /* fell behind (a long GPU wait): start again from here */
++		}
++		AbsoluteTime deadline;
++		*(uint64_t *)&deadline = fb->fNextTick;
++		sender->wakeAtTime(deadline);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+@@ -475,6 +792,10 @@ get32(const uint8_t *p, uint32_t off)
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++
++/* sweet_gpu.c: wait for the GPU to be done with the last submission naming a surface. */
++extern "C" int sweet_gpu_surface_wait(uint32_t surf_id, uint32_t ms);
++#define SWEET_SWAP_GPU_MS 100   /* a frame the GPU has not drawn by then is shown as it is (HackiOS: 500; the vsync workloop waits here) */
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -484,18 +805,442 @@ static uint64_t sweet_fb_swap_count;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/*
++ * Show the swap waiting to be shown (the earlier of two first). From the vsync tick, and with
++ * scanout from SwapEnd itself (fImmediate): CoreAnimation waits for each swap to be on the
++ * panel before it draws the next (SwapWait), so a swap kept for the next tick of a timer that
++ * is not the panel's cost it up to a frame every frame. Flipped at once, the display engine
++ * takes it at the start of the panel's next frame, as a phone's display does. A flip the
++ * engine has not taken yet is waited for first (not overwritten: that frame would be lost).
++ */
++void
++AppleCLCD::presentPending(void)
++{
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		return;
++	}
++	IOLockLock(fPresentLock);
++	IOLockLock(fLock);
++	bool have = fDirty;
++	if (have && fHasEarly) {
++		memcpy(rec, fEarly, SWEET_FB_SWAP_REC_SIZE);   /* (the latest stays for the next) */
++		fHasEarly = false;
++	} else if (have) {
++		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = false;
++	}
++	IOLockUnlock(fLock);
++	if (have) {
++		uint32_t flips = fFlips;
++		uint64_t now = mach_absolute_time(), ns = 0, until = 0;
++		static int latch_wait = -1;     /* boot-arg sweetfb_latchwait=1: a flip waits for the last to be taken */
++		if (latch_wait < 0) {
++			int v = 0;
++			(void)PE_parse_boot_argn("sweetfb_latchwait", &v, sizeof(v));
++			latch_wait = v != 0;
++		}
++		if (latch_wait && fScanning && fMdp != 0) {
++			volatile uint32_t *r = (volatile uint32_t *)fMdp;
++			clock_interval_to_deadline(20, kMillisecondScale, &until);
++			while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0 && mach_absolute_time() < until) {
++				IODelay(100);
++			}
++		}
++		present(rec);
++		IOLockLock(fLock);
++		memcpy((void *)&fShownSwap, rec + 0x50, sizeof(uint32_t));   /* (the swap's id, +0x50) */
++		IOLockWakeup(fLock, (event_t)&fShownSwap, false);
++		IOLockUnlock(fLock);
++		fRateShown++;
++		fRateFlips += fFlips - flips;
++		if (fLastShown != 0) {
++			absolutetime_to_nanoseconds(now - fLastShown, &ns);
++			fRateLate += ns > 20000000ull;
++		}
++		fLastShown = now;
++	}
++	IOLockUnlock(fPresentLock);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
++void
++AppleCLCD::presentCallout(thread_call_param_t self, __unused thread_call_param_t unused)
++{
++	((AppleCLCD *)self)->presentPending();
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	IOLockLock(fLock);
++	/*
++	 * Two swaps within one tick (CoreAnimation's frames do not come exactly 16.7 ms apart): the
++	 * first is kept and shown at the next tick, the second at the one after -- not the first
++	 * dropped and the next tick left with nothing new, a frame missed in a steady motion (the
++	 * "micro lags"). A third before either is shown drops the oldest.
++	 */
++	if (fDirty && fFlushTicks == 1) {
++		memcpy(fEarly, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fHasEarly = true;
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fRateSwaps++;
++	sweet_dvfs_kick();
++	if (sweet_tl_on) {
++		uint32_t i = sweet_tl_n;
++		if (i < SWEET_TL_SWAPS) {
++			bzero(&sweet_tl[i], sizeof(sweet_tl[i]));
++			memcpy(&sweet_tl[i].id, rec + 0x50, sizeof(uint32_t));
++			sweet_tl[i].arrive = sweet_tl_us();
++			sweet_tl_n = i + 1;
++		}
++	}
+ 	IOLockUnlock(fLock);
++	if (fImmediate && fScanout > 0) {
++		/*
++		 * Not on the caller's thread: a present waits for the GPU to be done with the frame (1.5-3
++		 * ms, sweet_gpu_surface_wait), and the caller is CoreAnimation's render thread, which could
++		 * be drawing the next frame meanwhile -- the heaviest frames missed their tick by that much.
++		 */
++		if (fPresentCall != NULL) {
++			thread_call_enter(fPresentCall);
++		} else {
++			presentPending();
++		}
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++/*
++ * Scanning out (boot-arg sweetfb_scanout=1), as Android's composer has the display engine do: no
++ * copy, the engine fetches iOS's surface itself. The boot loader leaves pipe VIG0 fetching its
++ * framebuffer (SRC0_ADDR 0x9c000000, 1080x2340, stride 4320; dt qcom,sde-sspp-off: vig0 0x5000)
++ * through CTL0 to INTF1, whose tear check refreshes the command-mode panel by itself every frame
++ * (INTF_TEAR autorefresh, sweet_dpu.c's survey). A swap writes the surface's address and stride
++ * into VIG0 and VIG0's flush bit into CTL0 (sde_hw_ctl: SSPP_VIG0 = bit 0): the engine takes the
++ * double-buffered registers at the next frame's start, so there is no tearing. The surface has to
++ * be one physical piece below 4 GB (SweetSurface allocates CoreAnimation's full-screen ones so);
++ * anything else is copied as before, with VIG0 back on the boot framebuffer. Scaled (fScale), VIG0
++ * fetches the whole 1125x2436 surface and its scaler shrinks it to the panel (scalerOn): the boot
++ * loader's 1:1 setup of the pipe is changed at the first flip, and put back by scanBack.
++ */
++
++/* VIG0's last flush taken by the display engine (or MS gone by): what is written now is all taken together at the next */
++static bool
++sweet_fb_flush_taken(volatile uint32_t *r, uint32_t ms)
++{
++	uint64_t until = 0;
++	clock_interval_to_deadline(ms, kMillisecondScale, &until);
++	while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0) {
++		if (mach_absolute_time() >= until) {
++			return false;
++		}
++		IODelay(100);
++	}
++	return true;
++}
++
++/*
++ * VIG0 fetching SW x SH and its scaler giving DW x DH to LM0, as the vendor driver sets a pipe up when
++ * nobody gave it scaler data (sde_plane.c _sde_plane_setup_scaler3 -> sde_hw_sspp.c setup_rects,
++ * setup_pe, sde_hw_util.c sde_hw_setup_scaler3): bilinear, so no coefficient tables to load; a phase
++ * step of SW / DW source pixels (21 fraction bits: 1125 -> 1080 is 0x215555, 2436 -> 2340 0x215015);
++ * initial phase 0; the preload of QSEED3 (4 across, 3 down); no pixel extension (the pipe's
++ * PE_OVERRIDE is set, so REQ_PIXELS is what it fetches: the whole source). The scaler's op mode last.
++ */
++static unsigned
++sweet_fb_scaler_config(struct sweet_fb_reg *c, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, bool alpha)
++{
++	uint32_t src = (sh << 16) | sw, dst = (dh << 16) | dw;
++	uint32_t step_x = (uint32_t)(((uint64_t)sw << SWEET_QSEED_PHASE_SHIFT) / dw);
++	uint32_t step_y = (uint32_t)(((uint64_t)sh << SWEET_QSEED_PHASE_SHIFT) / dh);
++	uint32_t preload = SWEET_QSEED_PRELOAD_H | (SWEET_QSEED_PRELOAD_V << 8) | (SWEET_QSEED_PRELOAD_H << 16) |
++	    (SWEET_QSEED_PRELOAD_V << 24);
++	uint32_t op = SWEET_QSEED_OP_ENABLE | SWEET_QSEED_OP_Y_BILINEAR | SWEET_QSEED_OP_BLEND | SWEET_QSEED_OP_8BIT;
++	const uint32_t q = SWEET_MDP_VIG0_QSEED;
++	unsigned n = 0;
++
++	if (alpha) {
++		op |= SWEET_QSEED_OP_ALPHA | SWEET_QSEED_OP_A_BILINEAR;
++	}
++	c[n++] = { SWEET_MDP_VIG0_SRC_SIZE, src };
++	c[n++] = { SWEET_MDP_VIG0_SRC_XY, 0 };
++	c[n++] = { SWEET_MDP_VIG0_OUT_SIZE, dst };
++	c[n++] = { SWEET_MDP_VIG0_OUT_XY, 0 };
++	c[n++] = { SWEET_MDP_VIG0_DECIMATION, 0 };
++	for (uint32_t i = 0; i < 3; i++) {     /* colour 0, colours 1 and 2, colour 3: LR, TB, REQ_PIXELS */
++		c[n++] = { SWEET_MDP_VIG0_PE(i) + 0x0u, 0 };
++		c[n++] = { SWEET_MDP_VIG0_PE(i) + 0x4u, 0 };
++		c[n++] = { SWEET_MDP_VIG0_PE(i) + 0x8u, src };
++	}
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0x0u, 0 };
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0x4u, 0 };
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0x8u, 0 };
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0xcu, 0 };
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0x0u, step_x };
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0x4u, step_y };
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0x8u, step_x };      /* (RGB: no subsampled chroma) */
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0xcu, step_y };
++	c[n++] = { q + SWEET_QSEED_PRELOAD, preload };
++	c[n++] = { q + SWEET_QSEED_SRC_SIZE_Y + 0x0u, src };
++	c[n++] = { q + SWEET_QSEED_SRC_SIZE_Y + 0x4u, src };
++	c[n++] = { q + SWEET_QSEED_DST_SIZE, dst };
++	c[n++] = { q + SWEET_QSEED_OP_MODE, op };
++	return n;
++}
++#define SWEET_FB_SCALER_SRC     0       /* (indexes into that: logged) */
++#define SWEET_FB_SCALER_OUT     2
++#define SWEET_FB_SCALER_REQ     7
++#define SWEET_FB_SCALER_STEP    18
++#define SWEET_FB_SCALER_DST     25
++
++/*
++ * The scaler on (VIG0 fetching the presented size): the first time, its version read (a scaler that
++ * is not there, or the first QSEED3 with its other phase registers, is not used: the frames are then
++ * copied, scaled by the CPU) and what the boot loader had in these registers kept. Written while no
++ * flush is pending, so that the next flush (scanOut's, with the address) has the engine take all of
++ * them at one frame's start.
++ */
++bool
++AppleCLCD::scalerOn(void)
++{
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	struct sweet_fb_reg c[SWEET_FB_SCALER_REGS];
++	bool alpha = (r[SWEET_MDP_VIG0_FORMAT / 4] & SWEET_MDP_VIG0_FORMAT_ALPHA) != 0;
++	unsigned n = sweet_fb_scaler_config(c, fLogicalW, fLogicalH, fWidth, fHeight, alpha);
++
++	if (fScalerState < 0) {
++		return false;
++	}
++	if (fScalerState == 0) {
++		uint32_t version = r[(SWEET_MDP_VIG0_QSEED + SWEET_QSEED_VERSION) / 4];
++		if (version == 0 || version == 0xffffffffu || version == 0x1002u) {
++			IOLog("SWEET FB: VIG0's scaler reads version %#x: not used (frames copied, scaled by the CPU)\n", version);
++			fScalerState = -1;
++			return false;
++		}
++		for (unsigned i = 0; i < n; i++) {
++			fScalerSave[i].off = c[i].off;
++			fScalerSave[i].val = r[c[i].off / 4];
++		}
++		fScalerRegs = n;
++		fScalerState = 1;
++		IOLog("SWEET FB: VIG0's scaler version %#x; the boot loader's src %#x out %#x req %#x, scaler op %#x step %#x/%#x "
++		    "dst %#x\n", version, fScalerSave[SWEET_FB_SCALER_SRC].val, fScalerSave[SWEET_FB_SCALER_OUT].val,
++		    fScalerSave[SWEET_FB_SCALER_REQ].val, fScalerSave[n - 1].val, fScalerSave[SWEET_FB_SCALER_STEP].val,
++		    fScalerSave[SWEET_FB_SCALER_STEP + 1].val, fScalerSave[SWEET_FB_SCALER_DST].val);
++	}
++	if (!sweet_fb_flush_taken(r, 40)) {
++		IOLog("SWEET FB: scaler on: VIG0's last flush still not taken after 40 ms\n");
++	}
++	for (unsigned i = 0; i < n; i++) {
++		r[c[i].off / 4] = c[i].val;
++	}
++	fScaled = true;
++	IOLog("SWEET FB: VIG0 scaled: %ux%u -> %ux%u, step %#x/%#x, scaler op %#x\n", fLogicalW, fLogicalH, fWidth,
++	    fHeight, c[SWEET_FB_SCALER_STEP].val, c[SWEET_FB_SCALER_STEP + 1].val, c[n - 1].val);
++	return true;
++}
++
++/* The boot loader's 1:1 setup back (the next flush takes it), for its framebuffer. */
++void
++AppleCLCD::scalerOff(void)
++{
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	if (!fScaled) {
++		return;
++	}
++	(void)sweet_fb_flush_taken(r, 40);
++	for (unsigned i = 0; i < fScalerRegs; i++) {
++		r[fScalerSave[i].off / 4] = fScalerSave[i].val;
++	}
++	fScaled = false;
++}
++
++bool
++AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled)
++{
++	if (fMdp == 0 && (fMdp = ml_io_map_unmappable(SWEET_MDP_PA, 0x6000u, 0x7u /* VM_WIMG_IO */)) == 0) {
++		return false;
++	}
++	if (scaled && !fScaled && !scalerOn()) {
++		return false;
++	} else if (!scaled && fScaled) {
++		scalerOff();
++	}
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	r[SWEET_MDP_VIG0_ADDR / 4] = (uint32_t)pa;
++	r[SWEET_MDP_VIG0_STRIDE / 4] = (r[SWEET_MDP_VIG0_STRIDE / 4] & 0xffff0000u) | (stride & 0xffffu);
++	__asm__ volatile("dsb sy" ::: "memory");
++	r[SWEET_MDP_CTL0_FLUSH / 4] = SWEET_MDP_FLUSH_VIG0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_panel_new_frame();
++	sweet_fb_scanout_id = s->id;
++	if (s != fShown[0]) {
++		OSSafeReleaseNULL(fShown[1]);        /* two flips old: no longer fetched */
++		fShown[1] = fShown[0];
++		s->retain();
++		fShown[0] = s;
++	}
++	if (!fScanning || fFlips < 4) {
++		IOLog("SWEET FB: scanning out surface %u at %#llx, stride %u%s (flip %u)\n", s->id, pa, stride,
++		    fScaled ? ", scaled" : "", fFlips);
++	}
++	fScanning = true;
++	fFlips++;
++	return true;
++}
++
++/*
++ * SwapWait: until the swap is on the panel. CoreAnimation asks this before it draws into the
++ * buffer that swap replaced; answered at once, as before, it drew into the buffer the display
++ * engine was still fetching -- tearing, and frames run ahead of the panel then bunched. On the
++ * panel means: shown at a tick (or a later swap was), and when it was scanned out, the display
++ * engine has taken the new address -- CTL0's flush bits read back set until the engine latches
++ * them at the start of the panel's next frame.
++ */
++bool
++AppleCLCD::swapShown(uint32_t id, uint64_t timeoutMS)
++{
++	static uint32_t told;
++	uint64_t began = mach_absolute_time(), deadline, ns = 0;
++	bool shown = true;
++	uint64_t win = sweet_tl_on ? sweet_tl_us() : 0;
++	clock_interval_to_deadline((uint32_t)timeoutMS, kMillisecondScale, &deadline);
++	IOLockLock(fLock);
++	while ((int32_t)(fShownSwap - id) < 0 && id <= fSwapID) {
++		if (IOLockSleepDeadline(fLock, (event_t)&fShownSwap, *(AbsoluteTime *)&deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			shown = false;
++			break;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (shown && fScanning && fMdp != 0) {
++		volatile uint32_t *r = (volatile uint32_t *)fMdp;
++		bool pending = false;
++		while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0 && mach_absolute_time() < deadline) {
++			pending = true;
++			IODelay(100);
++		}
++		if (pending) {
++			fLatchAt = mach_absolute_time();   /* (seen to change: within 0.1 ms of the frame's start) */
++		}
++	}
++	if (sweet_tl_on) {
++		struct sweet_tl_swap *t = sweet_tl_find(id);
++		if (t != NULL && t->win == 0) {
++			t->win = win;
++			t->wout = sweet_tl_us();
++			t->latch = t->wout;         /* (on the panel by then: latched, or the flush already taken) */
++		}
++	}
++	if (told < 12) {
++		told++;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		IOLog("SWEET FB: swap wait for %u (shown %u, last begun %u): %s after %llu us\n", id, fShownSwap, fSwapID,
++		    shown ? "on the panel" : "timed out", ns / 1000ull);
++	}
++	return shown;
++}
++
++/*
++ * The display's modes, as CoreAnimation reads them (HackiOS MiniIOMobileFramebuffer publishModes):
++ * TimingElements and ColorElements, one timing of the presented size at 60 Hz (16.16), one colour
++ * mode, 8-bit RGB; GetBlock 0x40 answers with their identifiers as "the current mode". Without
++ * them CoreAnimation had no refresh rate from the display to plan its frames by.
++ */
++#define SWEET_FB_TIMING_ID 1
++#define SWEET_FB_COLOR_ID  1
++static void
++sweet_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 64);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++void
++AppleCLCD::publishModes(void)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8), *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4), *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1), *colors = OSArray::withCapacity(1);
++	const uint64_t rate = 60ull << 16;
++	if (timing && horizontal && vertical && color && timings && colors) {
++		sweet_fb_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_fb_set_number(color, "PixelEncoding", 0);
++		sweet_fb_set_number(color, "Depth", 8);
++		sweet_fb_set_number(color, "Colorimetry", 1);
++		sweet_fb_set_number(color, "EOTF", 1);
++		sweet_fb_set_number(color, "DynamicRange", 0);
++		sweet_fb_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_fb_set_number(horizontal, "Active", fLogicalW);
++		sweet_fb_set_number(horizontal, "Total", fLogicalW);
++		sweet_fb_set_number(horizontal, "SyncRate", rate);
++		sweet_fb_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_fb_set_number(vertical, "Active", fLogicalH);
++		sweet_fb_set_number(vertical, "Total", fLogicalH);
++		sweet_fb_set_number(vertical, "SyncRate", rate);
++		sweet_fb_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_fb_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_fb_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
++void
++AppleCLCD::scanBack(void)
++{
++	if (!fScanning) {
++		return;
++	}
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	scalerOff();        /* (scaled: the boot framebuffer is the panel's size) */
++	r[SWEET_MDP_VIG0_ADDR / 4] = (uint32_t)fPhys;
++	r[SWEET_MDP_VIG0_STRIDE / 4] = (r[SWEET_MDP_VIG0_STRIDE / 4] & 0xffff0000u) | (fRowBytes & 0xffffu);
++	__asm__ volatile("dsb sy" ::: "memory");
++	r[SWEET_MDP_CTL0_FLUSH / 4] = SWEET_MDP_FLUSH_VIG0;
++	fScanning = false;
++	IOLog("SWEET FB: back on the boot framebuffer\n");
++}
++
++/* Scaled: the first panel pixel (of PANEL) whose centre is on logical pixel L or after it (of LOGICAL). */
++static int32_t
++sweet_fb_panel_at(int32_t l, uint32_t logical, uint32_t panel)
++{
++	int64_t num = 2 * (int64_t)l * panel - logical;
++	int64_t p = num <= 0 ? 0 : (num + 2 * (int64_t)logical - 1) / (2 * (int64_t)logical);
++	return (int32_t)(p > (int64_t)panel ? panel : p);
++}
++
++/* Scaled: the logical pixel under panel pixel P's centre. */
++static uint32_t
++sweet_fb_logical_at(int32_t p, uint32_t logical, uint32_t panel)
++{
++	return (uint32_t)(((2 * (uint64_t)p + 1) * logical) / (2 * (uint64_t)panel));
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -535,7 +1280,24 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+-		uintptr_t src = s->kernelAddress();
++		/* the GPU may still be drawing it (submissions are not waited for): HackiOS MiniIOSurfaceDrawn */
++		bool gpu_done = sweet_gpu_surface_wait(id, SWEET_SWAP_GPU_MS);
++		if (sweet_tl_on && layer == 0) {
++			struct sweet_tl_swap *t = sweet_tl_find(get32(rec, 0x50));
++			if (t != NULL) {
++				t->gpu = sweet_tl_us();
++			}
++		}
++		if (!gpu_done) {
++			static uint32_t told;
++			if (told++ < 8) {
++				IOLog("SWEET FB: present: the GPU is not done with surface %u after %u ms; shown as it is\n",
++				    id, SWEET_SWAP_GPU_MS);
++			}
++		}
++		/* the surface's own cached address when it has one (see RowJob), else the kernel map */
++		IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++		uintptr_t src = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+@@ -547,205 +1309,136 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
+-		/* Source rect stays in surface coordinates, clamped to it. */
++		/*
++		 * Logical (presented) display coordinates -> panel coordinates: cropped, the centered part
++		 * (sweetfb_scale=0); scaled, the layer stays in logical coordinates (and is scaled below).
++		 */
++		int32_t areaW = (int32_t)(fScale ? fLogicalW : fWidth), areaH = (int32_t)(fScale ? fLogicalH : fHeight);
++		if (!fScale) {
++			dx -= fOffX;
++			dy -= fOffY;
++		}
++		if (dx < 0) {
++			sx -= dx;
++			w += dx;
++			dx = 0;
++		}
++		if (dy < 0) {
++			sy -= dy;
++			h += dy;
++			dy = 0;
++		}
+ 		if (w > (int32_t)s->width - sx) {
+ 			w = (int32_t)s->width - sx;
+ 		}
+ 		if (h > (int32_t)s->height - sy) {
+ 			h = (int32_t)s->height - sy;
+ 		}
++		if (w > areaW - dx) {
++			w = areaW - dx;
++		}
++		if (h > areaH - dy) {
++			h = areaH - dy;
++		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4 && fScaling) {
+-			/* Scale the logical dest rect onto the panel: each panel
+-			 * pixel samples the logical pixel its centre falls on (the
+-			 * per-pixel maps were built in start()). */
+-			int32_t x0 = (int32_t)(((uint64_t)dx * fWidth +
+-			    fLogicalW / 2) / fLogicalW);
+-			int32_t y0 = (int32_t)(((uint64_t)dy * fHeight +
+-			    fLogicalH / 2) / fLogicalH);
+-			int32_t x1 = (int32_t)(((uint64_t)(dx + w) * fWidth +
+-			    fLogicalW / 2) / fLogicalW);
+-			int32_t y1 = (int32_t)(((uint64_t)(dy + h) * fHeight +
+-			    fLogicalH / 2) / fLogicalH);
+-			if (x0 < 0) {
+-				x0 = 0;
+-			}
+-			if (y0 < 0) {
+-				y0 = 0;
+-			}
+-			if (x1 > (int32_t)fWidth) {
+-				x1 = (int32_t)fWidth;
+-			}
+-			if (y1 > (int32_t)fHeight) {
+-				y1 = (int32_t)fHeight;
+-			}
+-			for (int32_t py = y0; py < y1; py++) {
+-				int32_t ly = fRowMap[py] - dy;
+-				if (ly < 0) {
+-					ly = 0;
+-				}
+-				if (ly >= h) {
+-					ly = h - 1;
+-				}
+-				uint32_t *dstRow = (uint32_t *)(fPixels +
+-				    (uint64_t)py * fRowBytes);
+-				const uint32_t *srcRow = (const uint32_t *)(src +
+-				    s->offset + (uint64_t)(sy + ly) * s->bytesPerRow +
+-				    (uint64_t)sx * 4);
+-				for (int32_t px = x0; px < x1; px++) {
+-					int32_t lx = fColMap[px] - dx;
+-					if (lx < 0) {
+-						lx = 0;
+-					}
+-					if (lx >= w) {
+-						lx = w - 1;
++		if (fScanout < 0) {
++			int v = 0;
++			fScanout = PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0;
++		}
++		if (fScanout && src != 0 && bpe == 4 && (mask & 0xfu) == 1u && dx == 0 && dy == 0 &&
++		    w == areaW && h == areaH) {
++			uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			uint64_t need = (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4;
++			IOByteCount seg = 0;
++			addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++			if (pa != 0 && seg >= need && pa + need <= 0x100000000ull && scanOut(s, pa, s->bytesPerRow, fScale)) {
++				if (sweet_tl_on) {
++					struct sweet_tl_swap *t = sweet_tl_find(get32(rec, 0x50));
++					if (t != NULL) {
++						t->flip = sweet_tl_us();
+ 					}
+-					dstRow[px] = srcRow[lx];
+ 				}
++				s->release();
++				continue;
+ 			}
+-		} else if (src != 0 && bpe == 4) {
+-			/* Centered crop (sweetscale=0): show the panel-sized
+-			 * window of the logical frame. */
+-			dx -= fOffX;
+-			dy -= fOffY;
+-			if (dx < 0) {
+-				sx -= dx;
+-				w += dx;
+-				dx = 0;
+-			}
+-			if (dy < 0) {
+-				sy -= dy;
+-				h += dy;
+-				dy = 0;
+-			}
+-			if (w > (int32_t)fWidth - dx) {
+-				w = (int32_t)fWidth - dx;
+-			}
+-			if (h > (int32_t)fHeight - dy) {
+-				h = (int32_t)fHeight - dy;
+-			}
+-			if (w > 0 && h > 0) {
+-				for (int32_t y = 0; y < h; y++) {
+-					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-					    (size_t)w * 4);
++			{
++				static uint32_t told;
++				if (told++ < 6) {
++					IOLog("SWEET FB: not scanned out: surface %u pa %#llx, %llu of %llu bytes in one piece\n", s->id,
++					    (unsigned long long)pa, (unsigned long long)seg, (unsigned long long)need);
+ 				}
+ 			}
++		} else if (fScanout) {
++			static uint32_t told;
++			if (told++ < 6) {
++				IOLog("SWEET FB: not scanned out: mask %#x src %d bpe %u at %d,%d %dx%d (%s %dx%d)\n", mask, src != 0, bpe,
++				    dx, dy, w, h, fScale ? "presented" : "panel", areaW, areaH);
++			}
+ 		}
+-		s->release();
+-	}
+-}
+-
+-#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-/* CoreBrightness/backboardd drives panel brightness through IOMFB sel 50
+- * (setBrightnessCorrection) in 0..10000 units; the t21 log caught
+- * backboardd calling it with 10000. Map that onto the panel's 11-bit
+- * DCS 0x51 level (4..2047) with a perceptual table so the low end of the
+- * slider is usable; linear between points. */
+-static uint32_t
+-sweetFbPanelLevel(uint32_t v)
+-{
+-	static const uint32_t vv[] = { 0, 1000, 2000, 3000, 4000, 5000,
+-	    6000, 7000, 8000, 9000, 10000 };
+-	static const uint32_t ll[] = { 4, 14, 40, 92, 180, 320,
+-	    530, 830, 1220, 1620, 2047 };
+-	if (v >= 10000u) {
+-		return 2047u;
+-	}
+-	for (unsigned i = 1; i < sizeof(vv) / sizeof(vv[0]); i++) {
+-		if (v <= vv[i]) {
+-			uint32_t span = vv[i] - vv[i - 1];
+-			uint32_t off = v - vv[i - 1];
+-			return ll[i - 1] +
+-			    (uint32_t)(((uint64_t)(ll[i] - ll[i - 1]) * off) / span);
++		if (fScanning) {
++			scanBack();
+ 		}
+-	}
+-	return SWEET_FB_BRIGHT_MIN;
+-}
+-
+-/* DCS 0x51, big-endian 11-bit level, the vendor _ss variant. */
+-void
+-AppleCLCD::setPanelBrightness(uint32_t level)
+-{
+-	if (level < SWEET_FB_BRIGHT_MIN) {
+-		level = SWEET_FB_BRIGHT_MIN;
+-	}
+-	if (level > SWEET_FB_BRIGHT_MAX) {
+-		level = SWEET_FB_BRIGHT_MAX;
+-	}
+-	if (!fDsiOk) {
+-		/* Remember the ask; the next display-on applies it. */
+-		fBrightness = level;
+-		return;
+-	}
+-	uint32_t dw[2];
+-	dw[0] = 0x02u | (0x39u << 16) | (0xc0u << 24);
+-	dw[1] = ((level >> 8) & 0xffu) | ((level & 0xffu) << 8) | 0xffff0000u;
+-	if (fbDsiSend(fDsi, dw, 2)) {
+-		fBrightness = level;
+-		IOLog("SWEET FB: brightness %u\n", level);
+-	} else {
+-		fDsiOk = false;
+-		IOLog("SWEET FB: brightness DCS failed; panel DCS disabled\n");
+-	}
+-}
+-
+-/* DCS set_display_on/off (0x29/0x28): short write, no parameter. */
+-bool
+-AppleCLCD::dsiDisplayOnOff(bool on)
+-{
+-	if (!fDsiOk) {
+-		return false;
+-	}
+-	uint32_t dw = (on ? 0x29u : 0x28u) | (0x05u << 16) | (0x80u << 24);
+-	return fbDsiSend(fDsi, &dw, 1);
+-}
+-
+-IOReturn
+-AppleCLCD::setProperties(OSObject *properties)
+-{
+-	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+-	if (dict != NULL) {
+-		/* Dump every key: the t21 hook only matched two guessed names and
+-		 * never fired, so any other property channel stays invisible. */
+-		OSCollectionIterator *iter =
+-		    OSCollectionIterator::withCollection(dict);
+-		if (iter != NULL) {
+-			while (OSObject *obj = iter->getNextObject()) {
+-				OSSymbol *key = OSDynamicCast(OSSymbol, obj);
+-				if (key != NULL) {
+-					IOLog("SWEET FB: setProperties key %s\n",
+-					    key->getCStringNoCopy());
++		if (src != 0 && bpe == 4 && !fScale) {
++			RowJob job;
++			job.src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			job.stride = s->bytesPerRow;
++			job.dst = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++			job.rowBytes = fRowBytes;
++			job.bytes = (size_t)w * 4;
++			job.rows = h;
++			job.runs = NULL;
++			job.nruns = 0;
++			job.rowMap = NULL;
++			copyFrame(&job);
++		} else if (src != 0 && bpe == 4 && fRuns != NULL && fRowMap != NULL) {
++			/*
++			 * Scaled by the CPU (a frame the display engine does not fetch itself), nearest rather
++			 * than the scaler's bilinear but onto the same place: panel pixel X shows logical pixel
++			 * ((2X + 1) * 1125) / (2 * 1080), the one under its centre, so a layer covers the same
++			 * part of the panel either way and a touch lands where it is drawn. The panel pixels of
++			 * the layer are those whose logical pixel is in it.
++			 */
++			int32_t x0 = sweet_fb_panel_at(dx, fLogicalW, fWidth), x1 = sweet_fb_panel_at(dx + w, fLogicalW, fWidth);
++			int32_t y0 = sweet_fb_panel_at(dy, fLogicalH, fHeight), y1 = sweet_fb_panel_at(dy + h, fLogicalH, fHeight);
++			uint32_t runs = 0;
++			for (int32_t x = x0; x < x1; x++) {
++				uint32_t from = sweet_fb_logical_at(x, fLogicalW, fWidth) - (uint32_t)dx;
++				if (runs != 0 && fRuns[runs - 1].src + fRuns[runs - 1].n == from) {
++					fRuns[runs - 1].n++;
++				} else {
++					fRuns[runs].dst = (uint32_t)(x - x0);
++					fRuns[runs].src = from;
++					fRuns[runs].n = 1;
++					runs++;
+ 				}
+ 			}
+-			iter->release();
+-		}
+-		OSNumber *n = OSDynamicCast(OSNumber,
+-		    dict->getObject("brightness"));
+-		if (n == NULL) {
+-			n = OSDynamicCast(OSNumber,
+-			    dict->getObject("ApplePanelBrightness"));
+-		}
+-		if (n != NULL) {
+-			uint32_t v = n->unsigned32BitValue();
+-			IOLog("SWEET FB: setProperties brightness %u\n", v);
+-			if (v > SWEET_FB_BRIGHT_MAX) {
+-				if (v > 10000u) {
+-					v = 10000u;
+-				}
+-				v = sweetFbPanelLevel(v);
++			for (int32_t y = y0; y < y1; y++) {
++				fRowMap[y - y0] = sweet_fb_logical_at(y, fLogicalH, fHeight) - (uint32_t)dy;
++			}
++			if (x1 > x0 && y1 > y0) {
++				RowJob job;
++				job.src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++				job.stride = s->bytesPerRow;
++				job.dst = fPixels + (uint64_t)y0 * fRowBytes + (uint64_t)x0 * 4;
++				job.rowBytes = fRowBytes;
++				job.bytes = (size_t)(x1 - x0) * 4;
++				job.rows = y1 - y0;
++				job.runs = fRuns;
++				job.nruns = runs;
++				job.rowMap = fRowMap;
++				copyFrame(&job);
+ 			}
+-			setPanelBrightness(v);
+ 		}
++		s->release();
+ 	}
+-	return IOService::setProperties(properties);
+ }
+-#endif /* ARM64_BOARD_CONFIG_RAPHAEL */
++
++extern "C" task_t sweet_window_server_task;      /* osfmk/kern/sched_prim.c */
+ 
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+@@ -754,20 +1447,15 @@ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID,
+ 		return false;
+ 	}
+ 	fTask = owningTask;
+-	return true;
+-}
+-
+-/* User clients must forward connect-set-properties to the service
+- * themselves (see Apple's IOHIDEventServiceUserClient): the base
+- * IOUserClient::setProperties does not. Without this the
+- * AppleCLCD brightness hook below can never be reached. */
+-IOReturn
+-IOMobileFramebufferUserClient::setProperties(OSObject *properties)
+-{
+-	if (fFB != NULL) {
+-		return fFB->setProperties(properties);
++	{
++		/* the window server: its threads get the big cores (osfmk/kern/sched_prim.c choose_processor) */
++		char name[32] = "";
++		proc_selfname(name, sizeof(name));
++		if (strcmp(name, "backboardd") == 0) {
++			sweet_window_server_task = owningTask;
++		}
+ 	}
+-	return IOUserClient::setProperties(properties);
++	return true;
+ }
+ 
+ bool
+@@ -829,7 +1517,6 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+-static uint8_t sweet_fb_selhits[64];    /* raphael: log lines per selector */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -862,6 +1549,48 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		fFB->swap(rec);
+ 		break;
+ 	}
++	case kSweetFBSwapWait: {
++		static uint32_t told;
++		if (told < 6) {
++			told++;
++			IOLog("SWEET FB: SwapWait in %u: %#llx %#llx %#llx\n", args->scalarInputCount,
++			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0, args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0);
++		}
++		/*
++		 * Answered at once (boot-arg sweetfb_swapwait=1: until the swap is on the panel): waiting,
++		 * however short, put CoreAnimation in step with the panel's latches instead of the vsync
++		 * it is told of, 18.6 ms a frame; answered at once it draws every 16.7 (60 a second).
++		 */
++		static int wait = -1;
++		if (wait < 0) {
++			int v = 0;
++			(void)PE_parse_boot_argn("sweetfb_swapwait", &v, sizeof(v));
++			wait = v != 0;
++		}
++		if (wait && args->scalarInputCount >= 1) {
++			fFB->swapShown((uint32_t)args->scalarInput[0], 50);
++		}
++		break;
++	}
++	case kSweetFBSupportedFrameInfo:        /* in: type; out: how many, and their tags: none */
++		out[0] = 0;
++		outCount = 1;
++		break;
++	case kSweetFBGetCurrentAbsoluteTime:
++		out[0] = mach_absolute_time();
++		outCount = 1;
++		break;
++	case kSweetFBGetBlock:                  /* in: which block; out: its bytes (0x40: the current mode) */
++		if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			if (args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 && args->structureOutputSize >= 12) {
++				uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++				memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			}
++			return kIOReturnSuccess;    /* (not zeroed again below) */
++		}
++		break;
+ 	case kSweetFBGetID:
+ 		out[0] = 0;
+ 		outCount = 1;
+@@ -894,6 +1623,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
++			uint32_t dpu = 0;
+ 			bool off = args->scalarInput[0] == 0;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+@@ -902,44 +1632,39 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-			if (off && fFB->fInstantOff) {
+-				/* Blank the whole panel in one pass and put the panel
+-				 * itself to sleep; AMOLED black is pixels-off. Replaces
+-				 * the slow per-vsync fade (sweetfb_fade=1 restores it). */
+-				for (uint32_t y = 0; y < fFB->fHeight; y++) {
+-					uint32_t *row = (uint32_t *)(fFB->fPixels +
+-					    (uint64_t)y * fFB->fRowBytes);
+-					memset((void *)row, 0, (size_t)fFB->fWidth * 4);
+-				}
+-				(void)fFB->dsiDisplayOnOff(false);
+-				IOLog("SWEET FB: display off (instant)\n");
+-			} else if (!off && fFB->fInstantOff) {
+-				(void)fFB->dsiDisplayOnOff(true);
+-				if (fFB->fBrightness != 0) {
+-					fFB->setPanelBrightness(fFB->fBrightness);
+-				}
+-				IOLog("SWEET FB: display on\n");
+-			} else
+-#endif
+-			{
+-				IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			/* the panel dark while iOS has the display off (it still shows the last frame, and iOS
++			 * takes no touches then: it looked frozen), its brightness back when on */
++			IOLog("SWEET FB: display %s (panel %d)\n", off ? "off" : "on", sweet_panel_power(off ? 0 : 1));
++			if (!off) {
++				sweet_prof_start();       /* (once) the profiler's thread, asked by /tmp/prof_go */
++			}
++			if (!off && PE_parse_boot_argn("sweetdpu", &dpu, sizeof(dpu)) && dpu) {
++				sweet_dpu_survey();       /* once: the display engine as the boot loader left it */
+ 			}
+ 		}
+ 		break;
+-	case kSweetFBSetBrightnessCorrection:
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-		/* The brightness slider channel: 0..10000 in, panel DCS level out. */
++	case kSweetFBSetBrightnessCorrection: {
++		/*
++		 * raphael (Gsjsjzhznsz's port): backboardd was seen driving the slider through this
++		 * selector, 0..10000, before SweetBacklight existed here. Kept as a second way in: onto the
++		 * panel's 0..2047 with a perceptual table (linear between the points).
++		 */
+ 		if (args->scalarInputCount >= 1) {
+-			uint64_t v = args->scalarInput[0];
+-			if (v > 10000u) {
+-				v = 10000u;
++			static const uint32_t in[] = { 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000 };
++			static const uint32_t to[] = { 4, 14, 40, 92, 180, 320, 530, 830, 1220, 1620, 2047 };
++			uint32_t v = args->scalarInput[0] > 10000u ? 10000u : (uint32_t)args->scalarInput[0], level = 2047u;
++			for (unsigned i = 1; i < sizeof(in) / sizeof(in[0]); i++) {
++				if (v <= in[i]) {
++					level = to[i - 1] + (uint32_t)(((uint64_t)(to[i] - to[i - 1]) * (v - in[i - 1])) / (in[i] - in[i - 1]));
++					break;
++				}
+ 			}
+-			fFB->setPanelBrightness(sweetFbPanelLevel((uint32_t)v));
++			IOLog("SWEET FB: brightness correction %u -> panel %u: %d\n", v, level, sweet_panel_brightness(level));
+ 		}
+-#endif
+ 		break;
+-	case kSweetFBSwapWait:
++	}
++#endif
+ 	default:
+ 		break;
+ 	}
+@@ -950,22 +1675,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+-	if (selector == kSweetFBSetBrightnessCorrection || selector >= 64 ||
+-	    !(sweet_fb_logged & (1ULL << selector)) ||
+-	    sweet_fb_selhits[selector] < 8) {
++	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {
+ 			sweet_fb_logged |= 1ULL << selector;
+-			sweet_fb_selhits[selector]++;   /* first 8 uses each */
+ 		}
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s sel %u in %u/%u (%llx %llx %llx %llx) out %u/%u -> 0x%x\n",
+-		    name, selector,
++		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
+ 		    args->scalarInputCount, args->structureInputSize,
+-		    args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
+-		    args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
+-		    args->scalarInputCount > 2 ? args->scalarInput[2] : 0,
+-		    args->scalarInputCount > 3 ? args->scalarInput[3] : 0,
+ 		    args->scalarOutputCount, args->structureOutputSize, ret);
+ 	}
+ 	return ret;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..bed0efd 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -15,6 +15,12 @@
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
+  *
++ * Use counts: the library counts uses per process and calls trap 0 when its
++ * count for a category goes 0 -> 1, trap 1 when it goes back to 0;
++ * IOSurfaceIsInUse reads the system-wide counts (u32 per category at +0x18
++ * of the state page), which surface pools (CMPhoto's, CoreVideo's) go by
++ * before they hand a surface out again.
++ *
+  * The lock result tells the library where the surface lives in the
+  * caller's address space: +0 pixels, +8 shared state page (registry id,
+  * seed at +0xc), +0x10 timestamps, then id, sizes and geometry (layout in
+@@ -26,6 +32,14 @@
+  * ignored (logged once per selector).
+  */
+ #include "SweetSurface.h"
++extern "C" boolean_t pmap_is_modified(ppnum_t pn);
++extern "C" void pmap_clear_modify(ppnum_t pn);
++extern "C" void pmap_clear_refmod_options(ppnum_t pn, unsigned int mask, unsigned int options, void *arg);
++#define SWEET_VM_MEM_MODIFIED   0x01            /* osfmk/vm/pmap.h VM_MEM_MODIFIED */
++#define SWEET_PMAP_FF_WIRED     0x10000         /* osfmk/vm/pmap.h PMAP_OPTIONS_FF_WIRED */
++extern "C" boolean_t pmap_valid_page(ppnum_t pn);
++extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
++extern "C" void sweet_gpu_reap_dead_now(void);       /* bsd/dev/sweet_gpu.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -53,8 +67,8 @@ enum {
+ 	kSweetSurfaceTrapDecrementUse   = 1,
+ 	kSweetSurfaceTrapLock           = 2,
+ 	kSweetSurfaceTrapUnlock         = 3,
+-	kSweetSurfaceTrapRelease        = 4,
+-	kSweetSurfaceTrapReleaseFailed  = 5,
++	kSweetSurfaceTrapDetach         = 4,
++	kSweetSurfaceTrapRelease        = 5,
+ };
+ 
+ #define SWEET_SURFACE_RESULT_SIZE       0xa68
+@@ -65,6 +79,7 @@ enum {
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++#define SWEET_SURFACE_STATE_USES        0x18    /* u32 per use count category (2) in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+@@ -77,12 +92,66 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/*
++ * The display pool (boot-arg sweetfb_scanout=1): CoreAnimation's full-screen surfaces have to be one
++ * physical piece for the display engine to fetch them (SweetFramebuffer scanOut), and 11 MB in one
++ * piece is not to be had once the system has run a while -- so three are made at the start, while
++ * memory is whole, and a full-screen surface takes a free one (it goes back when the surface goes).
++ */
++#define SWEET_DISPLAY_POOL      4       /* two shown (SweetFramebuffer holds them) and two being drawn */
++#define SWEET_DISPLAY_W         1125u
++#define SWEET_DISPLAY_H         2436u
++#define SWEET_DISPLAY_BPR       4608u
++static IOBufferMemoryDescriptor *sweet_display_pool[SWEET_DISPLAY_POOL];
++bool sweet_display_busy[SWEET_DISPLAY_POOL];
++
++void
++sweet_surface_display_pool_init(void)
++{
++	vm_size_t size = round_page((vm_size_t)SWEET_DISPLAY_BPR * SWEET_DISPLAY_H);
++	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
++		IOByteCount seg = 0;
++		if (sweet_display_pool[i] != NULL) {
++			continue;
++		}
++		sweet_display_pool[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000FFFFF000ull);
++		addr64_t pa = sweet_display_pool[i] ? sweet_display_pool[i]->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
++		IOLog("SWEET SURF: display buffer %u: %s at %#llx, %llu of %lu bytes in one piece\n", i,
++		    sweet_display_pool[i] ? "made" : "NOT MADE", (unsigned long long)pa, (unsigned long long)seg, (unsigned long)size);
++	}
++}
++
++static IOBufferMemoryDescriptor *
++sweet_display_take(uint32_t size, uint32_t *slot)
++{
++	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
++		if (sweet_display_pool[i] != NULL && !sweet_display_busy[i] && sweet_display_pool[i]->getLength() >= size) {
++			sweet_display_busy[i] = true;
++			sweet_display_pool[i]->retain();
++			*slot = i + 1;
++			return sweet_display_pool[i];
++		}
++	}
++	return NULL;
++}
++
+ void
+ SweetSurface::free()
+ {
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
++	if (wrapped && memory != NULL) {
++		memory->complete();   /* balance the prepare() from the IOSurfaceAddress wrap */
++	}
++	if (poolSlot != 0) {
++		extern bool sweet_display_busy[];
++		sweet_display_busy[poolSlot - 1] = false;   /* the pool keeps its own reference */
++	}
++	if (pages != NULL) {
++		IOFree(pages, pageCount * sizeof(pages[0]));
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -97,8 +166,9 @@ SweetSurface::kernelAddress()
+ 		return (uintptr_t)buffer->getBytesNoCopy();
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+-	if (kernelMap == NULL && memory != NULL) {
++	if (kernelMap == NULL && memory != NULL && !kernelMapFailed) {
+ 		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMapFailed = kernelMap == NULL;   /* (memory an application lent for reading only) */
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -183,6 +253,222 @@ sweet_surface_copy(uint32_t id)
+ 	return s;
+ }
+ 
++/* Export an imported surface's wired physical pages for GPU (freedreno) mapping;
++ * fills pa[] with 4K page phys + geometry. The backing is wired (IOBuffer) or
++ * physical/held (wrap), so the phys pages are stable for the GPU's use. Returns 0
++ * on success. Called from the GPU driver's MSM_INFO_IOS_IMPORT handler to enable
++ * zero-copy GPU sampling of CoreAnimation surfaces instead of per-frame
++ * glTexImage2D copies (which leaked a fresh ~12 MB BO per frame -> OOM). */
++extern "C" int
++sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *npages,
++    uint32_t *allocSize, uint32_t *width, uint32_t *height, uint32_t *bytesPerRow,
++    uint32_t *pixelFormat)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	unsigned n = 0;
++	IOByteCount off;
++	if (s == NULL) { return -1; }
++	if (s->memory == NULL) { s->release(); return -1; }
++	/* Memory of a program's own with a surface made around it is not in whole pages, and seldom
++	 * in rows the GPU takes (HackiOS surfaceBuffer refuses it): the GL bridge copies it instead. */
++	if (s->wrapped) { s->release(); return -1; }
++	/* One entry per 4K GPU page (the GPU maps 4K pages; a 16K kernel page is four of them). */
++	for (off = 0; off < s->allocSize; off += 4096) {
++		IOByteCount seglen = 0;
++		addr64_t phys = s->memory->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++		if (phys == 0 || n >= maxpages) { s->release(); return -1; }
++		pa[n++] = (uint64_t)(phys & ~((addr64_t)4095));
++	}
++	*npages = n;
++	*allocSize = s->allocSize;
++	*width = s->width; *height = s->height;
++	*bytesPerRow = s->bytesPerRow; *pixelFormat = s->pixelFormat;
++	s->release();
++	return 0;
++}
++
++/*
++ * The GPU's hold on a surface (HackiOS RedwoodGPU surfaceBuffer: "the surface is held for as
++ * long as the buffer is there"), its seed (bumped by whoever writes it and unlocks it), and
++ * its pixels pushed out of this processor's cache: the GPU maps surfaces uncached, and what a
++ * CPU writer left in the cache would otherwise be read stale -- and evict later over what the
++ * GPU drew. Cache maintenance by VA acts on the physical lines whatever the VA's attributes,
++ * so the buffer's own (cached) kernel address is used when there is one, else the kernel map.
++ */
++extern "C" void *
++sweet_surface_gpu_ref(uint32_t id)
++{
++	return sweet_surface_copy(id);
++}
++
++extern "C" void
++sweet_surface_gpu_unref(void *surface)
++{
++	if (surface != NULL) {
++		((SweetSurface *)surface)->release();
++	}
++}
++
++extern "C" uint32_t
++sweet_surface_gpu_seed(void *surface)
++{
++	return *sweet_surface_seed((SweetSurface *)surface);
++}
++
++extern "C" void
++sweet_surface_gpu_flush(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	IOBufferMemoryDescriptor *bmd;
++	uintptr_t va, line, end;
++	if (s == NULL || s->memory == NULL) {
++		return;
++	}
++	bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	va = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
++	if (va == 0) {
++		return;
++	}
++	end = va + s->memory->getLength();
++	for (line = va & ~(uintptr_t)63; line < end; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Only what a processor wrote, pushed out of the cache: XNU sets a page's "modified" bit at the
++ * first write after the bit was cleared (the clear makes every mapping of it read-only again),
++ * so the pages with it set are the ones whose lines may be in the cache. Each is cleared, then
++ * pushed out (a write between the two faults and sets the bit again). Pushing out the whole of
++ * every surface a submission named was 500 MB a second of cache maintenance in the window
++ * server; it draws almost everything with the GPU. Returns the bytes pushed out, or -1 when the
++ * memory is not pages the VM keeps bits for (the panel's): then the caller pushes out all of it.
++ */
++static struct sweet_surface_page *
++sweet_surface_pages(SweetSurface *s)
++{
++	struct sweet_surface_page *list = s->pages;
++	uint64_t length, off;
++	uint32_t count = 0, most;
++	if (list != NULL || s->memory == NULL) {
++		return list;
++	}
++	/* by physical page, not by PAGE_SIZE steps of the memory: what an application lends starts
++	 * where its allocation does, anywhere in a page, and then every step lies in two pages */
++	length = s->memory->getLength();
++	most = (uint32_t)(length / PAGE_SIZE) + 2u;
++	list = (struct sweet_surface_page *)IOMalloc(most * sizeof(list[0]));
++	if (list == NULL) {
++		return NULL;
++	}
++	for (off = 0; off < length && count < most; count++) {
++		IOByteCount seg = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		uint64_t in_page = PAGE_SIZE - (pa & PAGE_MASK);
++		uint64_t len = in_page < length - off ? in_page : length - off;
++		list[count].pn = (ppnum_t)(pa >> PAGE_SHIFT);
++		if (pa == 0 || !pmap_valid_page(list[count].pn)) {
++			list[count].pn = 0;
++		}
++		list[count].off = (uint32_t)off;
++		list[count].len = (uint32_t)len;
++		list[count].poff = (uint32_t)(pa & PAGE_MASK);
++		off += len;
++	}
++	IOLockLock(sweet_surface_lock);
++	if (s->pages == NULL) {
++		s->pageCount = most;            /* (the allocation's size, for IOFree) */
++		s->pages = list;
++		if (count < most) {
++			list[count].len = 0;    /* end */
++		}
++		list = NULL;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	if (list != NULL) {
++		IOFree(list, most * sizeof(list[0]));
++	}
++	return s->pages;
++}
++
++static int64_t
++sweet_surface_push_written(SweetSurface *s)
++{
++	struct sweet_surface_page *list = sweet_surface_pages(s);
++	int64_t pushed = 0;
++	uint32_t pages = 0;
++	if (list == NULL) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < s->pageCount && list[i].len != 0; i++) {
++		if (list[i].pn == 0) {
++			static uint32_t told;
++			if (told++ < 8) {
++				IOLog("SWEET SURF: surface %u %ux%u: page %u is not the VM's: pushed out whole\n", s->id, s->width,
++				    s->height, i);
++			}
++			return -1;
++		}
++		if (!pmap_is_modified(list[i].pn)) {
++			continue;
++		}
++		/*
++		 * Wired mappings too (the applications' maps of their surfaces are wired): without
++		 * PMAP_OPTIONS_FF_WIRED the pmap leaves their write permission alone, the next write does
++		 * not fault, and "modified" was never cleared -- every surface was pushed out whole at
++		 * every submission, 160 MB in five seconds of the widget panel, in the flushes of the
++		 * window server's frames. Boot-arg sweetsurf_ffwired=0: as before.
++		 */
++		static int ff_wired = -1;
++		if (ff_wired < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("sweetsurf_ffwired", &v, sizeof(v));
++			ff_wired = v != 0;
++		}
++		if (ff_wired) {
++			pmap_clear_refmod_options(list[i].pn, SWEET_VM_MEM_MODIFIED, SWEET_PMAP_FF_WIRED, NULL);
++		} else {
++			pmap_clear_modify(list[i].pn);
++		}
++		/* by the kernel's own (cached) view of all memory: no mapping to make, none of a different kind */
++		uintptr_t at = (uintptr_t)ml_static_ptovirt((vm_offset_t)ptoa(list[i].pn)) + list[i].poff;
++		for (uintptr_t line = at & ~(uintptr_t)63, end = at + list[i].len; line < end; line += 64) {
++			__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++		}
++		pushed += list[i].len;
++		pages++;
++	}
++	if (pushed != 0) {
++		static uint32_t looks;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		OSBitOrAtomic(1u, &s->cpuWritten);
++		if (looks++ % 400u < 3u) {
++			/* (which surfaces are written by a processor, how much of them: the first of every 400) */
++			IOLog("SWEET SURF: surface %u %ux%u (display buffer %u): %u pages written since the last look\n", s->id,
++			    s->width, s->height, s->poolSlot, pages);
++		}
++	}
++	return pushed;
++}
++
++extern "C" int64_t
++sweet_surface_gpu_push_written(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	if (s != NULL && s->poolSlot != 0) {
++		/*
++		 * CoreAnimation's own framebuffers (the display pool): only the GPU draws into them, and
++		 * their pages never say otherwise -- an IOSurface's user mappings are wired, and the pmap
++		 * leaves a page with a wired mapping "modified" (arm_force_fast_fault skips wired PTEs, so
++		 * phys_attribute_clear keeps the bit). Pushing all of one out every frame was 11 MB of
++		 * cache maintenance a frame for nothing. Pushed out whole at first use only (the caller).
++		 */
++		return 0;
++	}
++	return s != NULL && s->memory != NULL ? sweet_surface_push_written(s) : -1;
++}
++
+ /* The table lock; the framebuffer may publish a surface before the root starts. */
+ static void
+ sweet_surface_init_lock(void)
+@@ -248,11 +534,52 @@ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+ 	return s;
+ }
+ 
++/*
++ * A Mach send right for a surface (IOSurfaceCreateMachPort). It holds a table
++ * user-count on the surface for as long as the port exists, so a surface handed
++ * to another process cannot leave the id table -- a later lookup-by-id from that
++ * process then still finds it (this is what stopped cross-process glyph/icon
++ * surfaces resolving to id 0). Mirrors MiniIOSurface IOSurfaceSendRight (cpp:789)
++ * + makeSendRight surfaceHold (cpp:1340) + IOSurfaceSendRight::free (cpp:806).
++ */
++class SweetSurfaceSendRight : public OSObject {
++	OSDeclareDefaultStructors(SweetSurfaceSendRight);
++
++public:
++	SweetSurface *surface;
++
++	bool init() APPLE_KEXT_OVERRIDE { surface = NULL; return OSObject::init(); }
++	void free() APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetSurfaceSendRight, OSObject);
++
++void
++SweetSurfaceSendRight::free()
++{
++	if (surface != NULL) {
++		sweet_surface_put(surface);     /* drop the table user-count taken in sweet_surface_port_in_task */
++		surface = NULL;
++	}
++	OSObject::free();
++}
++
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+ {
+ 	mach_port_name_t name = 0;
+-	IOUserClient::copyPortNameForObjectInTask(task, s, &name);
++	SweetSurfaceSendRight *right = OSTypeAlloc(SweetSurfaceSendRight);
++	if (right == NULL || !right->init()) {
++		OSSafeReleaseNULL(right);
++		return 0;
++	}
++	if (!sweet_surface_get(s)) {            /* re-insert into the table + bump users for the port's life */
++		right->release();
++		return 0;
++	}
++	right->surface = s;
++	IOUserClient::copyPortNameForObjectInTask(task, right, &name);
++	right->release();                       /* the port holds the only reference now */
+ 	return name;
+ }
+ 
+@@ -276,6 +603,34 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ }
+ 
++/* Bytes per element when the client did not say (mirrors MiniIOSurface defaultBytesPerElement cpp:365). */
++#define SWEET_FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
++static uint32_t
++sweet_default_bpe(uint32_t format)
++{
++	switch (format) {
++	case SWEET_FOURCC('L', '0', '0', '8'):
++	case SWEET_FOURCC('A', '0', '0', '8'):
++	case 0x00000008:
++		return 1;
++	case SWEET_FOURCC('L', '5', '6', '5'):
++	case SWEET_FOURCC('B', '5', '6', '5'):
++	case SWEET_FOURCC('L', '5', '5', '5'):
++	case SWEET_FOURCC('2', 'v', 'u', 'y'):
++	case SWEET_FOURCC('y', 'u', 'v', 's'):
++	case SWEET_FOURCC('y', 'u', 'v', 'f'):
++	case SWEET_FOURCC('L', '0', '1', '6'):
++	case SWEET_FOURCC('L', '0', '0', 'h'):
++		return 2;
++	case SWEET_FOURCC('R', 'G', 'h', 'A'):
++		return 8;
++	case SWEET_FOURCC('R', 'G', 'f', 'A'):
++		return 16;
++	default:
++		return 4;
++	}
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -284,10 +639,20 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 
+ 	s->width = sweet_dict_u32(props, "IOSurfaceWidth", 0);
+ 	s->height = sweet_dict_u32(props, "IOSurfaceHeight", 0);
+-	s->bytesPerElement = (uint16_t)sweet_dict_u32(props, "IOSurfaceBytesPerElement", 4);
++	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	s->bytesPerElement = (uint16_t)sweet_dict_u32(props, "IOSurfaceBytesPerElement",
++	    sweet_default_bpe(s->pixelFormat));
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+-	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/* iOS wide-gamut / 10-bit formats CoreAnimation draws as BGRA; our GL bridge renders only
++	 * single-plane BGRA, so substitute them (matches HackiOS MiniIOSurface) and drop plane info. */
++	bool sweet_fmt_subst = (s->pixelFormat == 'w30r' || s->pixelFormat == 'l10r' ||
++	    s->pixelFormat == 'w30R' || s->pixelFormat == 'b3a8');
++	if (sweet_fmt_subst) {
++		s->pixelFormat = 'BGRA';
++		s->bytesPerElement = 4;
++		s->elementWidth = s->elementHeight = 1;
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -299,9 +664,47 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/*
++	 * CAMetalLayer's drawables ("CAMetalLayer Display Drawable") are asked for at width * 4 bytes a
++	 * row -- PencilKit's 1128-pixel canvas came as 4512 -- which a6xx cannot import
++	 * (fd_resource_from_handle's pitchalign 6: 64 bytes), so the Metal driver had no drawable and
++	 * Notes' ink was never drawn. Those rows are rounded up to the alignment this kernel advertises;
++	 * CoreAnimation and the GPU both read a drawable's row back. Only those: rounding every
++	 * client-sized row (the first try) sheared images whose writers keep the row they asked for
++	 * (Notes' toolbar icons came out striped).
++	 */
++	/*
++	 * Which ones: the drawable is created without a name (CoreAnimation names it afterwards), as
++	 * BGRA, one plane, width * 4 rounded to 16 (1125 pixels: 4512); every image writer seen keeping its own row names
++	 * its surface at creation (CoreUI, QuartzCore, CoreVideo). So: rounded when unnamed and so
++	 * shaped (or named CAMetalLayer...), kept otherwise; each decision logged, the first 24.
++	 */
++	OSString *name = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
++	OSArray *plane_info = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	/* one-plane plane info counts as single-plane: CAMetalLayer passes its drawable's row there too */
++	bool one_plane = plane_info == NULL || plane_info->getCount() == 1;
++	/* and PencilKit's own canvas ("PencilKit", 1125x2436 at 4512): a surface it wraps as a Metal
++	 * texture and draws only on the GPU */
++	/* named ones only: an unnamed BGRA surface rounded (0157) was an image decoder's, which then
++	 * walked its rows past the end of its buffer -- SpringBoard crashed in DecodeRow */
++	bool drawable = name != NULL && (strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 ||
++	    strcmp(name->getCStringNoCopy(), "PencilKit") == 0);
++	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && one_plane) {
++		static unsigned told;
++		if (told < 24 || drawable || s->width >= 1000) {
++			told++;
++			IOLog("SWEET SURF: %ux%u asked %u bytes a row (not a multiple of %u), name %s: %s\n", s->width,
++			    s->height, s->bytesPerRow, SWEET_SURFACE_ROW_ALIGN, name ? name->getCStringNoCopy() : "(none)",
++			    drawable ? "rounded up" : "kept");
++		}
++		if (drawable) {
++			s->bytesPerRow = (uint32_t)((s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &
++			    ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++		}
++	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = sweet_fmt_subst ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
+@@ -325,15 +728,64 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+ 			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			bool rounded = false;
++			if (planes->getCount() == 1 && (p->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 &&
++			    (drawable || s->width >= 1000)) {
++				OSString *pn = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
++				IOLog("SWEET SURF: %ux%u plane 0 asked %u bytes a row, name %s: %s\n", s->width, s->height,
++				    p->bytesPerRow, pn ? pn->getCStringNoCopy() : "(none)", drawable ? "rounded up" : "kept");
++			}
++			if (drawable && planes->getCount() == 1 && (p->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0) {
++				/* the drawable's own row, as the surface's above (0157) */
++				p->bytesPerRow = (uint32_t)((p->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &
++				    ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++				rounded = true;
++			}
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
++			if (rounded && p->size < p->bytesPerRow * sweet_div_up(p->height, p->elementHeight)) {
++				p->size = p->bytesPerRow * sweet_div_up(p->height, p->elementHeight);
++			}
+ 			next = round_page((uint64_t)p->offset + p->size);
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;
+ 			}
+ 		}
+ 		s->planeCount = planes->getCount();
++	} else if (!sweet_fmt_subst && s->width != 0 && s->height != 0) {
++		/* two-plane YCbCr asked for without plane info: luma, then interleaved chroma (MiniIOSurface
++		 * biplanarLayout); *2 for the 10-bit ones, in 16 bits */
++		uint32_t hs = 0, vs = 0, wide = 0, f = s->pixelFormat;
++		if (f == '420v' || f == '420f') { hs = 2; vs = 2; }
++		else if (f == '422v' || f == '422f') { hs = 2; vs = 1; }
++		else if (f == '444v' || f == '444f') { hs = 1; vs = 1; }
++		else if (f == 'x420' || f == 'xf20') { hs = 2; vs = 2; wide = 1; }
++		else if (f == 'x422' || f == 'xf22') { hs = 2; vs = 1; wide = 1; }
++		else if (f == 'x444' || f == 'xf44') { hs = 1; vs = 1; wide = 1; }
++		if (hs != 0) {
++			struct sweet_surface_plane *y = &s->planes[0], *c = &s->planes[1];
++			bzero(y, sizeof(*y));
++			bzero(c, sizeof(*c));
++			y->width = s->width;
++			y->height = s->height;
++			y->bytesPerElement = wide ? 2 : 1;
++			y->elementWidth = y->elementHeight = 1;
++			y->bytesPerRow = sweet_row_bytes(y->width, 1, y->bytesPerElement);
++			y->offset = 0;
++			y->size = y->bytesPerRow * y->height;
++			c->width = sweet_div_up(s->width, hs);
++			c->height = sweet_div_up(s->height, vs);
++			c->bytesPerElement = wide ? 4 : 2;
++			c->elementWidth = c->elementHeight = 1;
++			c->bytesPerRow = sweet_row_bytes(c->width, 1, c->bytesPerElement);
++			c->offset = y->size;
++			c->size = c->bytesPerRow * c->height;
++			s->planeCount = 2;
++			if ((uint64_t)c->offset + c->size > end) {
++				end = (uint64_t)c->offset + c->size;
++			}
++		}
+ 	}
+ 
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+@@ -357,16 +809,31 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint32_t      uses[2];          /* this client's share of the surface's use counts (traps 0/1) */
++	bool          detached;         /* client let go (trap 4) but has not released yet (trap 5) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { detached = false; uses[0] = uses[1] = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetSurfaceRef, OSObject);
+ 
++static volatile SInt32 *
++sweet_surface_uses(SweetSurface *s, uint32_t category)
++{
++	return (volatile SInt32 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USES + 4 * category);
++}
++
+ void
+ SweetSurfaceRef::free()
+ {
++	/* uses this client still held (released the surface or exited while using it) end with it */
++	for (uint32_t c = 0; c < 2 && surface != NULL; c++) {
++		if (uses[c] != 0) {
++			OSAddAtomic(-(SInt32)uses[c], sweet_surface_uses(surface, c));
++			uses[c] = 0;
++		}
++	}
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
+@@ -406,8 +873,8 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
+ 
+-	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
+-	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
++	SweetSurfaceRef *findRef(uint32_t id, bool detached, unsigned int *index);
++	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+ 
+@@ -420,9 +887,12 @@ public:
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn useCount(uintptr_t id, uintptr_t category, int delta);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+ };
+ 
+@@ -478,11 +948,11 @@ IOSurfaceRootUserClient::clientClose(void)
+ 
+ /* Lock held. */
+ SweetSurfaceRef *
+-IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++IOSurfaceRootUserClient::findRef(uint32_t id, bool detached, unsigned int *index)
+ {
+ 	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+ 		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached == detached) {
+ 			if (index != NULL) {
+ 				*index = i;
+ 			}
+@@ -495,25 +965,17 @@ IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
+- *
+- * A lookup of a surface this client already has maps nothing and counts
+- * nothing (*existing): IOSurface.framework then gets base address -1 in the
+- * lock result and reuses its cached IOSurfaceClient. Counting it instead
+- * made the framework build a second client for the same id; releasing that
+- * one (traps 4 + 5) unmapped the memory under the first (backboardd
+- * snapshot crash in CGDataProviderCreateWithData).
+  */
+ IOReturn
+-IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing)
++IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut)
+ {
+-	*existing = false;
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef(s->id, NULL);
++	SweetSurfaceRef *ref = findRef(s->id, false, NULL);
+ 	if (ref != NULL && ref->surface == s) {
++		ref->count++;
+ 		IOLockUnlock(fLock);
+ 		sweet_surface_put(s);
+ 		*refOut = ref;
+-		*existing = true;
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -527,14 +989,18 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	/* The creator of a surface around its own memory has the pixels where they are: it is
++	 * told that address, and nothing is mapped a second time (HackiOS returnSurface). */
++	if (!(s->wrapped && s->clientTask == fTask)) {
++		ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	}
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+-	if (ref->data == NULL || ref->state == NULL) {
++	if ((ref->data == NULL && !(s->wrapped && s->clientTask == fTask)) || ref->state == NULL) {
+ 		ref->release();
+ 		return kIOReturnVMError;
+ 	}
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *raced = findRef(s->id, NULL);
++	SweetSurfaceRef *raced = findRef(s->id, false, NULL);
+ 	if (raced != NULL && raced->surface == s) {
+ 		/* Another thread mapped it meanwhile: count there, drop ours. */
+ 		raced->count++;
+@@ -567,7 +1033,7 @@ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x00, ref->data != NULL ? ref->data->getAddress() : s->clientAddress);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -585,17 +1051,52 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put32(out, 0x44, s->cacheMode);
+ 	put32(out, 0x50, s->parentID);
+ 	put32(out, 0x54, 1);
+-	for (uint32_t i = 0; i < s->planeCount; i++) {
++	/*
++	 * The planes, as IOSurface.framework reads them (HackiOS MiniIOSurface.h struct minisurf_plane):
++	 * width 0x00, height 0x04, offset 0x0c, bytes per row 0x10 (it was written at 0x08, a reserved
++	 * word: every IOSurfaceGetBytesPerRowOfPlane() answered 0, and VideoToolbox's decodes into
++	 * planes came out empty -- the wallpaper's HEIC pictures were all zero), size 0x14, element
++	 * 0x18..0x1b, components 0x1c..0x34. A surface without planes still has its one plane described
++	 * here (MiniIOSurface resultSize: at least one), the header's count staying 0.
++	 */
++	uint32_t described = s->planeCount ? s->planeCount : 1;
++	for (uint32_t i = 0; i < described && i < SWEET_SURFACE_MAX_PLANES; i++) {
+ 		uint8_t *p = out + 0x68 + i * 0x80;
++		struct sweet_surface_plane one;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
++		if (s->planeCount == 0) {
++			bzero(&one, sizeof(one));
++			one.width = s->width;
++			one.height = s->height;
++			one.bytesPerRow = s->bytesPerRow;
++			one.offset = 0;
++			one.size = s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++			one.bytesPerElement = s->bytesPerElement;
++			one.elementWidth = s->elementWidth;
++			one.elementHeight = s->elementHeight;
++			pl = &one;
++		}
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+ 		p[0x1b] = pl->elementHeight;
++		if (s->planeCount == 0 && (s->pixelFormat == 'BGRA' || s->pixelFormat == 'RGBA')) {
++			/* MiniIOSurface describeComponents: in memory order; names 1 alpha 2 red 3 green 4 blue */
++			static const uint8_t bgra[4] = { 4, 3, 2, 1 }, rgba[4] = { 2, 3, 4, 1 };
++			const uint8_t *names = s->pixelFormat == 'BGRA' ? bgra : rgba;
++			p[0x1c] = 4;
++			for (unsigned c = 0; c < 4; c++) {
++				p[0x20 + c] = 8;                   /* bit depth */
++				p[0x24 + c] = (uint8_t)(8 * c);    /* bit offset */
++				p[0x28 + c] = names[c];
++				p[0x2c + c] = 1;                   /* unsigned integer */
++				p[0x30 + c] = 1;                   /* full range */
++			}
++		}
+ 	}
+ }
+ 
+@@ -618,14 +1119,48 @@ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ 	return kIOReturnSuccess;
+ }
+ 
++static uint32_t sweet_surface_lookups_logged;
++
++/*
++ * Log a lookup/return outcome: the surface geometry, whether its backing mapped,
++ * and how much of that backing is non-zero (mirrors MiniIOSurface cpp:1311-1313),
++ * so an empty cross-process result (id 0 in the sampler) can be told apart from a
++ * resolved-but-blank one. Gated: first 64, plus every failure.
++ */
++static void
++sweet_surf_log_lookup(const char *how, uint32_t reqid, SweetSurface *s, IOReturn ret, bool mapped)
++{
++	if (ret == kIOReturnSuccess && sweet_surface_lookups_logged >= 64) {
++		return;
++	}
++	sweet_surface_lookups_logged++;
++	uint32_t id = reqid, w = 0, h = 0, fmt = 0, planes = 0, nonzero = 0, total = 0;
++	if (s != NULL) {
++		id = s->id; w = s->width; h = s->height; fmt = s->pixelFormat; planes = s->planeCount;
++		uintptr_t base = s->kernelAddress();
++		uint64_t len = s->memory != NULL ? s->memory->getLength() : 0;
++		if (base != 0 && len >= 4) {
++			const uint8_t *p = (const uint8_t *)base;
++			for (uint64_t at = 0; at + 4 <= len; at += 64) {
++				nonzero += (p[at] | p[at + 1] | p[at + 2] | p[at + 3]) != 0;
++				total++;
++			}
++		}
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: %s lookup/%s id %u %ux%u fmt 0x%x planes %u mapped %d nonzero %u/%u -> 0x%x\n",
++	    name, how, id, w, h, fmt, planes, mapped, nonzero, total, ret);
++}
++
+ /* Map s for this client and answer with its lock result. Takes s's user count. */
+ IOReturn
+ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
+ {
+ 	SweetSurfaceRef *ref = NULL;
+-	bool existing = false;
+-	IOReturn ret = addRef(s, &ref, &existing);
++	IOReturn ret = addRef(s, &ref);
+ 	if (ret != kIOReturnSuccess) {
++		sweet_surf_log_lookup("ret", s->id, s, ret, false);   /* createMappingInTask failed */
+ 		return ret;
+ 	}
+ 	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
+@@ -633,13 +1168,11 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+ 		sweet_surface_fill_result(s, ref, out);
+-		if (existing) {
+-			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
+-		}
+ 		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
+ 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
+ 	}
+-	if (ret != kIOReturnSuccess && !existing) {
++	sweet_surf_log_lookup("ret", s->id, s, ret, true);
++	if (ret != kIOReturnSuccess) {
+ 		/* The caller never learns the id: undo this create/lookup. */
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}
+@@ -685,11 +1218,76 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
++		OSNumber *wrapAddr = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++		if (wrapAddr != NULL) {
++			/* WRAP: the surface's pixels ARE the creator's own memory -- CoreAnimation
++			 * wraps its pictures / glyph atlases / app-drawn layer contents via
++			 * IOSurfaceAddress so the render server can sample them as-is. Map that
++			 * range instead of handing back a fresh zero buffer (which rendered all
++			 * content white). Mirrors HackiOS MiniIOSurface. No wired charge -- we
++			 * allocate no pixels of our own. */
++			IOMemoryDescriptor *md = NULL;
++			IOReturn held = kIOReturnNoMemory;
++			s->wrapped = true;
++			s->clientTask = fTask;
++			s->clientAddress = wrapAddr->unsigned64BitValue();
++			/* As HackiOS MiniIOSurface: the memory is as big as its owner says, not a byte
++			 * more (rounding up to whole pages ran past the owner's allocation and the
++			 * hold failed: every icon CoreAnimation wraps came back kIOReturnVMError), and
++			 * a picture that is only shown is held for reading (kIODirectionOut: the
++			 * device reads it) when it cannot be held for writing -- kIODirectionIn, as
++			 * here before, wants it writable too. */
++			{
++				uint64_t need = (uint64_t)s->offset +
++				    (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++				uint64_t told = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++				s->allocSize = (uint32_t)(told > need ? told : need);
++			}
++			for (int a = 0; a < 2 && held != kIOReturnSuccess; a++) {   /* InOut, then read-only */
++				OSSafeReleaseNULL(md);
++				md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)s->clientAddress,
++				    s->allocSize, (a == 0 ? kIODirectionInOut : kIODirectionOut), s->clientTask);
++				held = (md != NULL) ? md->prepare() : kIOReturnNoMemory;
++			}
++			if (held != kIOReturnSuccess) {
++				OSSafeReleaseNULL(md);
++				ret = kIOReturnVMError;
++			} else {
++				s->memory = md;
++				s->mapCache = kIOMapDefaultCache;
++				if (!sweet_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
++			}
++		} else {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			/* boot-arg sweetfb_scanout=1: a full-screen BGRA surface (what CoreAnimation presents,
++			 * 1125x2436) gets a buffer of the display pool, one physical piece below 4 GB, so that
++			 * the display engine can fetch it as it is (SweetFramebuffer scanOut); else as any other */
++			/* (only the window server's: PosterBoard makes a dozen full-screen BGRA surfaces of its own for
++			   the wallpaper, which took the pool, and the frames then went back to being copied, torn) */
++			char maker[32] = "";
++			proc_selfname(maker, sizeof(maker));
++			if (s->width == SWEET_DISPLAY_W && s->height == SWEET_DISPLAY_H && s->pixelFormat == 'BGRA' &&
++			    s->planeCount == 0 && s->bytesPerRow == SWEET_DISPLAY_BPR && strcmp(maker, "backboardd") == 0) {
++				mem = sweet_display_take(s->allocSize, &s->poolSlot);
++				if (mem == NULL) {
++					sweet_gpu_reap_dead_now();      /* (a dead window server's buffers may hold them) */
++					mem = sweet_display_take(s->allocSize, &s->poolSlot);
++				}
++				if (mem == NULL) {
++					static uint32_t told;
++					if (told++ < 4) {
++						IOLog("SWEET SURF: no display buffer free for a full-screen surface\n");
++					}
++				}
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+@@ -702,14 +1300,15 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				ret = kIOReturnNoResources;
+ 			}
+ 		}
++		}
+ 	}
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+-		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u wrap %d -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), s->wrapped, ret);
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+@@ -745,6 +1344,9 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		if (s != NULL) {
+ 			ret = sweet_surface_get(s) ? returnSurface(s, args) : kIOReturnNotFound;
+ 			s->release();
++		} else {
++			/* id not in the table: the sampler gets an empty IOSurface (id 0) */
++			sweet_surf_log_lookup("id", (uint32_t)arg0, NULL, kIOReturnNotFound, false);
+ 		}
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+@@ -752,10 +1354,14 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kSweetSurfaceLookupFromPort: {
+ 		OSObject *obj = NULL;
+ 		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
+-		SweetSurface *s = OSDynamicCast(SweetSurface, obj);
++		SweetSurfaceSendRight *right = OSDynamicCast(SweetSurfaceSendRight, obj);
++		SweetSurface *s = right != NULL ? right->surface : NULL;
+ 		if (ret == kIOReturnSuccess) {
+ 			ret = (s != NULL && sweet_surface_get(s)) ? returnSurface(s, args) : kIOReturnBadArgument;
+ 		}
++		if (ret != kIOReturnSuccess) {
++			sweet_surf_log_lookup("port", s != NULL ? s->id : 0, s, ret, false);
++		}
+ 		OSSafeReleaseNULL(obj);
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+@@ -772,6 +1378,65 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 200: {     /* SWEET: has surface arg0 been written by a processor since the last ask? (eagl.c surface_changed) */
++		/*
++		 * The GL bridge copies some surfaces into textures and has to notice when they are drawn
++		 * into; not every writer moves the seed, so it added up all their memory every frame --
++		 * 15% of the window server's processor time. The pages know: XNU keeps a "modified" bit
++		 * per page, set by the first write after it was cleared. Asked here and cleared, a page
++		 * at a time; out: 1 written, 0 not. The GPU's submissions read the same bits (they push
++		 * out of the cache only the written pages) and leave cpuWritten set for this.
++		 */
++		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
++		uint64_t dirty;
++		if (s == NULL || s->memory == NULL || args->scalarOutputCount < 1) {
++			OSSafeReleaseNULL(s);
++			return kIOReturnNotFound;
++		}
++		dirty = sweet_surface_push_written(s) < 0 ? 1 : 0;
++		dirty |= OSBitAndAtomic(0u, &s->cpuWritten) & 1u;
++		args->scalarOutput[0] = dirty;
++		args->scalarOutputCount = 1;
++		s->release();
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
++	case 201: {     /* SWEET: selector 200 for up to 64 surfaces at once (in: their ids, u32 each; out: a mask, 1 written) */
++		/* (one Mach message a frame instead of one a surface: each costs the window server's render thread a kmsg
++		   made, copied in and out, and an IOKit dispatch) */
++		const uint32_t *ids = (const uint32_t *)args->structureInput;
++		uint32_t n = args->structureInputSize / sizeof(uint32_t);
++		uint64_t mask = 0;
++		if (ids == NULL || n == 0 || n > 64 || args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			SweetSurface *s = sweet_surface_copy(ids[i]);
++			uint64_t dirty = 1;                     /* (a surface not found: as written, so it is copied and seen to) */
++			if (s != NULL && s->memory != NULL) {
++				dirty = sweet_surface_push_written(s) < 0 ? 1 : 0;
++				dirty |= OSBitAndAtomic(0u, &s->cpuWritten) & 1u;
++			}
++			OSSafeReleaseNULL(s);
++			mask |= dirty << i;
++		}
++		args->scalarOutput[0] = mask;
++		args->scalarOutputCount = 1;
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
++	case 6:         /* WrapClientImage: a surface around memory of the caller's own */
++	case 7:         /* WrapClientMemory */
++		/*
++		 * Not done here, and said so (HackiOS MiniIOSurface: kIOReturnUnsupported). The
++		 * framework then returns NULL and CoreAnimation uploads the picture as an ordinary
++		 * texture. Answered "success" with nothing filled in (the default below), the
++		 * framework made an empty surface (id 0, no memory, null color info): the GPU
++		 * renderer drew the lock screen's text and pictures from it as black, and the
++		 * window server crashed on its color info.
++		 */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+@@ -786,12 +1451,43 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++IOSurfaceRootUserClient::useCount(uintptr_t id, uintptr_t category, int delta)
+ {
++	if (category >= 2) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)id, false, NULL);
++	if (ref == NULL) {
++		ref = findRef((uint32_t)id, true, NULL);
++	}
++	if (ref == NULL) {
++		IOLockUnlock(fLock);
++		return kIOReturnNotFound;
++	}
++	if (delta > 0) {
++		ref->uses[category]++;
++		OSIncrementAtomic(sweet_surface_uses(ref->surface, (uint32_t)category));
++	} else if (ref->uses[category] != 0) {
++		ref->uses[category]--;
++		OSDecrementAtomic(sweet_surface_uses(ref->surface, (uint32_t)category));
++	}
++	IOLockUnlock(fLock);
+ 	return kIOReturnSuccess;
+ }
+ 
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount((uintptr_t)id, (uintptr_t)category, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount((uintptr_t)id, (uintptr_t)category, -1);
++}
++
+ static IOReturn
+ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ {
+@@ -848,12 +1544,33 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	return ret;
+ }
+ 
++/*
++ * A client drops a surface in two steps (mirrors MiniIOSurface cpp:1784/1798):
++ * trap 4 "detach" marks the ref while the client still holds its own lock, trap 5
++ * "release" drops it. A lookup of the same surface in between finds no non-detached
++ * ref and builds a fresh view instead of colliding with the dying one.
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, false, NULL);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
+ {
+ 	unsigned int index;
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, true, &index);    /* a detached view first */
++	if (ref == NULL) {
++		ref = findRef((uint32_t)(uintptr_t)id, false, &index);
++	}
+ 	if (ref != NULL && --ref->count == 0) {
+ 		fRefs->removeObject(index);     /* unmaps and drops the user count */
+ 	}
+@@ -862,12 +1579,12 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
++	[kSweetSurfaceTrapDetach]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+-	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 
+ IOExternalTrap *
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..de57d77 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -24,6 +24,13 @@ struct sweet_surface_plane {
+ 	uint8_t  elementWidth, elementHeight;
+ };
+ 
++/* One physical page of a surface's memory: which, and the bytes of the memory that are in it. */
++struct sweet_surface_page {
++	ppnum_t  pn;            /* 0: not a page the VM keeps "modified" bits for */
++	uint32_t off, len;      /* the memory's bytes [off, off + len) ... */
++	uint32_t poff;          /* ... are at this offset in the page */
++};
++
+ class SweetSurface : public OSObject {
+ 	OSDeclareDefaultStructors(SweetSurface);
+ 
+@@ -39,8 +46,16 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	bool                      wrapped;      /* backing is the creator's OWN memory (IOSurfaceAddress wrap) */
++	uint32_t                  poolSlot;     /* 1 + the display pool buffer it has, 0: none */
++	task_t                    clientTask;   /* task whose VA clientAddress lives in (for complete()) */
++	uint64_t                  clientAddress;
++	struct sweet_surface_page *pages;       /* the pixels' pages (made on first need) */
++	bool                      kernelMapFailed; /* (not to be tried again: every try printed a backtrace) */
++	uint32_t                  pageCount;
++	volatile UInt32           cpuWritten;   /* a processor wrote a page since selector 200 last asked */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; clientTask = NULL; clientAddress = 0; pages = NULL; pageCount = 0; cpuWritten = 0; kernelMapFailed = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -55,6 +70,8 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+  * retained surface that stays in the id table until released by the caller
+  * and every user.
+  */
++/* boot-arg sweetfb_scanout=1: physically contiguous full-screen buffers, made early (AppleCLCD::start) */
++void sweet_surface_display_pool_init(void);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7e9e217..7821022 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -364,6 +364,9 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/* what sweet_touch.c reports: the panel's 1080 columns, and its rows (davinci: 2340 stretched to 2400) */
++#define SWEET_TOUCH_W 1080
++#define SWEET_TOUCH_H (SWEET_MAX_Y + 1)
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -376,6 +379,7 @@ protected:
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	bool fScaled;   /* the whole panel is the whole presented display (SweetFramebuffer.cpp fScale) */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -440,8 +444,9 @@ SweetHIDTouch::start(IOService *provider)
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
++	int native = 0, scale = 1;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
+ 	fLogicalW = native ? 1080 : 1125;
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+ 	fLogicalH = native ? 2340 : 2436;
+@@ -450,13 +455,20 @@ SweetHIDTouch::start(IOService *provider)
+ #endif
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - SWEET_NATIVE_H) / 2;
++	/*
++	 * As SweetFramebuffer.cpp shows the display: scaled onto the whole panel (boot-args as there,
++	 * sweetfb_scale default 1), the panel's edges are the display's; cropped (sweetfb_scale=0), the
++	 * panel is the centered part of it.
++	 */
++	fScaled = !native && scale != 0;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch registered\n");
++	IOLog("SWEET HID: touch registered (%s %dx%d)\n", fScaled ? "the whole panel onto" : "the panel centered on",
++	    fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
+@@ -475,9 +487,19 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/*
++	 * Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp), 0..1 across it. Scaled,
++	 * a pixel's centre: panel x 0 and 1079 are 0.0005 and 0.9995 of the display, its pixels 0 and 1124
++	 * as the framebuffer shows them there.
++	 */
++	IOFixed nx, ny;
++	if (fScaled) {
++		nx = (IOFixed)((((int64_t)x * 2 + 1) << 16) / (2 * SWEET_TOUCH_W));
++		ny = (IOFixed)((((int64_t)y * 2 + 1) << 16) / (2 * SWEET_TOUCH_H));
++	} else {
++		nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++		ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	}
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index f80c531..84c9c99 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -83,6 +83,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetBattery;"
+     "     'name'           = AppleSmartBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = AppleARMBacklight;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetBacklight;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..43f170a 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..4cdb720 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -717,8 +717,8 @@ extern unsigned char iso_font[256 * 16];
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 
+-static volatile uint32_t *fbcon_base;
+-static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++volatile uint32_t *fbcon_base;
++uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
+ static void
