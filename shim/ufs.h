@@ -30,7 +30,7 @@ uint32_t ufs_crumb_diag(void);
 #else
 static inline void ufs_crumb(const char *tag, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
 {
-        (void)tag; (void)a; (void)b; (void)c; (void)d;
+	(void)tag; (void)a; (void)b; (void)c; (void)d;
 }
 static inline uint32_t ufs_crumb_diag(void) { return 0; }
 #endif

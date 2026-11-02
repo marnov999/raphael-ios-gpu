@@ -159,3 +159,29 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   - root: `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 0`, errno 19, retried forever (expected).
   - **Ghost touches = two fixed rows: y=101 and y=318** (many down/up pairs, random x, no finger). Real
     touches were the swipes at y 1700-1900. Looks like two bad sensor lines; filter or re-tune later (step 4).
+
+### 2026-11-02 (step 2 started: boot menu + MIUI chain-load, t2)
+- Shim: davinci's spmi/menu/linux/charge modules ported; console.c, mmu.c (mmu_fast_copy), fdt.c
+  (fdt_chosen_has, fdt_size, fdt_rebuild_for_linux) taken from davinci (three-way merge with upstream as
+  base; raphael files were re-tabbed first, their tab->space drift made every line differ). loader.c
+  merged cleanly (davinci's I-cache off before the XNU jump; shim.c turns it on at entry).
+  - PPIDs: PON 0x008 (power bit 0, RESIN = vol-down bit 1; idle 0x4 = cable), vol-up PM8150 GPIO6 0x0c5,
+    USBIN PM8150B 0x213 (bit 4).
+  - linux.c: MIUI kernel at 0xc0000000 (+0x80000), else 0x140000000; never over FB (0x2400000), the bad
+    DRAM, the ramdisk, the tree or the shim. **The tree MIUI gets carries badram@1016a0000 (no-map)**:
+    fdt_rebuild_for_linux(..., bad_base, bad_size), skipped if the input tree has one. Host-tested with
+    dtb_2 (SM8150 v2): dtc parses it, node identical to kbuild/boot-resv.img's.
+  - Menu: "Boot MIUI" enabled when the image carries MIUI (linux_present), since userdata is MIUI's.
+- MIUI parts: `boot` partition read from the phone = kbuild/raphael_magisk_boot_legacysar.img (sha256 of
+  the used part 98485627...). `tools/unpack-miui-boot.py backup/boot-current-20261102.img backup/miui`:
+  UNCOMPRESSED_IMG wrapper, Image 41963536 bytes (text_offset 0x80000, want_initramfs = Magisk), cpio
+  ramdisk 427332, cmdline 333 bytes. `MIUI=backup/miui tools/mkiosimg.sh NAME KERNEL` packs it.
+- Normal MIUI boot (reference, out/logs/miui-normal-cmdline.txt): ABL picks `androidboot.dtb_idx=2`
+  (SM8150 v2, msm-id 339: this phone), dtbo_idx=10; DTB bootargs first ("ramoops_memreserve=4M rcu..."),
+  then the image cmdline, then ABL's words (verity dm=, vbmeta, skip_initramfs ...). Panel:
+  `msm_drm.dsi_display0=dsi_ss_fhd_ea8076_global_cmd_display` (Samsung EA8076, command mode).
+  /proc/iomem: System RAM c0000000-1ffffffff in one piece (bad pages in use) before the fix.
+- Image: out/raphael-ios-t2.img (61 MB = shim + XNU payload + MIUI kernel/ramdisk/cmdline), CONSOLE=1,
+  ufsroot=rawdump. To test with fastboot boot: menu; Boot MIUI (expect rooted MIUI, iomem hole
+  1016a0000-1016bffff); Boot iOS (as t1); Power off.
+

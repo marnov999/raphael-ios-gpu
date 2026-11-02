@@ -14,6 +14,8 @@
 #   ADT=path     device tree (default out/raphael.adt, from tools/mkadt.py OUT --raphael --highmem)
 #   DTB=path     stock SoC DTBs (default dtb/raphael-stock.dtb, from tools/stock-dtbs.py)
 #   SHIM=path    shim Image (default shim/out-clang/Image, from shim/build-clang.sh)
+#   MIUI=dir     also pack MIUI's kernel behind the payload (dir from tools/unpack-miui-boot.py: Image,
+#                ramdisk.cpio, cmdline.txt): the boot menu's "Boot MIUI" and off-mode charging (shim/linux.c)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 NAME=${1:?usage: mkiosimg.sh NAME KERNEL [boot-args...]} K=${2:?kernel}; shift 2
@@ -27,7 +29,12 @@ CMDLINE="rd=ufsroot0 ufsroot=$ROOT debug=0xc serial=3 cpus=${CPUS:-8} keepsyms=1
 for f in "$K" "$ADT" "$DTB" "$SHIM"; do [ -s "$f" ] || { echo "missing $f" >&2; exit 1; }; done
 mkdir -p out
 python3 tools/mkpayload.py "$K" "$ADT" "out/${NAME}_payload.bin" --cmdline "$CMDLINE" >/dev/null
-python3 tools/mkbootimg.py --header_version 2 --kernel "$SHIM" --ramdisk "out/${NAME}_payload.bin" \
+RD="out/${NAME}_payload.bin"
+if [ -n "${MIUI:-}" ]; then
+	python3 tools/mkcombo.py "$RD" "$MIUI/Image" "$MIUI/ramdisk.cpio" "$MIUI/cmdline.txt" "out/${NAME}_combo.bin" >/dev/null
+	RD="out/${NAME}_combo.bin"
+fi
+python3 tools/mkbootimg.py --header_version 2 --kernel "$SHIM" --ramdisk "$RD" \
 	--dtb "$DTB" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 \
 	--dtb_offset 0x1f00000 --pagesize 4096 --os_version 11.0.0 --os_patch_level 2021-10 \
 	--cmdline "console=null" -o "out/raphael-ios-$NAME.img"

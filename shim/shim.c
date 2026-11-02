@@ -13,6 +13,10 @@
 #include "diag.h"
 #include "loader.h"
 #include "ufs.h"
+#include "spmi.h"
+#include "menu.h"
+#include "linux.h"
+#include "charge.h"
 
 #define IMEM_RESTART_REASON     0x146aa65cUL    /* qcom,msm-imem restart_reason@65c */
 #ifdef RAPHAEL
@@ -80,51 +84,45 @@ static volatile int irq_src;
 /* ICC_SGI1R_EL1 value targeting the calling core only. */
 static uint64_t sgi_self(unsigned id)
 {
-        uint64_t m = rsr("mpidr_el1");
-        return ((m >> 16) & 0xff) << 32 |       /* Aff2 */
-               ((m >> 8) & 0xff) << 16 |        /* Aff1 */
-               (uint64_t)id << 24 |
-               (1U << (m & 0xf));               /* target list: Aff0 */
+	uint64_t m = rsr("mpidr_el1");
+	return ((m >> 16) & 0xff) << 32 |       /* Aff2 */
+	       ((m >> 8) & 0xff) << 16 |        /* Aff1 */
+	       (uint64_t)id << 24 |
+	       (1U << (m & 0xf));               /* target list: Aff0 */
 }
 
 static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 {
-        register uint64_t x0 __asm__("x0") = fn;
-        register uint64_t x1 __asm__("x1") = a1;
-        register uint64_t x2 __asm__("x2") = a2;
-        register uint64_t x3 __asm__("x3") = a3;
-        __asm__ volatile("smc #0"
-                         : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
-                         :
-                         : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
-                           "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-        return x0;
+	register uint64_t x0 __asm__("x0") = fn;
+	register uint64_t x1 __asm__("x1") = a1;
+	register uint64_t x2 __asm__("x2") = a2;
+	register uint64_t x3 __asm__("x3") = a3;
+	__asm__ volatile("smc #0"
+			 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+			 :
+			 : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+			   "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	return x0;
 }
 
 static uint64_t now(void)
 {
-        isb();
-        return rsr("cntpct_el0");
+	isb();
+	return rsr("cntpct_el0");
 }
 
-static void delay_ms(unsigned ms)
-{
-        uint64_t end = now() + rsr("cntfrq_el0") / 1000 * ms;
-        while (now() < end)
-                ;
-}
 
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
-        con_skip();
-        con_str("RESET", "now");
-        delay_ms(after_s * 1000);
-        wr32(USE_IMEM_RESTART_REASON, RESTART_BOOTLOADER);
-        __asm__ volatile("dsb sy" ::: "memory");
-        smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-        wr32(PSHOLD, 0);
-        for (;;)
-                __asm__ volatile("wfe");
+	con_skip();
+	con_str("RESET", "now");
+	delay_ms(after_s * 1000);
+	wr32(USE_IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	wr32(PSHOLD, 0);
+	for (;;)
+		__asm__ volatile("wfe");
 }
 
 /* ---- stage diagnostics (see diag.h) ---- */
@@ -148,67 +146,67 @@ static void stg_wr64(uintptr_t a, uint64_t v) { *(volatile uint64_t *)a = v; }
 
 static void stg_hex(char **p, uint64_t v)
 {
-        static const char d[] = "0123456789abcdef";
-        for (int i = 15; i >= 0; i--)
-                *(*p)++ = d[(v >> (4 * i)) & 0xf];
+	static const char d[] = "0123456789abcdef";
+	for (int i = 15; i >= 0; i--)
+		*(*p)++ = d[(v >> (4 * i)) & 0xf];
 }
 
 static void stg_record(uintptr_t base, unsigned code, uint64_t esr, uint64_t elr, uint64_t far)
 {
-        uint32_t cd = ufs_crumb_diag();
-        char ascii[128];        /* "STGDIAG2 " + 6 x (16 hex + 1 sp) + NUL = 112 */
-        char *p = ascii;
+	uint32_t cd = ufs_crumb_diag();
+	char ascii[128];        /* "STGDIAG2 " + 6 x (16 hex + 1 sp) + NUL = 112 */
+	char *p = ascii;
 
-        stg_wr(base + 0x00, STG_MAGIC);
-        stg_wr(base + 0x04, 2u << 24 | code);           /* version 2, stage code */
-        stg_wr(base + 0x08, cd);
-        stg_wr(base + 0x0c, (uint32_t)shim_stage_mode);
-        stg_wr64(base + 0x10, esr);
-        stg_wr64(base + 0x18, elr);
-        stg_wr64(base + 0x20, far);
+	stg_wr(base + 0x00, STG_MAGIC);
+	stg_wr(base + 0x04, 2u << 24 | code);           /* version 2, stage code */
+	stg_wr(base + 0x08, cd);
+	stg_wr(base + 0x0c, (uint32_t)shim_stage_mode);
+	stg_wr64(base + 0x10, esr);
+	stg_wr64(base + 0x18, elr);
+	stg_wr64(base + 0x20, far);
 
-        for (int i = 0; i < 8; i++)
-                *p++ = "STGDIAG2"[i];
-        *p++ = ' ';
-        stg_hex(&p, (uint64_t)code);
-        *p++ = ' ';
-        stg_hex(&p, cd);
-        *p++ = ' ';
-        stg_hex(&p, (uint64_t)shim_stage_mode);
-        *p++ = ' ';
-        stg_hex(&p, esr);
-        *p++ = ' ';
-        stg_hex(&p, elr);
-        *p++ = ' ';
-        stg_hex(&p, far);
-        *p++ = 0;
-        for (unsigned i = 0; i + 1 < sizeof(ascii) && ascii[i]; i++)
-                *(volatile char *)(base + 0x40 + i) = ascii[i];
-        *(volatile char *)(base + 0x40 + sizeof(ascii) - 1) = 0;
-        __asm__ volatile("dsb sy" ::: "memory");
+	for (int i = 0; i < 8; i++)
+		*p++ = "STGDIAG2"[i];
+	*p++ = ' ';
+	stg_hex(&p, (uint64_t)code);
+	*p++ = ' ';
+	stg_hex(&p, cd);
+	*p++ = ' ';
+	stg_hex(&p, (uint64_t)shim_stage_mode);
+	*p++ = ' ';
+	stg_hex(&p, esr);
+	*p++ = ' ';
+	stg_hex(&p, elr);
+	*p++ = ' ';
+	stg_hex(&p, far);
+	*p++ = 0;
+	for (unsigned i = 0; i + 1 < sizeof(ascii) && ascii[i]; i++)
+		*(volatile char *)(base + 0x40 + i) = ascii[i];
+	*(volatile char *)(base + 0x40 + sizeof(ascii) - 1) = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
 }
 
 void stage_diag_mark(unsigned code)
 {
-        if (code < stage_diag_stage)
-                code = stage_diag_stage;
-        stage_diag_stage = code;
-        stg_record(STAGE_DIAG_HI, code, 0, 0, 0);
-        stg_record(STAGE_DIAG_LO, code, 0, 0, 0);
+	if (code < stage_diag_stage)
+		code = stage_diag_stage;
+	stage_diag_stage = code;
+	stg_record(STAGE_DIAG_HI, code, 0, 0, 0);
+	stg_record(STAGE_DIAG_LO, code, 0, 0, 0);
 }
 
 void stage_diag_final(void)
 {
-        /* 20 + 20*stage seconds: stage 6 (ready to jump) -> 140 s.
-         * Distinct from the ~40 s exception reset and the ~200 s loader
-         * error path; a hang never resets at all. */
-        reset(20 + 20 * (stage_diag_stage ? stage_diag_stage : 6));
+	/* 20 + 20*stage seconds: stage 6 (ready to jump) -> 140 s.
+	 * Distinct from the ~40 s exception reset and the ~200 s loader
+	 * error path; a hang never resets at all. */
+	reset(20 + 20 * (stage_diag_stage ? stage_diag_stage : 6));
 }
 
 static void stage_diag_exc(unsigned code, uint64_t esr, uint64_t elr, uint64_t far)
 {
-        stg_record(STAGE_DIAG_HI, 0xf0u | (code & 0xf), esr, elr, far);
-        stg_record(STAGE_DIAG_LO, 0xf0u | (code & 0xf), esr, elr, far);
+	stg_record(STAGE_DIAG_HI, 0xf0u | (code & 0xf), esr, elr, far);
+	stg_record(STAGE_DIAG_LO, 0xf0u | (code & 0xf), esr, elr, far);
 }
 
 /* shimstage=1 in the DTB /chosen command line enables stage mode before
@@ -216,29 +214,29 @@ static void stage_diag_exc(unsigned code, uint64_t esr, uint64_t elr, uint64_t f
  * long androidboot list before our token. */
 static void stage_diag_detect(uintptr_t dtb)
 {
-        static char buf[512];
-        if ((fdt_chosen_str(dtb, "bootargs", buf, sizeof(buf)) ||
-             fdt_chosen_str(dtb, "commandline", buf, sizeof(buf))) &&
-            diag_has_token(buf, "shimstage=1"))
-                shim_stage_mode = 1;
+	static char buf[512];
+	if ((fdt_chosen_str(dtb, "bootargs", buf, sizeof(buf)) ||
+	     fdt_chosen_str(dtb, "commandline", buf, sizeof(buf))) &&
+	    diag_has_token(buf, "shimstage=1"))
+		shim_stage_mode = 1;
 }
 #else
 void stage_diag_mark(unsigned code)
 {
-        (void)code;
+	(void)code;
 }
 void stage_diag_final(void)
 {
-        for (;;)
-                ;
+	for (;;)
+		;
 }
 static void stage_diag_exc(unsigned code, uint64_t esr, uint64_t elr, uint64_t far)
 {
-        (void)code; (void)esr; (void)elr; (void)far;
+	(void)code; (void)esr; (void)elr; (void)far;
 }
 static void stage_diag_detect(uintptr_t dtb)
 {
-        (void)dtb;
+	(void)dtb;
 }
 #endif
 
@@ -246,51 +244,51 @@ static void stage_diag_detect(uintptr_t dtb)
 
 static void irq_handler(void)
 {
-        uint64_t iar = rsr("icc_iar1_el1");
-        uint32_t id = iar & 0xffffff;
+	uint64_t iar = rsr("icc_iar1_el1");
+	uint32_t id = iar & 0xffffff;
 
-        if (id >= 1020 && id <= 1023)
-                return; /* spurious */
-        irq_last = id;
-        if (id == (uint32_t)irq_src)
-                irq_count++;
-        else
-                irq_other++;
-        if (id == VTIMER_INTID)
-                wsr("cntv_tval_el0", rsr("cntfrq_el0") / 100);  /* 10 ms */
-        else if (id == PTIMER_INTID)
-                wsr("cntp_tval_el0", rsr("cntfrq_el0") / 100);
-        wsr("icc_eoir1_el1", iar);
-        isb();
+	if (id >= 1020 && id <= 1023)
+		return; /* spurious */
+	irq_last = id;
+	if (id == (uint32_t)irq_src)
+		irq_count++;
+	else
+		irq_other++;
+	if (id == VTIMER_INTID)
+		wsr("cntv_tval_el0", rsr("cntfrq_el0") / 100);  /* 10 ms */
+	else if (id == PTIMER_INTID)
+		wsr("cntp_tval_el0", rsr("cntfrq_el0") / 100);
+	wsr("icc_eoir1_el1", iar);
+	isb();
 }
 
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
-        if (slot == 5) {        /* IRQ from current EL, SPx */
-                irq_handler();
-                return;
-        }
-        /* Record the fault before touching the framebuffer: the flash crumb
-         * is the only evidence channel when the panel stays dark. */
-        ufs_crumb("EXC", slot, rsr("esr_el1"), rsr("elr_el1"), rsr("far_el1"));
-        stage_diag_exc((unsigned)slot, rsr("esr_el1"), rsr("elr_el1"), rsr("far_el1"));
-        con_clear(BLUE);
-        switch (slot & 3) {
-        case 0: con_str("PANIC", "SYNC"); break;
-        case 1: con_str("PANIC", "IRQ"); break;
-        case 2: con_str("PANIC", "FIQ"); break;
-        default: con_str("PANIC", "SERROR"); break;
-        }
-        con_hex2("SLOT", "n=", slot, "cpu=", rsr("mpidr_el1"));
-        con_str("STAGE", stage);
-        con_hex("ESR", rsr("esr_el1"));
-        con_hex("ELR", rsr("elr_el1"));
-        con_hex("FAR", rsr("far_el1"));
-        con_hex("SPSR", rsr("spsr_el1"));
-        con_hex("X0", regs[0]);
-        con_hex("X1", regs[1]);
-        con_hex("X30", regs[29]);       /* stashed lr is just above the frame */
-        reset(40);
+	if (slot == 5) {        /* IRQ from current EL, SPx */
+		irq_handler();
+		return;
+	}
+	/* Record the fault before touching the framebuffer: the flash crumb
+	 * is the only evidence channel when the panel stays dark. */
+	ufs_crumb("EXC", slot, rsr("esr_el1"), rsr("elr_el1"), rsr("far_el1"));
+	stage_diag_exc((unsigned)slot, rsr("esr_el1"), rsr("elr_el1"), rsr("far_el1"));
+	con_clear(BLUE);
+	switch (slot & 3) {
+	case 0: con_str("PANIC", "SYNC"); break;
+	case 1: con_str("PANIC", "IRQ"); break;
+	case 2: con_str("PANIC", "FIQ"); break;
+	default: con_str("PANIC", "SERROR"); break;
+	}
+	con_hex2("SLOT", "n=", slot, "cpu=", rsr("mpidr_el1"));
+	con_str("STAGE", stage);
+	con_hex("ESR", rsr("esr_el1"));
+	con_hex("ELR", rsr("elr_el1"));
+	con_hex("FAR", rsr("far_el1"));
+	con_hex("SPSR", rsr("spsr_el1"));
+	con_hex("X0", regs[0]);
+	con_hex("X1", regs[1]);
+	con_hex("X30", regs[29]);       /* stashed lr is just above the frame */
+	reset(40);
 }
 
 /* ---- SMP ---- */
@@ -299,278 +297,305 @@ static uintptr_t find_gicr(void);
 
 void secondary_main(uint64_t idx)
 {
-        sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
-        if (idx == 1) {
-                uintptr_t r = find_gicr();
-                if (r) {
-                        sec_probe[0] = rd32(r + GICR_IGROUPR0);
-                        wr32(r + GICR_IGROUPR0, 0xffffffff);
-                        sec_probe[1] = rd32(r + GICR_IGROUPR0);
-                        wr8(r + GICR_IPRIORITYR + 19, 0xa0);
-                        sec_probe[2] = rd32(r + GICR_IPRIORITYR + 16);
-                }
-                sec_probe[3] = r ? 1 : 0xdead;
-        }
-        __asm__ volatile("dsb sy" ::: "memory");
-        smc(PSCI_CPU_OFF, 0, 0, 0);
+	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
+	if (idx == 1) {
+		uintptr_t r = find_gicr();
+		if (r) {
+			sec_probe[0] = rd32(r + GICR_IGROUPR0);
+			wr32(r + GICR_IGROUPR0, 0xffffffff);
+			sec_probe[1] = rd32(r + GICR_IGROUPR0);
+			wr8(r + GICR_IPRIORITYR + 19, 0xa0);
+			sec_probe[2] = rd32(r + GICR_IPRIORITYR + 16);
+		}
+		sec_probe[3] = r ? 1 : 0xdead;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_CPU_OFF, 0, 0, 0);
 }
 
 static void __attribute__((unused)) test_smp(void)
 {
-        stage = "smp";
-        uint64_t self = rsr("mpidr_el1") & 0xffffff;
-        int64_t ret[NR_CPUS];
+	stage = "smp";
+	uint64_t self = rsr("mpidr_el1") & 0xffffff;
+	int64_t ret[NR_CPUS];
 
-        for (int i = 1; i < NR_CPUS; i++)
-                ret[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);
-        delay_ms(500);
-        for (int i = 1; i < NR_CPUS; i++) {
-                char label[] = "CPU0";
-                label[3] = '0' + i;
-                if (((uint64_t)i << 8) == self)
-                        con_str(label, "is boot cpu");
-                else
-                        con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
-                                 (uint32_t)sec_mpidr[i] | (sec_mpidr[i] ? 0 : 0xdead0000));
-        }
+	for (int i = 1; i < NR_CPUS; i++)
+		ret[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);
+	delay_ms(500);
+	for (int i = 1; i < NR_CPUS; i++) {
+		char label[] = "CPU0";
+		label[3] = '0' + i;
+		if (((uint64_t)i << 8) == self)
+			con_str(label, "is boot cpu");
+		else
+			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
+				 (uint32_t)sec_mpidr[i] | (sec_mpidr[i] ? 0 : 0xdead0000));
+	}
 }
 
 /* ---- GIC + timer ---- */
 
 static uintptr_t find_gicr(void)
 {
-        uint64_t aff = rsr("mpidr_el1");
-        uint32_t want = (aff & 0xffffff) | ((aff >> 8) & 0xff000000);
+	uint64_t aff = rsr("mpidr_el1");
+	uint32_t want = (aff & 0xffffff) | ((aff >> 8) & 0xff000000);
 
-        for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
-                uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
-                if ((uint32_t)(typer >> 32) == want)
-                        return GICR_BASE + off;
-                if (typer & (1 << 4))   /* Last */
-                        break;
-        }
-        return 0;
+	for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
+		uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
+		if ((uint32_t)(typer >> 32) == want)
+			return GICR_BASE + off;
+		if (typer & (1 << 4))   /* Last */
+			break;
+	}
+	return 0;
 }
 
 static void gicd_wait_rwp(void)
 {
-        for (int i = 0; i < 1000000 && (rd32(GICD_BASE) & (1U << 31)); i++)
-                ;
+	for (int i = 0; i < 1000000 && (rd32(GICD_BASE) & (1U << 31)); i++)
+		;
 }
 
 /* Run one interrupt source for ~300 ms and report what the GIC saw. */
 static void irq_window(const char *label, uintptr_t r, int src)
 {
-        uint64_t f = rsr("cntfrq_el0");
-        uint32_t pend = 0, act = 0, isr = 0, hppi = 0x3ff, ist = 0;
+	uint64_t f = rsr("cntfrq_el0");
+	uint32_t pend = 0, act = 0, isr = 0, hppi = 0x3ff, ist = 0;
 
-        irq_count = irq_other = 0;
-        irq_last = 0x3ff;
-        irq_src = src;
-        if (src == VTIMER_INTID) {
-                wsr("cntv_tval_el0", f / 100);
-                wsr("cntv_ctl_el0", 1);
-        } else if (src == PTIMER_INTID) {
-                wsr("cntp_tval_el0", f / 100);
-                wsr("cntp_ctl_el0", 1);
-        }
-        isb();
-        /* sample state with IRQs still masked, after the first period */
-        uint64_t t = now() + f / 50;
-        while (now() < t)
-                ;
-        if (src == SGI_INTID)
-                wsr("icc_sgi1r_el1", sgi_self(SGI_INTID));
-        isb();
-        ist = src == PTIMER_INTID ? rsr("cntp_ctl_el0") : rsr("cntv_ctl_el0");
-        pend = rd32(r + GICR_ISPENDR0);
-        act = rd32(r + GICR_ISACTIVER0);
-        isr = rsr("isr_el1");
-        hppi = rsr("icc_hppir1_el1");
+	irq_count = irq_other = 0;
+	irq_last = 0x3ff;
+	irq_src = src;
+	if (src == VTIMER_INTID) {
+		wsr("cntv_tval_el0", f / 100);
+		wsr("cntv_ctl_el0", 1);
+	} else if (src == PTIMER_INTID) {
+		wsr("cntp_tval_el0", f / 100);
+		wsr("cntp_ctl_el0", 1);
+	}
+	isb();
+	/* sample state with IRQs still masked, after the first period */
+	uint64_t t = now() + f / 50;
+	while (now() < t)
+		;
+	if (src == SGI_INTID)
+		wsr("icc_sgi1r_el1", sgi_self(SGI_INTID));
+	isb();
+	ist = src == PTIMER_INTID ? rsr("cntp_ctl_el0") : rsr("cntv_ctl_el0");
+	pend = rd32(r + GICR_ISPENDR0);
+	act = rd32(r + GICR_ISACTIVER0);
+	isr = rsr("isr_el1");
+	hppi = rsr("icc_hppir1_el1");
 
-        __asm__ volatile("msr daifclr, #2" ::: "memory");
-        t = now() + f * 3 / 10;
-        /* SGI: one already sent above, send 9 more 10 ms apart -> expect 10 */
-        uint64_t next = now() + f / 100;
-        for (int sent = 1; now() < t;)
-                if (src == SGI_INTID && sent < 10 && now() >= next) {
-                        wsr("icc_sgi1r_el1", sgi_self(SGI_INTID));
-                        isb();
-                        sent++;
-                        next += f / 100;
-                }
-        __asm__ volatile("msr daifset, #2" ::: "memory");
-        wsr("cntv_ctl_el0", 0);
-        wsr("cntp_ctl_el0", 0);
-        isb();
+	__asm__ volatile("msr daifclr, #2" ::: "memory");
+	t = now() + f * 3 / 10;
+	/* SGI: one already sent above, send 9 more 10 ms apart -> expect 10 */
+	uint64_t next = now() + f / 100;
+	for (int sent = 1; now() < t;)
+		if (src == SGI_INTID && sent < 10 && now() >= next) {
+			wsr("icc_sgi1r_el1", sgi_self(SGI_INTID));
+			isb();
+			sent++;
+			next += f / 100;
+		}
+	__asm__ volatile("msr daifset, #2" ::: "memory");
+	wsr("cntv_ctl_el0", 0);
+	wsr("cntp_ctl_el0", 0);
+	isb();
 
-        con_hex2(label, "irqs=", irq_count, "other=", irq_other);
-        con_hex2(" pre", "pend=", pend, "act=", act);
-        con_hex2(" pre", "isr=", isr, "hppi=", hppi);
-        con_hex2(" pre", "tctl=", ist, "last=", irq_last);
+	con_hex2(label, "irqs=", irq_count, "other=", irq_other);
+	con_hex2(" pre", "pend=", pend, "act=", act);
+	con_hex2(" pre", "isr=", isr, "hppi=", hppi);
+	con_hex2(" pre", "tctl=", ist, "last=", irq_last);
 }
 
 static void test_gic(void)
 {
-        stage = "gic sre";
-        uint64_t sre = rsr("icc_sre_el1");
-        if (!(sre & 1)) {
-                wsr("icc_sre_el1", sre | 1);
-                isb();
-        }
-        if (!(rsr("icc_sre_el1") & 1)) {
-                con_str("GIC", "no sysreg iface, skip");
-                return;
-        }
+	stage = "gic sre";
+	uint64_t sre = rsr("icc_sre_el1");
+	if (!(sre & 1)) {
+		wsr("icc_sre_el1", sre | 1);
+		isb();
+	}
+	if (!(rsr("icc_sre_el1") & 1)) {
+		con_str("GIC", "no sysreg iface, skip");
+		return;
+	}
 
-        stage = "gic dist";
-        uint32_t dctlr = rd32(GICD_BASE);
-        /* Non-secure view (DS=0): bit0 EnableGrp1, bit1 EnableGrp1A, bit4 ARE_NS; Linux writes 0x13 */
-        wr32(GICD_BASE, dctlr | 0x13);
-        gicd_wait_rwp();
-        con_hex2("GICD", "was=", dctlr, "now=", rd32(GICD_BASE));
+	stage = "gic dist";
+	uint32_t dctlr = rd32(GICD_BASE);
+	/* Non-secure view (DS=0): bit0 EnableGrp1, bit1 EnableGrp1A, bit4 ARE_NS; Linux writes 0x13 */
+	wr32(GICD_BASE, dctlr | 0x13);
+	gicd_wait_rwp();
+	con_hex2("GICD", "was=", dctlr, "now=", rd32(GICD_BASE));
 
-        stage = "gic redist";
-        uintptr_t r = find_gicr();
-        if (!r) {
-                con_str("GICR", "not found");
-                return;
-        }
-        uint32_t waker = rd32(r + GICR_WAKER);
-        if (waker & 2) {
-                wr32(r + GICR_WAKER, waker & ~2U);
-                for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
-                        ;
-        }
-        con_hex2("GICR", "base=", r, "waker=", rd32(r + GICR_WAKER));
+	stage = "gic redist";
+	uintptr_t r = find_gicr();
+	if (!r) {
+		con_str("GICR", "not found");
+		return;
+	}
+	uint32_t waker = rd32(r + GICR_WAKER);
+	if (waker & 2) {
+		wr32(r + GICR_WAKER, waker & ~2U);
+		for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
+			;
+	}
+	con_hex2("GICR", "base=", r, "waker=", rd32(r + GICR_WAKER));
 
-        stage = "gic config";
-        uint32_t grp = rd32(r + GICR_IGROUPR0);
-        wr32(r + GICR_IGROUPR0, 0xffffffff);    /* NS view: secure bits are WI */
-        uint32_t en_before = rd32(r + GICR_ISENABLER0);
-        uint32_t pri_before = rd32(r + GICR_IPRIORITYR + 16);   /* INTIDs 16..19 */
-        for (int id = 0; id < 32; id++)
-                wr8(r + GICR_IPRIORITYR + id, 0xa0);
-        wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
-        con_hex2("ENABLE", "was=", en_before, "now=", rd32(r + GICR_ISENABLER0));
-        (void)grp;
-        (void)pri_before;
+	stage = "gic config";
+	uint32_t grp = rd32(r + GICR_IGROUPR0);
+	wr32(r + GICR_IGROUPR0, 0xffffffff);    /* NS view: secure bits are WI */
+	uint32_t en_before = rd32(r + GICR_ISENABLER0);
+	uint32_t pri_before = rd32(r + GICR_IPRIORITYR + 16);   /* INTIDs 16..19 */
+	for (int id = 0; id < 32; id++)
+		wr8(r + GICR_IPRIORITYR + id, 0xa0);
+	wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
+	con_hex2("ENABLE", "was=", en_before, "now=", rd32(r + GICR_ISENABLER0));
+	(void)grp;
+	(void)pri_before;
 
-        uint64_t ctlr = rsr("icc_ctlr_el1");
-        wsr("icc_ctlr_el1", ctlr & ~2ULL);      /* EOImode 0: EOIR also deactivates */
-        wsr("icc_pmr_el1", 0xf0);
-        wsr("icc_bpr1_el1", 0);
-        wsr("icc_igrpen1_el1", 1);
-        isb();
-        con_hex2("ICC", "ctlr=", ctlr, "grpen1=", rsr("icc_igrpen1_el1"));
+	uint64_t ctlr = rsr("icc_ctlr_el1");
+	wsr("icc_ctlr_el1", ctlr & ~2ULL);      /* EOImode 0: EOIR also deactivates */
+	wsr("icc_pmr_el1", 0xf0);
+	wsr("icc_bpr1_el1", 0);
+	wsr("icc_igrpen1_el1", 1);
+	isb();
+	con_hex2("ICC", "ctlr=", ctlr, "grpen1=", rsr("icc_igrpen1_el1"));
 
-        stage = "gic vtimer";
-        irq_window("VTIMER", r, VTIMER_INTID);
-        stage = "gic sgi";
-        irq_window("SGI1", r, SGI_INTID);
-        wr32(r + GICR_ICENABLER0, 0xffffffff);
-        isb();
+	stage = "gic vtimer";
+	irq_window("VTIMER", r, VTIMER_INTID);
+	stage = "gic sgi";
+	irq_window("SGI1", r, SGI_INTID);
+	wr32(r + GICR_ICENABLER0, 0xffffffff);
+	isb();
 }
 
 /* ---- main ---- */
 
 static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
 {
-        con_hex2(label, "feat=", smc(PSCI_FEATURES, fn, 0, 0), 0, 0);
+	con_hex2(label, "feat=", smc(PSCI_FEATURES, fn, 0, 0), 0, 0);
 }
 
 static uint64_t scratch[8192];  /* 64KB, lives in our (later cacheable) image */
 
 static uint64_t ticks_fill(uint32_t c)
 {
-        uint64_t t = now();
-        con_clear(c);
-        return now() - t;
+	uint64_t t = now();
+	con_clear(c);
+	return now() - t;
 }
 
 static uint64_t ticks_mem(void)
 {
-        uint64_t t = now();
-        for (int pass = 0; pass < 16; pass++)
-                for (int i = 0; i < 8192; i++)
-                        scratch[i] = scratch[i] * 3 + i;
-        return now() - t;
+	uint64_t t = now();
+	for (int pass = 0; pass < 16; pass++)
+		for (int i = 0; i < 8192; i++)
+			scratch[i] = scratch[i] * 3 + i;
+	return now() - t;
 }
 
 static uint32_t to_us(uint64_t ticks)
 {
-        return ticks * 10 / 192;        /* 19.2 MHz */
+	return ticks * 10 / 192;        /* 19.2 MHz */
 }
+
+uint64_t shim_t0;			/* the timer at entry (since the SoC came on): linux.c reports it */
 
 void shim_main(uint64_t dtb)
 {
-        struct mmu_info mi;
+	struct mmu_info mi;
 
-        /* Stage mode is opt-in via the DTB command line; the payload command
-         * line is checked later in the loader (works even if ABL did not
-         * forward bootargs into /chosen). */
-        stage_diag_detect(dtb);
+	shim_t0 = now();
+	/* instruction fetches cacheable from here on (allowed with the MMU off): everything runs faster;
+	 * loader.c turns the I-cache off again before it jumps to XNU */
+	__asm__ volatile("ic iallu; dsb sy; isb" ::: "memory");
+	wsr("sctlr_el1", rsr("sctlr_el1") | (1UL << 12));
+	isb();
 
-        /* First breadcrumb: proves ABL actually jumped into us. */
-        ufs_crumb("MAIN", dtb, 0, 0, 0);
-        stage_diag_mark(1);
+	/* Stage mode is opt-in via the DTB command line; the payload command
+	 * line is checked later in the loader (works even if ABL did not
+	 * forward bootargs into /chosen). */
+	stage_diag_detect(dtb);
 
-        /* An xnu payload in the ramdisk means: boot it (MMU stays off). */
-        stage = "loader";
-        con_clear(RED);
-        con_str("SHIM", "sweet milestone 4: xnu loader");
-        con_skip();
-        const char *why = loader_boot(dtb);
-        con_str("LOADER", why);
-        con_skip();
+	/* First breadcrumb: proves ABL actually jumped into us. */
+	ufs_crumb("MAIN", dtb, 0, 0, 0);
+	stage_diag_mark(1);
 
-        /* No payload: probe the internal UFS while the MMU is still off. */
-        stage = "ufs";
-        test_ufs();
-        con_skip();
-        /* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-        con_str("UFS", "probe done, reset in ~3 min");
-        delay_ms(180000);
-        reset(20);
+	/* A charger woke the phone: MIUI's own charger mode. Otherwise the boot menu (iOS / MIUI /
+	 * power off; iOS after 10 s), with MIUI only when the image carries its kernel (tools/mkcombo.py). */
+	stage = "menu";
+	charge_mode(dtb);
+	switch (boot_menu(linux_present(dtb))) {
+	case BOOT_OFF:
+		spmi_power_off();
+	case BOOT_MIUI: {
+		const char *why = linux_boot(dtb);	/* returns only if MIUI's kernel could not start */
+		con_clear(RED);
+		con_str("MIUI", why);
+		delay_ms(3000);
+		break;
+	}
+	default:
+		break;
+	}
 
-        stage = "fill off";
-        uint64_t fill_off = ticks_fill(RED);
-        uint64_t mem_off = ticks_mem();
+	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
+	stage = "loader";
+	con_clear(RED);
+	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_skip();
+	const char *why = loader_boot(dtb);
+	con_str("LOADER", why);
+	con_skip();
 
-        stage = "mmu enable";
-        int rc = mmu_enable(&mi);
+	/* No payload: probe the internal UFS while the MMU is still off. */
+	stage = "ufs";
+	test_ufs();
+	con_skip();
+	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
+	con_str("UFS", "probe done, reset in ~3 min");
+	delay_ms(180000);
+	reset(20);
 
-        stage = "fill on";
-        uint64_t fill_on = rc ? 0 : ticks_fill(RED);
-        uint64_t mem_on = rc ? 0 : ticks_mem();
-        if (rc)
-                con_clear(RED);
+	stage = "fill off";
+	uint64_t fill_off = ticks_fill(RED);
+	uint64_t mem_off = ticks_mem();
 
-        con_str("SHIM", "sweet milestone 3");
-        con_skip();
-        con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
-        con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
-        con_hex2("MMU", "rc=", rc, "l3=", mi.n_l3);
-        con_hex2("TTBR0", "pa=", mi.ttbr, "pa_hi=", mi.ttbr >> 32);
-        con_hex("SCTLR0", mi.sctlr_before);
-        con_hex("SCTLR1", mi.sctlr_after);
-        con_hex("TCR", rsr("tcr_el1"));
-        con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
-        con_skip();
-        con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
-        con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));
-        con_hex("PAR gic", mmu_probe(GICD_BASE));
-        con_hex("PAR 12G", mmu_probe(0x300000000UL));
-        con_skip();
-        con_hex2("FILL us", "off=", to_us(fill_off), "on=", to_us(fill_on));
-        con_hex2("MEM us", "off=", to_us(mem_off), "on=", to_us(mem_on));
-        con_skip();
+	stage = "mmu enable";
+	int rc = mmu_enable(&mi);
 
-        stage = "psci";
-        con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
-        con_skip();
-        test_gic();
+	stage = "fill on";
+	uint64_t fill_on = rc ? 0 : ticks_fill(RED);
+	uint64_t mem_on = rc ? 0 : ticks_mem();
+	if (rc)
+		con_clear(RED);
 
-        stage = "done";
-        reset(40);
+	con_str("SHIM", "sweet milestone 3");
+	con_skip();
+	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
+	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
+	con_hex2("MMU", "rc=", rc, "l3=", mi.n_l3);
+	con_hex2("TTBR0", "pa=", mi.ttbr, "pa_hi=", mi.ttbr >> 32);
+	con_hex("SCTLR0", mi.sctlr_before);
+	con_hex("SCTLR1", mi.sctlr_after);
+	con_hex("TCR", rsr("tcr_el1"));
+	con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
+	con_skip();
+	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
+	con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));
+	con_hex("PAR gic", mmu_probe(GICD_BASE));
+	con_hex("PAR 12G", mmu_probe(0x300000000UL));
+	con_skip();
+	con_hex2("FILL us", "off=", to_us(fill_off), "on=", to_us(fill_on));
+	con_hex2("MEM us", "off=", to_us(mem_off), "on=", to_us(mem_on));
+	con_skip();
+
+	stage = "psci";
+	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
+	con_skip();
+	test_gic();
+
+	stage = "done";
+	reset(40);
 }

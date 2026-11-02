@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 P=${PROTON:-/home/marnov/xmiphones/kbuild/proton-clang/bin}
 OUT=${1:-out-clang}; shift || true
 CF="--target=aarch64-linux-gnu -O2 -ffreestanding -fno-builtin -nostdlib -fno-pic -fno-jump-tables -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DRAPHAEL $*"
-OBJ="start shim console mmu fdt loader ufs"
+OBJ="start shim console mmu fdt loader ufs spmi menu linux charge"
 mkdir -p "$OUT"
 for f in $OBJ; do s=$f.c; [ $f = start ] && s=start.S; $P/clang $CF -c $s -o $OUT/$f.o; done
 abs=$(for f in $OBJ; do [ $f = start ] || $P/llvm-readelf -r $OUT/$f.o; done | grep -c ABS64 || true)

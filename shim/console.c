@@ -13,6 +13,7 @@
 
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
+int con_quiet;			/* text calls draw nothing (con_clear still paints) */
 static int row;
 
 void con_clear(uint32_t bg)
@@ -28,6 +29,8 @@ void con_clear(uint32_t bg)
 
 static void put_char(int col, char ch, uint32_t fg)
 {
+	if (con_quiet)
+		return;
 	if (ch < 0x20 || ch > 0x7e)
 		ch = '?';
 	const unsigned char *g = font8x16[ch - 0x20];
@@ -94,4 +97,42 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		put_str(col, buf, WHITE);
 	}
 	row++;
+}
+
+void con_at(int r, const char *s, uint32_t fg)
+{
+	int y0 = MARGIN + r * CH_H;
+	if (y0 + CH_H > FB_H)
+		return;
+	for (int y = y0; y < y0 + CH_H; y++) {
+		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+		for (int x = 0; x < FB_W; x++)
+			line[x] = con_bg;
+	}
+	int keep = row;
+	row = r;
+	put_str(0, s, fg);
+	row = keep;
+}
+
+void con_rect(int x, int y, int w, int h, uint32_t c)
+{
+	for (int yy = y; yy < y + h && yy < FB_H; yy++) {
+		if (yy < 0)
+			continue;
+		volatile uint32_t *line = con_fb + yy * (FB_STRIDE / 4);
+		for (int xx = x < 0 ? 0 : x; xx < x + w && xx < FB_W; xx++)
+			line[xx] = c;
+	}
+}
+
+void con_text(int x, int y, const char *s, int scale, uint32_t fg, uint32_t bg)
+{
+	for (; *s; s++, x += 8 * scale) {
+		char ch = *s < 0x20 || *s > 0x7e ? '?' : *s;
+		const unsigned char *g = font8x16[ch - 0x20];
+		for (int gy = 0; gy < 16; gy++)
+			for (int gx = 0; gx < 8; gx++)
+				con_rect(x + gx * scale, y + gy * scale, scale, scale, (g[gy] & (0x80 >> gx)) ? fg : bg);
+	}
 }
