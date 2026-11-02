@@ -323,3 +323,13 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   ring: sweetgpu=9 publishes ring (now contiguous + NC view) + result page (GPU VA 0x01800000) + buffers at
   4..8 GB; chip 0x06040001, gpu_id 640, GMEM 1 MB, hbb 15; speed = HFI GX_BW_PERF_VOTE. Not ported (davinci
   hardware): camera, qg battery, Wi-Fi, cpufreq/dvfs, PMIC fastboot reboot, davinci panel DSI driver.
+- **g6 (0111-0113 + fix 991ca30, CI 41537831411; sweetgpu=9) 23:38: lock screen; KGSL + MSM-DRM SELF-TESTS PASS.**
+  out/logs/g6-kernel.log: [KGSL] ring at word 351, result page gpu 0x1800000, buffers from 0x100000000;
+  /dev/kgsl-3d0 devinfo chip 0x6040001 gpu 640, [U] submit readback 0x5afe600d; /dev/dri/renderD128 (msm) [V]
+  GEM_NEW+SUBMIT+fence 2 readback 0x5afeda7a. davinci SweetFramebuffer runs (1080x2340 scaled from 1125x2436),
+  SweetBacklight published, SweetHID scaled touch; SWEET PANEL: DSI ctrl0 takes commands; sel 50 brightness
+  10000 -> 2047 OK. IOAcceleratorES NOT published (needs sweetmetal=1 AND the userland in the root: SweetGLES,
+  RedwoodMetal, Mesa) -> backboardd polls for it; software compositing as before.
+- Next: userland (davinci's Mesa freedreno a6xx build, libredwood-gl FD_MESA_GMEM 1 MB, SweetGLES, RedwoodMetal,
+  shims, root overlay) -> rewrite iosdata root (needs the user's OK) -> sweetmetal=1. USB gadget (sweetusb=2) on
+  SM8150 still resets the phone: fixing it would give davinci's sweet_push fast loop (no root rewrites).
