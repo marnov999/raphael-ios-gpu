@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -370,11 +370,26 @@
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+ };
+-/* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
++/*
++ * The host side's MAC (ECM iMACAddress); the phone's own is ..:02. The Mi 9T Pro gets its own MACs,
++ * subnet and log port, so the PC can take both phones' logs at once (davinci: enx02005e77ee01,
++ * 192.168.7.x, 5140; raphael: enx02005e77ef01, 192.168.9.x, 5149).
++ */
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++#define UD_HOST_MAC_STR         "02005E77EF01"
++#define UD_MAC_5                0xef
++#define UD_NET                  0xc0a80900u     /* 192.168.9.0/24 */
++#define UD_LOG_PORT             5149
++#else
++#define UD_HOST_MAC_STR         "02005E77EE01"
++#define UD_MAC_5                0xee
++#define UD_NET                  0xc0a80700u     /* 192.168.7.0/24 */
++#define UD_LOG_PORT             5140
++#endif
+ static const char *const ud_strings[] = {
+-	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
++	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", UD_HOST_MAC_STR,
+ };
+-static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, UD_MAC_5, 0x02 };
+ 
+ static uint32_t
+ ud_string(unsigned idx, uint8_t *out)
+@@ -650,7 +665,7 @@
+ {
+ }
+ 
+-/* ue0, 192.168.7.2/24 (the host side is 192.168.7.1). */
++/* ue0, UD_NET.2/24 (the host side is UD_NET.1). */
+ static void
+ ud_if_create(void)
+ {
+@@ -709,7 +724,7 @@
+ 		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
++		a->sin_addr.s_addr = htonl(UD_NET | 2);
+ 		a = (struct sockaddr_in *)&ifra.ifra_mask;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+@@ -717,12 +732,13 @@
+ 		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a807ff);
++		a->sin_addr.s_addr = htonl(UD_NET | 0xff);
+ 		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+ 		sock_close(so);
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	printf("SWEET USB: ue0 %u.%u.%u.2/24 %s (err %d)\n", UD_NET >> 24, UD_NET >> 16 & 0xffu, UD_NET >> 8 & 0xffu,
++	    err ? "NOT configured" : "up", err);
+ }
+ 
+ static void
+@@ -824,7 +840,7 @@
+ /*
+  * Live console log over USB Ethernet: every 100 ms the new bytes of the
+  * console ring (bsd/dev/sweet_ufs.c) go as UDP datagrams to
+- * 192.168.7.1:5140 (on the PC: nc -ukl 5140). Starts with the last 64 KiB
++ * UD_NET.1:UD_LOG_PORT (on the PC: nc -ukl 5140 or 5149). Starts with the last 64 KiB
+  * so the boot is included. Nothing here may print (it would feed itself).
+  * Boot-arg sweetusblog=0 disables it.
+  */
+@@ -843,8 +859,8 @@
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+-	to.sin_port = htons(5140);
+-	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++	to.sin_port = htons(UD_LOG_PORT);
++	to.sin_addr.s_addr = htonl(UD_NET | 1);
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+ 		if (!ud.configured) {
