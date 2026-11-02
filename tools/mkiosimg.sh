@@ -16,6 +16,9 @@
 #   SHIM=path    shim Image (default shim/out-clang/Image, from shim/build-clang.sh)
 #   DEFAULT=miui the boot menu's 10 s countdown boots MIUI instead of iOS (for the flashed image while there
 #                is no iOS root); needs MIUI=
+#   FLASH=1      an image for the boot partition: without "sweetnocharger", so a charger plugged into a
+#                switched-off phone starts MIUI's charging screen. Test images for `fastboot boot` carry
+#                it, since ABL still says charger after the phone was last switched on by the charger.
 #   MIUI=dir     also pack MIUI's kernel behind the payload (dir from tools/unpack-miui-boot.py: Image,
 #                ramdisk.cpio, cmdline.txt): the boot menu's "Boot MIUI" and off-mode charging (shim/linux.c)
 set -euo pipefail
@@ -28,6 +31,7 @@ case "$ROOT" in userdata) [ "${ALLOW_USERDATA:-0}" = 1 ] || {
 	exit 1; };; esac
 NOCON=1; [ "${CONSOLE:-0}" = 1 ] && NOCON=0
 IMGCMD="console=null"
+[ "${FLASH:-0}" = 1 ] || IMGCMD="$IMGCMD sweetnocharger"
 case "${DEFAULT:-ios}" in ios) ;; miui) [ -n "${MIUI:-}" ] || { echo "DEFAULT=miui needs MIUI=" >&2; exit 1; }
 	IMGCMD="$IMGCMD sweetdefault=miui";; *) echo "DEFAULT is ios or miui" >&2; exit 1;; esac
 CMDLINE="rd=ufsroot0 ufsroot=$ROOT debug=0xc serial=3 cpus=${CPUS:-8} keepsyms=1 -enable_kprintf_spam -noprogress unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=$NOCON sweetfb_hz=30 $*"

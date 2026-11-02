@@ -28,6 +28,11 @@ void charge_mode(uintptr_t dtb)
 		(void)spmi_wr(pon, PON_TRIGGER_EN, trig | PON_TRIGGER_USB_CHG);
 	if (!fdt_chosen_has(dtb, "bootargs", "androidboot.mode=charger"))
 		return;
+	/* `fastboot boot` test images (tools/mkiosimg.sh without FLASH=1) carry "sweetnocharger": ABL
+	 * keeps saying charger as long as the phone was last switched on by the charger, even for a
+	 * fastboot boot, and the boot menu is what a test boot wants. */
+	if (fdt_chosen_has(dtb, "bootargs", "sweetnocharger"))
+		return;
 	if (linux_present(dtb)) {
 		const char *why = linux_boot(dtb);
 		con_clear(0xff000000U);
