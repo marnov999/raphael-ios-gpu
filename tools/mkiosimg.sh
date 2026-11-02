@@ -10,6 +10,7 @@
 #   ROOT=name    partition for ufsroot= (default rawdump). The kernel keeps its 4 MiB log ring at the end
 #                of that partition. Use userdata/iosdata only once it holds the iOS root.
 #   CONSOLE=1    keep the kernel console on screen after the GUI starts (sweetfb_noconsole=0)
+#   CPUS=n       cpus= (default 8). Not as an extra boot-arg: xnu takes the first cpus= it finds.
 #   ADT=path     device tree (default out/raphael.adt, from tools/mkadt.py OUT --raphael --highmem)
 #   DTB=path     stock SoC DTBs (default dtb/raphael-stock.dtb, from tools/stock-dtbs.py)
 #   SHIM=path    shim Image (default shim/out-clang/Image, from shim/build-clang.sh)
@@ -22,7 +23,7 @@ case "$ROOT" in userdata) [ "${ALLOW_USERDATA:-0}" = 1 ] || {
 	echo "refusing ufsroot=userdata: it is MIUI's data until the iOS root is installed (ALLOW_USERDATA=1)" >&2
 	exit 1; };; esac
 NOCON=1; [ "${CONSOLE:-0}" = 1 ] && NOCON=0
-CMDLINE="rd=ufsroot0 ufsroot=$ROOT debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=$NOCON sweetfb_hz=30 $*"
+CMDLINE="rd=ufsroot0 ufsroot=$ROOT debug=0xc serial=3 cpus=${CPUS:-8} keepsyms=1 -enable_kprintf_spam -noprogress unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=$NOCON sweetfb_hz=30 $*"
 for f in "$K" "$ADT" "$DTB" "$SHIM"; do [ -s "$f" ] || { echo "missing $f" >&2; exit 1; }; done
 mkdir -p out
 python3 tools/mkpayload.py "$K" "$ADT" "out/${NAME}_payload.bin" --cmdline "$CMDLINE" >/dev/null

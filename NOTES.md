@@ -133,7 +133,15 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 
 ## Handoff
 
-### 2026-11-02 (repo created)
-- Tree assembled; kernel not built yet when this was written; see the git log / next entry for the CI run.
-- Not tested on the phone: everything here. The K20 Pro port's t22/t23 rounds booted their phone (CN firmware);
-  ours is global firmware, other DTB order, other memory window.
+### 2026-11-02 (repo created, first test image)
+- Kernel: CI run 41443364491 (commit 094c770), 7m39s, all 0082-0102 applied (only blacktop's own
+  TrustCache/monterey/sonoma patches skipped, as on every build), board-macro guard passed.
+  kernel.development.raphael sha256 271bb2a0...e210bf.
+- QEMU (`tools/qemu-sweet.py`, ADT `--raphael --highmem --qemu`, cpus=1, needs proton-clang's llvm-nm on
+  PATH): boots at phys_base 0x110000000 through MMU, platform expert, AKS, WDT, IOSurface root, HID
+  buttons/touch, CPU init, BSD, battery service; then a synchronous external abort in AppleCLCD::start+0x420
+  = the first read of `ml_io_map(0x0ae94000)` (DSI0 ctrl, raphael brightness probe 0098/0100). QEMU has no
+  device there; on the phone ABL leaves DSI0 running. Expected, QEMU-only.
+- Images (out/, not in git): `raphael-ios-t1.img` (cpus=8, sha256 9408d501...4442) and
+  `raphael-ios-t1-1cpu.img` (fallback, a36207dc...744f); both CONSOLE=1, ufsroot=rawdump.
+- Not run on the phone yet. Expected: kernel console on the panel, then no root (rawdump has no HFS+).
