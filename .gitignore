@@ -1,0 +1,14 @@
+# device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
+backup/
+dtb/
+recovery/
+# third-party/Apple sources fetched for reading (research/ipsw-x/d22ap.adt is Apple's)
+research/
+# build output: shim objects, ADTs, payloads, boot images, downloaded kernels
+out/
+shim/out/
+shim/out-*/
+xnu/out/
+xnu/out-*/
+__pycache__/
+*.img
