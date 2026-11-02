@@ -144,4 +144,18 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   device there; on the phone ABL leaves DSI0 running. Expected, QEMU-only.
 - Images (out/, not in git): `raphael-ios-t1.img` (cpus=8, sha256 9408d501...4442) and
   `raphael-ios-t1-1cpu.img` (fallback, a36207dc...744f); both CONSOLE=1, ufsroot=rawdump.
-- Not run on the phone yet. Expected: kernel console on the panel, then no root (rawdump has no HFS+).
+- **13:38 `fastboot boot out/raphael-ios-t1.img` (serial 53d545e6): STEP 1 DONE.** Console on the panel; log
+  pulled from MIUI (root) with `adb exec-out "su -c 'dd if=/dev/block/by-name/rawdump bs=4096 skip=31743'"`
+  (= last 4198400 bytes; ring header SWEETLOG v1, 29443 bytes; shim block SHIMCRMB, 5 records). Local copy
+  out/logs/t1-kernel.log. Observed:
+  - shim: FDT 0x84521000 valid, payload 0x110000000/0xecc00000, 10 segments, jump to 0x11148f488.
+  - vm_page_bootstrap 239108 free pages (3.65 GiB); 8/8 CPUs (PSCI CPU_ON rc=0, SGI1 OK).
+  - SWEET FB: DSI ctrl0 ctrl=0x20030000 probe ok, panel DCS enabled; AppleCLCD 1080x2340 stride 4320 at
+    0x9c000000, presented 1125x2436 (scaled).
+  - SWEET UFS: rawdump LUN 0 first block 0x20000, 128 MiB, rw; log ring at block 0x27bff.
+  - keys: power and volume events (PON + PM8150 GPIO); key census printed.
+  - touch starts 45 s after boot: GT9886 pid "9886", 784 B cfg sent, 1080x2340, poll 10 ms.
+  - battery: "static fallback, 100%" (real fg-gen4 readout not active in this config).
+  - root: `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : 0`, errno 19, retried forever (expected).
+  - **Ghost touches = two fixed rows: y=101 and y=318** (many down/up pairs, random x, no finger). Real
+    touches were the swipes at y 1700-1900. Looks like two bad sensor lines; filter or re-tune later (step 4).
