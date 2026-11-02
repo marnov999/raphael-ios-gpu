@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the XNU kernel needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); MMIO addresses
-come from the target device's live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--raphael] [--fullram]
+come from the target device's live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--raphael] [--fullram [--base=PA]]
 
 --raphael: Xiaomi Redmi K20 Pro (SM8150 / Snapdragon 855). Same Qualcomm
 platform family as the generic driver set (Kryo 400 series CPUs, ARMv8.2
@@ -103,7 +103,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullram=False):
+def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullram=False, fullram_base=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     raphael=True: Redmi K20 Pro panel geometry and Kryo 485 clocks.
     cpus=N: /cpus child node count (default 8). N=1 replicates the t2 swap-test
@@ -114,7 +114,8 @@ def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullra
     if raphael and highmem:
         phys_base, mem_size = RAPHAEL_PHYS_BASE, RAPHAEL_MEM_SIZE
     if raphael and fullram:
-        phys_base, mem_size = FULLRAM_PHYS_BASE, FULLRAM_MEM_SIZE
+        base = int(fullram_base, 0) if fullram_base else FULLRAM_PHYS_BASE
+        phys_base, mem_size = base, FULLRAM_PHYS_BASE + FULLRAM_MEM_SIZE - base
     assert fullram or phys_base >= BADRAM_END or phys_base + mem_size <= BADRAM_START, 'kernel RAM overlaps the bad DRAM'
     fb_h, fb_stride = (RAPHAEL_FB_H, RAPHAEL_FB_STRIDE) if raphael else (FB_H, FB_STRIDE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -287,6 +288,7 @@ if __name__ == '__main__':
         if a.startswith('--cpus='):
             cpus_arg = int(a.split('=', 1)[1])
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, fullram='--fullram' in sys.argv,
+                 fullram_base=next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--base=')), None),
                  raphael='--raphael' in sys.argv, cpus=cpus_arg)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
