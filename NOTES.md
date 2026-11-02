@@ -287,3 +287,15 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - Test plan g2: `ADT=out/raphael-full-fw.adt ROOT=iosdata MIUI=backup/miui-unenc tools/mkiosimg.sh g2 K sweetgpu=6
   sweetusb=2`; live log over USB ethernet: host nmcli con `sweetusb` (enx02005e77ee01, 192.168.7.1), `nc -ukl 5140`.
   NOTE the gadget MAC/IPs equal davinci's: only one phone may run sweetusb=2 at a time.
+- **g2 (0106+0107, sweetgpu=6 sweetusb=2) 21:41: phone reset early**, fell back to the flashed f10 (iOS default),
+  whose boot overwrote the log ring (proof: ring's boot-args = f10's, trailing space). Nothing from USB either.
+- 0108 (commit 4c914db, CI 41523313469): sweet_log_sync() + 14 logged/synced GMU steps, sweetgpu_stop/_delay.
+- **g3 (0108, sweetgpu=6 sweetgpu_delay=5, NO sweetusb=2) 22:00: GMU BOOTS, 3D CORE POWERED, iOS lock screen.**
+  out/logs/g3-kernel.log: smmu idr0 0x4c017e06; stream 5 -> context 1 (smr 0x84000005) accepted by the hypervisor;
+  5464 TCM words, 0 wrong, versions core 0x20000105 power 0x20000012 hfi 0x20000001; cmd-db mx 0x30010 cx 0x30000
+  xo 0x30090; `fw_init 0xbabeface`; HFI version 0x20000001; PERF/BW tables, CORE_FW_START, GX vote (257 MHz),
+  START all accepted; OOB grant intr_info 0x80000000, gx_gdscr 0xf8222800; rbbm_status 0x1 int0 0.
+  => g2's reset was almost certainly sweetusb=2 (davinci's gadget: QUSB2-era code, SM8150 has the SNPS femto HS
+  PHY): USB live log on raphael is OPEN, do not use sweetusb=2 until fixed.
+- Next: layer 3 = GPU SMMU context 0 (stream 0 mask 0x400 per dt, ACTLR 0x303), ringbuffer, SQE (a630_sqe.fw), CP init
+  with A640 UBWC values, zap via PAS (a640_zap.mdt + .b02 in /sweet-fw), self tests.
