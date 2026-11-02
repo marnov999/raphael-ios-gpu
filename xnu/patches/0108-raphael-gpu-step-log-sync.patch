@@ -1,0 +1,236 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 5c9fa41..80d9ab5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -13,6 +13,9 @@
+  *   6  + the GMU started (gpu_gmu_boot): its memory through SMMU context 1, a640_gmu.bin loaded,
+  *      the PDC and RSCC sequencers, out of reset to 0xBABEFACE, HFI v2 (tables, CORE_FW_START,
+  *      the speed), the 3D core powered by OOB request and its registers read.
++ *      Each step is logged and the log put on the flash (sweet_log_sync) before it runs, so a step that
++ *      resets the phone is the last one in the log. sweetgpu_stop=N stops before step N;
++ *      sweetgpu_delay=S waits S seconds first (for the USB log to come up).
+  *
+  * Firmware is not in this repository: tools/mkadt.py --fw DIR puts a640_gmu.bin, a630_sqe.fw and
+  * the a640_zap pieces (from the phone's own vendor partition) into the ADT's /sweet-fw node of the
+@@ -39,6 +42,7 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void sweet_log_sync(void);
+ void sweet_gpu_init(void);
+ 
+ /*
+@@ -384,6 +388,19 @@ gpu_gmu_step2(void)
+ #define GMU_HFI_ADDRESS           0x60006000u
+ 
+ static vm_offset_t g_smmu, g_core, g_pdc, g_pdc_seq;
++static int gpu_stop = 1000;
++
++/* Log a step and get the log onto the flash before it runs; false: sweetgpu_stop says not to run it. */
++static bool
++gmu_step(int n, const char *what)
++{
++	printf("SWEET GMU: step %d: %s\n", n, what);
++	if (n >= gpu_stop) {
++		printf("SWEET GMU: stopped before step %d (sweetgpu_stop=%d)\n", n, gpu_stop);
++	}
++	sweet_log_sync();
++	return n < gpu_stop;
++}
+ 
+ /* ---- firmware, from the ADT (tools/mkadt.py --fw) ---- */
+ static const uint8_t *
+@@ -669,6 +686,9 @@ gmu_space_up(const uint8_t *fw, uint32_t fwlen)
+ {
+ 	struct gmu_fw_block b;
+ 	uint32_t at;
++	if (!gmu_step(2, "GMU memory and its page tables")) {
++		return false;
++	}
+ 	if (!(g_gmu_l1 = gmu_table_new(&g_gmu_l1_pa))) {
+ 		return false;
+ 	}
+@@ -694,6 +714,9 @@ gmu_space_up(const uint8_t *fw, uint32_t fwlen)
+ 		return false;
+ 	}
+ 	printf("SWEET GMU: %u blocks of GMU memory, %u tables\n", g_gmu_nblocks, g_gmu_ntables);
++	if (!gmu_step(3, "SMMU context 1 and stream 5 (writes through the hypervisor)")) {
++		return false;
++	}
+ 	return smmu_context_on(GMU_CONTEXT, GMU_MATCH, GMU_STREAM, 0x400u, g_gmu_l1_pa);
+ }
+ 
+@@ -703,6 +726,9 @@ gmu_fw_load(const uint8_t *fw, uint32_t fwlen)
+ {
+ 	struct gmu_fw_block b;
+ 	uint32_t at, wrong = 0, words = 0;
++	if (!gmu_step(4, "a640_gmu.bin into TCM and GMU memory")) {
++		return false;
++	}
+ 	gpu_wr(gpu_gmu, GMU_CM3_SYSRESET_R, 1);
+ 	for (int pass = 0; pass < 2; pass++) {
+ 		for (at = 0; at < fwlen;) {
+@@ -760,11 +786,18 @@ gmu_sequencers(void)
+ 	static const uint32_t rscc_seq[5] = { 0xa7a506a0u, 0xa1e6a6e7u, 0xa2e081e1u, 0xe9a982e2u, 0x0020e8a8u };
+ 	static const uint32_t data[2][3] = { { 1, 0, 0 }, { 2, 3, 3 } };       /* TCS1 sleep, TCS3 wake (a640: cx 3) */
+ 	uint32_t addr[3];
++	if (!gmu_step(6, "cmd-db")) {
++		return false;
++	}
+ 	if (cmddb_find("mx.lvl", &addr[0], NULL, NULL) || cmddb_find("cx.lvl", &addr[1], NULL, NULL) ||
+ 	    cmddb_find("xo.lvl", &addr[2], NULL, NULL)) {
+ 		printf("SWEET GMU: cmd-db lacks mx/cx/xo.lvl\n");
+ 		return false;
+ 	}
++	printf("SWEET GMU: cmd-db: mx.lvl %#x cx.lvl %#x xo.lvl %#x\n", addr[0], addr[1], addr[2]);
++	if (!gmu_step(7, "PDC sequencer and TCS writes")) {
++		return false;
++	}
+ 	for (unsigned i = 0; i < 5u; i++) {
+ 		gpu_wr(g_pdc_seq, 4u * i, pdc_seq[i]);
+ 	}
+@@ -781,6 +814,9 @@ gmu_sequencers(void)
+ 	}
+ 	gpu_wr(g_pdc, PDC_GPU_SEQ_START_ADDR, 0);
+ 	gpu_wr(g_pdc, PDC_GPU_ENABLE, 0x80000001u);
++	if (!gmu_step(8, "RSCC")) {
++		return false;
++	}
+ 	if (gpu_rd(gpu_gmu, RSCC_SEQ_MEM_0) != rscc_seq[0] || gpu_rd(gpu_gmu, RSCC_HIDDEN_TCS_DATA + 4u * 4u) != 0x80000000u) {
+ 		gpu_wr(gpu_gmu, RSCC_RSC_STATUS0, 1u << 24);
+ 		gpu_wr(gpu_gmu, RSCC_PDC_SLAVE_ID, 1);
+@@ -987,6 +1023,9 @@ gmu_core_power(void)
+ 	    !hfi_send("the speed", HFI_GX_BW_PERF_VOTE, vote, 4)) {
+ 		return false;
+ 	}
++	if (!gmu_step(13, "3D core power request (OOB)")) {
++		return false;
++	}
+ 	gpu_wr(gpu_gmu, GMU_HOST2GMU_INTR_SET, 1u << 30);   /* keep the 3D core powered for us */
+ 	for (int i = 0; i < 5000 && !(granted & (1u << 31)); i++) {
+ 		delay_for_interval(100, NSEC_PER_USEC);
+@@ -1013,6 +1052,10 @@ gpu_gmu_boot(void)
+ 	if (!(fw = gpu_fw("a640_gmu.bin", &fwlen))) {
+ 		return -1;
+ 	}
++	(void)PE_parse_boot_argn("sweetgpu_stop", &gpu_stop, sizeof(gpu_stop));
++	if (!gmu_step(1, "map the SMMU, core and PDC windows; read the SMMU's ID registers")) {
++		return -1;
++	}
+ 	g_smmu = ml_io_map(GPU_SMMU_PA, GPU_SMMU_SIZE);
+ 	g_core = ml_io_map(A6XX_GPU_CORE_PA, A6XX_GPU_CORE_SIZE);
+ 	g_pdc = ml_io_map(PDC_CFG_PA, PDC_SIZE);
+@@ -1033,6 +1076,9 @@ gpu_gmu_boot(void)
+ 	}
+ 
+ 	/* the HFI table, as the vendor lays it out */
++	if (!gmu_step(5, "HFI page (uncached view) and table")) {
++		return -2;
++	}
+ 	if (!(g_hfi = (volatile struct hfi_table *)ml_io_map(gpu_kvtophys(g_gmu_hfi->va), PAGE_SIZE))) {
+ 		return -2;
+ 	}
+@@ -1061,6 +1107,9 @@ gpu_gmu_boot(void)
+ 	}
+ 
+ 	/* what the vendor writes before it lets the processor go (register_config, power_config) */
++	if (!gmu_step(9, "GMU registers and GBIF_HALT in the core's CX part")) {
++		return -3;
++	}
+ 	gpu_wr(gpu_gmu, GMU_GENERAL_7, 1);
+ 	gpu_wr(gpu_gmu, GMU_CM3_FW_INIT_RESULT_R, 0);
+ 	gpu_wr(gpu_gmu, GMU_CM3_BOOT_CONFIG, 2);
+@@ -1080,6 +1129,9 @@ gpu_gmu_boot(void)
+ 	gpu_wr(gpu_gmu, GMU_GMU2HOST_INTR_CLR, 0xffffffffu);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 
++	if (!gmu_step(10, "the GMU's processor out of reset")) {
++		return -3;
++	}
+ 	gpu_wr(gpu_gmu, GMU_CM3_SYSRESET_R, 0);
+ 	for (int i = 0; i < 5000 && result != 0xbabefaceu; i++) {
+ 		delay_for_interval(100, NSEC_PER_USEC);
+@@ -1093,6 +1145,9 @@ gpu_gmu_boot(void)
+ 		return -4;
+ 	}
+ 	printf("SWEET GMU: THE GMU'S FIRMWARE RUNS\n");
++	if (!gmu_step(11, "HFI queues")) {
++		return -4;
++	}
+ 
+ 	gpu_wr(gpu_gmu, GMU_HFI_CTRL_INIT, 1);
+ 	if (!gpu_wait(gpu_gmu, GMU_HFI_CTRL_STATUS_R, 1, 1, 50)) {
+@@ -1101,9 +1156,15 @@ gpu_gmu_boot(void)
+ 		return -5;
+ 	}
+ 	printf("SWEET GMU: [HFI] queues up, version %#x\n", gpu_rd(gpu_gmu, GMU_HFI_VERSION_INFO));
++	if (!gmu_step(12, "HFI tables, speed vote and the 3D core's power")) {
++		return -5;
++	}
+ 	if (!gmu_core_power()) {
+ 		return -6;
+ 	}
++	if (!gmu_step(14, "the 3D core's registers")) {
++		return -6;
++	}
+ 	printf("SWEET GMU: THE 3D CORE HAS POWER: rbbm_status %#x int0 %#x clock_cntl %#x\n", gpu_rd(g_core, RBBM_STATUS),
+ 	    gpu_rd(g_core, RBBM_INT_0_STATUS), gpu_rd(g_core, RBBM_CLOCK_CNTL));
+ 	return 0;
+@@ -1156,6 +1217,12 @@ gpu_thread(void *arg, wait_result_t wr)
+ {
+ 	(void)arg;
+ 	(void)wr;
++	int wait = 0;
++	(void)PE_parse_boot_argn("sweetgpu_delay", &wait, sizeof(wait));
++	if (wait > 0 && wait <= 120) {
++		printf("SWEET GPU: waiting %d s (sweetgpu_delay)\n", wait);
++		delay_for_interval((uint32_t)wait * 1000u, NSEC_PER_MSEC);
++	}
+ 	gpu_probe();
+ 	printf("SWEET GPU: bring-up (sweetgpu=%d) over\n", gpu_level);
+ 	(void)thread_terminate(current_thread());
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 275a7af..016cfc2 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -685,6 +685,8 @@ sweet_ufs_init(void)
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
++static uint64_t _Atomic sweet_log_flushed;
++static bool sweet_log_running;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+@@ -785,6 +787,23 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 			return;
+ 		}
+ 		flushed = total;
++		os_atomic_store(&sweet_log_flushed, total, relaxed);
++	}
++}
++
++/*
++ * Put everything logged so far on the flash now (up to 3 s), for code that may reset the phone next:
++ * bsd/dev/sweet_gpu.c calls it before each bring-up step.
++ */
++void sweet_log_sync(void);
++
++void
++sweet_log_sync(void)
++{
++	uint64_t want = os_atomic_load(&sweet_log_total, relaxed);
++	for (int i = 0; sweet_log_running && i < 300 && os_atomic_load(&sweet_log_flushed, relaxed) < want; i++) {
++		wakeup(&sweet_log_chan);
++		delay_for_interval(10, NSEC_PER_MSEC);
+ 	}
+ }
+ 
+@@ -804,6 +823,7 @@ sweet_log_start(void)
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++		sweet_log_running = true;
+ 	}
+ }
+ 
