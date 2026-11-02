@@ -250,3 +250,20 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   display off/on works, Settings > storage 27 GB, 13.69 GB free.
 - Next: step 5, the GPU (Adreno 640) and the GLES path as on davinci.
 
+### 2026-11-02 (full RAM: 5 GiB)
+- t6 (0xb0000000 + 0x14cc00000, pmap_next_page skipping the bad pages): panic vm_resident.c:2627
+  `phys_page == VM_PAGE_GET_PHYS_PAGE(mem)`: arm64 derives a vm_page's address from its index in vm_pages[],
+  the array cannot have holes. 0103 now marks the bad pages vmp_error (retired, stay wired) in pmap_startup
+  and vm_get_delayed_page; pmap_next_page_hi (steal) panics if it would hand one out.
+- t7/t9 (same window, retired pages: "8 bad pages retired", 336975 free pages): userland hung after
+  usermanagerd's UMD_INIT, kernel alive (keys, SMP samples), and t9 never wrote its log ring (iosdata tail =
+  t7's byte for byte): UFS DMA stalled. 0104 (davinci 0084: recover + log 32-bit PA truncations) added.
+- Cause: this phone's /memory node (MIUI /sys/firmware/devicetree/base/memory/reg) = <0x80000000 0x3cc00000>
+  <0xc0000000 0x80000000> <0x140000000 0xc0000000>: the firmware keeps 0xbcc00000-0xc0000000 (52 MB, in the
+  middle; davinci keeps the top 52 MB). The window crossed it.
+- **t10: 0xc0000000-0x200000000 (5 GiB, mkadt --raphael --fullram) -> lock screen.** The 204 MB at
+  0xb0000000-0xbcc00000 would need a second keep-out plus cutting the hole out of the physmap (speculative
+  reads of firmware memory); not done.
+- **20:51 flashed f10** (FLASH=1: no sweetnocharger; iOS default; kernel run 41507798047 = 0103+0104;
+  sha256 d8ac15f2...). Rollback: backup/boot-current-20261102.img or backup/flashed/*.
+
