@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 0895e6a..558c91d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2927,6 +2927,30 @@ sweet_gpu_reap_dead_now(void)
+ 	gpu_unlock();
+ }
+ 
++/*
++ * SweetSurface.cpp, raphael, when the display pool is empty: the kept GPU buffers (used 3) of surfaces
++ * nobody has any more given back now. CoreAnimation makes a full-screen surface a frame and lets each go a
++ * few frames later; the buffers the GL bridge had of them were kept until gpu_import_expire looked again
++ * (every 250 ms: 20 frames at 81 Hz) -- 11 of the 16 display buffers held so in animations (u20), and a
++ * third of the frames' surfaces were made of new pages, zeroed and pushed out of the cache.
++ */
++void sweet_gpu_drop_dead_imports(void);
++void
++sweet_gpu_drop_dead_imports(void)
++{
++	if (g_gpu_mtx == NULL || !g_kgsl_ready) {
++		return;
++	}
++	gpu_lock();
++	for (unsigned i = 0; i < KGSL_MAX_BO; i++) {
++		if (g_bo[i].used == 3 && !sweet_surface_gpu_live(g_bo[i].surf)) {
++			gpu_import_drop(&g_bo[i]);
++		}
++	}
++	gpu_reap();
++	gpu_unlock();
++}
++
+ static int
+ kgsl_do_drawctxt_create(uint32_t flags, uint32_t *out_id)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ba3821b..aa70e05 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -40,6 +40,7 @@ extern "C" void pmap_clear_refmod_options(ppnum_t pn, unsigned int mask, unsigne
+ extern "C" boolean_t pmap_valid_page(ppnum_t pn);
+ extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
+ extern "C" void sweet_gpu_reap_dead_now(void);       /* bsd/dev/sweet_gpu.c */
++extern "C" void sweet_gpu_drop_dead_imports(void);   /* (raphael) */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -1394,6 +1395,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			    s->planeCount == 0 && s->bytesPerRow >= SWEET_DISPLAY_BPR_MIN && s->bytesPerRow <= SWEET_DISPLAY_BPR &&
+ 			    strcmp(maker, "backboardd") == 0) {
+ 				mem = sweet_display_take(s->allocSize, &s->poolSlot);
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++				if (mem == NULL) {
++					sweet_gpu_drop_dead_imports();  /* (the GPU's kept buffers of surfaces gone hold them) */
++					mem = sweet_display_take(s->allocSize, &s->poolSlot);
++				}
++#endif
+ 				if (mem != NULL) {
+ 					sweet_display_owner[s->poolSlot - 1] = s;
+ 				}
