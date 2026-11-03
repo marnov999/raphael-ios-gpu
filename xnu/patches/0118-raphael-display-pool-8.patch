@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index f620bc5..cf4586c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -98,7 +98,12 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+  * piece is not to be had once the system has run a while -- so three are made at the start, while
+  * memory is whole, and a full-screen surface takes a free one (it goes back when the surface goes).
+  */
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++/* raphael (u4): backboardd's first four full-screen surfaces stay alive and the ones it shows come later */
++#define SWEET_DISPLAY_POOL      8
++#else
+ #define SWEET_DISPLAY_POOL      4       /* two shown (SweetFramebuffer holds them) and two being drawn */
++#endif
+ #define SWEET_DISPLAY_W         1125u
+ #define SWEET_DISPLAY_H         2436u
+ #define SWEET_DISPLAY_BPR       4608u
