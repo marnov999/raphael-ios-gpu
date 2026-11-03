@@ -48,6 +48,24 @@ for f in fr:
     if i>=0 and f[1]<=ticks[-1]+17000 and j<len(arr) and arr[j]-f[2]<5000: work.append((arr[j]-ticks[i])/1000)
 work.sort()
 if work: print(f'   frame time (tick -> swap): median {statistics.median(work):.1f} ms, p99 {p(work,.99):.1f} ms, p99.9 {p(work,.999):.1f} ms; missed the slot: {sum(1 for w in work if w>16.7)}/{len(work)} ({100*sum(1 for w in work if w>16.7)/len(work):.1f}%)')
+# what the panel showed (ticks are on the panel's TEs, sweetfb_telock=1): each swap is on screen from the
+# first tick after it; inside an animation (swaps under 70 ms apart) how many refreshes each new frame
+# stayed up -- 1 is every refresh a new frame, 2+ a frame shown again (a stutter you see)
+if len(ticks)>2:
+    P=statistics.median(b2-a for a,b2 in zip(ticks,ticks[1:]))
+    if work: print(f'   at the panel period {P/1000:.2f} ms: over a period tick -> swap: {sum(1 for w in work if w>P/1000)}/{len(work)} ({100*sum(1 for w in work if w>P/1000)/len(work):.1f}%)')
+    shown=[]
+    for a in arr:
+        i=bisect.bisect_right(ticks,a+300)
+        shown.append(ticks[i] if i<len(ticks) else None)
+    held=collections.Counter(); ivs=[]
+    for j in range(1,len(arr)):
+        if shown[j] is None or shown[j-1] is None or arr[j]-arr[j-1]>=70000 or shown[j]==shown[j-1]: continue
+        k=max(1,round((shown[j]-shown[j-1])/P)); held[k]+=1; ivs.append(k*P/1000)
+    ivs.sort()
+    if ivs:
+        rep=sum((k-1)*n for k,n in held.items()); tot=sum(k*n for k,n in held.items())
+        print(f'   shown: refreshes each animation frame stayed up {sorted(held.items())}; refreshes repeating a frame {rep}/{tot} ({100*rep/tot:.1f}%); shown interval median {statistics.median(ivs):.1f} ms ({1000/statistics.median(ivs):.1f} fps), p99 {p(ivs,.99):.1f} ms ({1000/p(ivs,.99):.1f} fps)')
 busy=[(int(m.group(1)),int(m.group(2)),int(m.group(3))) for m in re.finditer(r'PRF t (\d+) (\d+) (\d+)',t)]
 print('   busiest threads (% of a core):', ', '.join(f'{tid}:{pm/10:.0f}%' for tid,us,pm in sorted(busy,key=lambda x:-x[1])[:5]))
 PY

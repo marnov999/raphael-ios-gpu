@@ -16,7 +16,7 @@ fi
 tools/touch.sh "swipe 540 2335 540 500 250"
 sleep 2
 H=(); for _ in 1 2 3; do H+=("swipe 950 1300 150 1300 250" "sleep 700" "swipe 150 1300 950 1300 250" "sleep 700"); done
-timeout 300 tools/measure.sh "$TAG-home" 10 backboardd -- "${H[@]}" 2>&1 | head -5
+timeout 300 tools/measure.sh "$TAG-home" 10 backboardd -- "${H[@]}" 2>&1 | grep -v "^   busiest"
 sleep 2
 A=(); for _ in 1 2 3; do A+=("tap 662 1700" "sleep 1500" "swipe 540 2335 540 1100 200" "sleep 1500"); done
-timeout 300 tools/measure.sh "$TAG-settings" 12 backboardd -- "${A[@]}" 2>&1 | head -5
+timeout 300 tools/measure.sh "$TAG-settings" 12 backboardd -- "${A[@]}" 2>&1 | grep -v "^   busiest"

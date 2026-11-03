@@ -1,0 +1,112 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 67cb16b..e227e1b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -282,6 +282,9 @@ public:
+ 	bool          fDirty;
+ 	uint8_t       fEarly[SWEET_FB_SWAP_REC_SIZE];       /* the one before it, not shown yet either: */
+ 	bool          fHasEarly;                            /* shown first, at the next tick */
++	uint64_t      fPendingTick, fEarlyTick;             /* the tick count when each came (sweetfb_depth=2) */
++	int           fDepth;                               /* boot-arg sweetfb_depth: 2, a swap flipped no sooner than the tick after it came */
++	volatile uint32_t fVsyncDropped;                    /* vsync notifications not sent (the port's queue full) */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	int           fScanout;       /* boot-arg sweetfb_scanout: the display engine fetches the surface itself */
+@@ -375,7 +378,7 @@ public:
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+-	void notify(uint32_t type, const uint64_t *values, uint32_t count);
++	bool notify(uint32_t type, const uint64_t *values, uint32_t count);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+@@ -499,6 +502,9 @@ AppleCLCD::start(IOService *provider)
+ 		int v = 1;
+ 		(void)PE_parse_boot_argn("sweetfb_immediate", &v, sizeof(v));
+ 		fImmediate = v != 0;
++		v = 1;
++		(void)PE_parse_boot_argn("sweetfb_depth", &v, sizeof(v));
++		fDepth = v;
+ 	}
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -668,7 +674,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+-		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
++		if (!client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6)) {
++			fb->fVsyncDropped++;
++		}
+ 	}
+ 	if (0 && fb->fPowerOff) {   /* POWER-OFF HANDLING DISABLED: backboardd auto-dims the display
+ 	                             * seconds after boot (no backlight service), which skipped the panel
+@@ -746,10 +754,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				{
+ 					uint64_t pns = 0;
+ 					absolutetime_to_nanoseconds(fb->fTePeriod, &pns);
+-					IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %llu.%03llu Hz%s\n",
++					IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %llu.%03llu Hz%s; %u vsyncs not sent\n",
+ 					    fb->fRateSwaps, fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull,
+ 					    pns != 0 ? 1000000000000ull / pns / 1000ull : 0, pns != 0 ? 1000000000000ull / pns % 1000ull : 0,
+-					    fb->fTeLock ? ", ticks on its TEs" : "");
++					    fb->fTeLock ? ", ticks on its TEs" : "", fb->fVsyncDropped);
++					fb->fVsyncDropped = 0;
+ 				}
+ #else
+ 				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u frames\n", fb->fRateSwaps,
+@@ -912,6 +921,16 @@ AppleCLCD::presentPending(void)
+ 	IOLockLock(fPresentLock);
+ 	IOLockLock(fLock);
+ 	bool have = fDirty;
++	/*
++	 * sweetfb_depth=2: a frame goes to the display engine no sooner than the tick after the one it was
++	 * drawn in, so that the engine takes it at the panel's frame after that: CoreAnimation and the GPU
++	 * have two of the panel's periods for it (24.7 ms at 81 Hz), not what was left of one -- 60 of 97
++	 * frames that stayed up two refreshes at 81 Hz were a swap ~8 ms into the period and ~4.5 ms of GPU
++	 * after it, flipped just after the panel's frame began (u20). One refresh more of latency, always.
++	 */
++	if (have && fDepth >= 2 && (fHasEarly ? fEarlyTick : fPendingTick) >= fVsyncCount) {
++		have = false;
++	}
+ 	if (have && fHasEarly) {
+ 		memcpy(rec, fEarly, SWEET_FB_SWAP_REC_SIZE);   /* (the latest stays for the next) */
+ 		fHasEarly = false;
+@@ -971,9 +990,11 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	 */
+ 	if (fDirty && fFlushTicks == 1) {
+ 		memcpy(fEarly, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fEarlyTick = fPendingTick;
+ 		fHasEarly = true;
+ 	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingTick = fVsyncCount;
+ 	fDirty = true;
+ 	fRateSwaps++;
+ 	sweet_dvfs_kick();
+@@ -1632,19 +1653,19 @@ IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, __unus
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Called with the framebuffer lock held. */
+-void
++/* Called with the framebuffer lock held. False: one there was to send, and it was not sent (the port's queue full). */
++bool
+ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uint32_t count)
+ {
+ 	OSAsyncReference64 ref;
+ 
+ 	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
+-		return;
++		return true;
+ 	}
+ 	bzero(ref, sizeof(ref));
+ 	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
+-	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
+-	    kIOUserNotifyOptionCanDrop);
++	return sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
++	           kIOUserNotifyOptionCanDrop) == kIOReturnSuccess;
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
