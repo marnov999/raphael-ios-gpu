@@ -1,0 +1,39 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 563f001..894f0d4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1248,6 +1248,25 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	/*
++	 * The layers that have a surface. raphael (u11): CoreAnimation now and then sends swaps with layers 0-2
++	 * enabled (mask 0x80000007) but only layer 0 holding a surface; tested on the raw mask, those were not
++	 * scanned out but copied into the boot framebuffer, and the screen went back and forth between that
++	 * copy and the surface scanned out by the swaps around it (the "stuck between two frames" flicker).
++	 */
++	uint32_t shown = 0;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			shown |= 1u << layer;
++		}
++	}
++	if ((mask & 0xfu) != shown) {
++		static uint32_t told;
++		if (told++ < 6) {
++			IOLog("SWEET FB: swap %u: mask %#x, layers with a surface %#x (ids %u %u %u %u)\n", get32(rec, 0x50), mask, shown,
++			    get32(rec, 0x54), get32(rec, 0x58), get32(rec, 0x5c), get32(rec, 0x60));
++		}
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -1353,7 +1372,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			int v = 0;
+ 			fScanout = PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0;
+ 		}
+-		if (fScanout && src != 0 && bpe == 4 && (mask & 0xfu) == 1u && dx == 0 && dy == 0 &&
++		if (fScanout && src != 0 && bpe == 4 && shown == 1u && dx == 0 && dy == 0 &&
+ 		    w == areaW && h == areaH) {
+ 			uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+ 			uint64_t need = (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4;
