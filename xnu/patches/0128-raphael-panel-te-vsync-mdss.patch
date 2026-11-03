@@ -1,0 +1,298 @@
+diff --git a/bsd/dev/sweet_panel.c b/bsd/dev/sweet_panel.c
+index 8a1eb3f..0ef6fe5 100644
+--- a/bsd/dev/sweet_panel.c
++++ b/bsd/dev/sweet_panel.c
+@@ -13,10 +13,19 @@
+  * (vendor dsi_ctrl_hw_cmn_kickoff_fifo_command): header dword [wc_lo wc_hi data_type flags], payload,
+  * flags bit 7 the last command, bit 6 a payload follows. The controller is the first of ctrl0/ctrl1 that
+  * completes a command.
++ *
++ * And the panel's own frame signal: the boot loader runs INTF1's tear check on the panel's TE pin
++ * (SYNC_CONFIG_VSYNC 0x180088: hw vsync mode, counter on, 136 vsync-clock ticks a line) with
++ * autorefresh every TE, so the panel's refresh is the panel's, not ours. sweet_panel_te() reads when
++ * the last TE came from the tear check's read pointer (loaded with VSYNC_INIT_VAL at a TE, then one up
++ * per line) and how many have come. kern.sweet_mdss reads and writes the display block's registers
++ * (MDSS, the DSI controllers, PHYs and PLLs, the display clock controller) and sends the panel DCS
++ * writes: what tools/mdss (userland/mdss.c) measures and tries the panel's refresh rate with.
+  */
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/thread_call.h>
+ #include <machine/machine_routines.h>
+@@ -196,6 +205,130 @@ sweet_panel_off(void)
+ 	return g_off;
+ }
+ 
++/* The display block: MDSS (MDP 0xae00000, DSI0 +0x94000, its PHY +0x94400 and PLL +0x94900, DSI1 +0x96000) and DISP_CC (0xaf00000) */
++#define MDSS_PA                 0x0ae00000u
++#define MDSS_LEN                0x120000u
++#define INTF1_TEAR              0x6b800u
++#define TEAR_SYNC_CONFIG_VSYNC  0x288u          /* sde_hw_intf.c INTF_TEAR_*: [18:0] vsync clocks a line, 19 counter, 20 TE pin */
++#define TEAR_VSYNC_INIT_VAL     0x294u          /* the read pointer's line at a TE */
++#define TEAR_INT_COUNT_VAL      0x298u          /* [31:16] TEs seen, [15:0] the read pointer's line */
++#define VSYNC_CLK_HZ            19200000ull     /* dt clock "vsync_clk": the XO */
++
++static vm_offset_t g_mdss;
++
++static vm_offset_t
++mdss(void)
++{
++	if (g_mdss == 0) {
++		g_mdss = ml_io_map(MDSS_PA, MDSS_LEN);
++	}
++	return g_mdss;
++}
++
++/*
++ * The last TE: when it came (mach_absolute_time) and how many have come (16 bits, wrapping); false if
++ * the tear check is not counting a TE pin. The read pointer runs on from VSYNC_INIT_VAL after each TE
++ * at the configured lines a second, so the time since the TE is its lines past that.
++ */
++bool sweet_panel_te(uint64_t *at, uint32_t *count);
++bool
++sweet_panel_te(uint64_t *at, uint32_t *count)
++{
++	vm_offset_t m = mdss();
++	if (m == 0) {
++		return false;
++	}
++	volatile uint32_t *t = (volatile uint32_t *)(m + INTF1_TEAR);
++	uint32_t cfg = t[TEAR_SYNC_CONFIG_VSYNC / 4], init = t[TEAR_VSYNC_INIT_VAL / 4] & 0xffffu;
++	uint64_t now = mach_absolute_time();
++	uint32_t v = t[TEAR_INT_COUNT_VAL / 4];
++	uint32_t clocks = cfg & 0x7ffffu, line = v & 0xffffu;
++	if ((cfg & (1u << 19 | 1u << 20)) != (1u << 19 | 1u << 20) || clocks == 0 || line < init) {
++		return false;
++	}
++	uint64_t since = 0;
++	nanoseconds_to_absolutetime((uint64_t)(line - init) * clocks * 1000000000ull / VSYNC_CLK_HZ, &since);
++	*at = now - since;
++	*count = v >> 16;
++	return true;
++}
++
++/*
++ * kern.sweet_mdss (root): in { op, off, val, n, bytes[56] }, out { val, ok, at, count }.
++ * op 0 reads the word at MDSS + off, 1 writes val there (and reads it back), 2 sends bytes[0..n) to the
++ * panel as one DCS long write, 3 samples the TE (sweet_panel_te).
++ */
++struct sweet_mdss_req {
++	uint32_t op, off, val, n;
++	uint8_t  bytes[56];
++};
++struct sweet_mdss_out {
++	uint32_t val, ok;
++	uint64_t at;
++	uint32_t count, pad;
++};
++
++static bool
++dcs_long(const uint8_t *b, uint32_t n)
++{
++	uint32_t dw[1 + 14];
++	if (n == 0 || n > 56) {
++		return false;
++	}
++	dw[0] = (n & 0xffu) | (n >> 8 & 0xffu) << 8 | DCS_LONG_WRITE << 16 | 0xc0u << 24;
++	for (uint32_t i = 0; i < (n + 3) / 4; i++) {
++		uint32_t w = 0;
++		for (uint32_t k = 0; k < 4; k++) {
++			w |= (uint32_t)(4 * i + k < n ? b[4 * i + k] : 0xffu) << (8 * k);
++		}
++		dw[1 + i] = w;
++	}
++	return dsi_ready() && dsi_send(dw, 1 + (n + 3) / 4);
++}
++
++static int
++sysctl_sweet_mdss SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	struct sweet_mdss_req in;
++	struct sweet_mdss_out out;
++	int error;
++	if (req->newptr == USER_ADDR_NULL) {
++		return EINVAL;
++	}
++	bzero(&in, sizeof(in));
++	bzero(&out, sizeof(out));
++	if ((error = SYSCTL_IN(req, &in, sizeof(in))) != 0) {
++		return error;
++	}
++	vm_offset_t m = mdss();
++	switch (in.op) {
++	case 0:
++	case 1:
++		if (m == 0 || (in.off & 3u) != 0 || in.off >= MDSS_LEN) {
++			return EINVAL;
++		}
++		if (in.op == 1) {
++			*(volatile uint32_t *)(m + in.off) = in.val;
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++		out.val = *(volatile uint32_t *)(m + in.off);
++		out.ok = 1;
++		break;
++	case 2:
++		out.ok = dcs_long(in.bytes, in.n);
++		break;
++	case 3:
++		out.ok = sweet_panel_te(&out.at, &out.count);
++		break;
++	default:
++		return EINVAL;
++	}
++	return SYSCTL_OUT(req, &out, sizeof(out));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mdss, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_mdss, "S", "display block registers, panel DCS writes, the panel's TE");
++
+ int
+ sweet_panel_power(int on)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 894f0d4..cdd1b35 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -64,6 +64,7 @@ extern "C" void sweet_prof_start(void);
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+ extern "C" uint32_t sweet_mdp_iova(uint32_t id, const void *owner, const uint64_t *pages, uint32_t n);   /* bsd/dev/sweet_mdp_smmu.c */
++extern "C" bool sweet_panel_te(uint64_t *at, uint32_t *count);  /* bsd/dev/sweet_panel.c: the panel's last TE */
+ #endif
+ extern "C" void sweet_dvfs_kick(void);      /* bsd/dev/sweet_gpu.c: wake the clocks (something is drawn) */
+ 
+@@ -195,7 +196,9 @@ sweet_fb_timeline(int on)
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+-#define SWEET_FB_VSYNC_US               16667
++#define SWEET_FB_VSYNC_US               sweet_fb_vsync_us
++/* the panel's refresh as told to CoreAnimation, and the free-running tick's period (boot-arg sweetfb_rate, Hz: 60) */
++static uint32_t sweet_fb_rate = 60, sweet_fb_vsync_us = 16667;
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -298,6 +301,12 @@ public:
+ 	uint32_t      fRateSwaps, fRateShown, fRateFlips, fRateLate;
+ 	uint64_t      fRateSince, fLastShown;
+ 	uint64_t      fNextTick;      /* the timer's next deadline: a fixed 60 Hz cadence, not 16.7 ms after the work */
++	/* raphael, boot-arg sweetfb_telock=1: the ticks on the panel's TEs (the panel's period, measured) */
++	uint64_t      fTePeriod;      /* abs time a TE, measured over seconds (0: not yet) */
++	uint64_t      fTeRefAt;       /* a TE some seconds ago, and the TE count then */
++	uint32_t      fTeRefCount;
++	uint32_t      fTeSecCount;    /* the TE count at the last FPS line */
++	bool          fTeLock;
+ 	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled);
+ 	void scanBack(void);
+ 	bool          fScale;         /* boot-arg sweetfb_scale (default 1): the presented size onto the whole panel */
+@@ -468,6 +477,11 @@ AppleCLCD::start(IOService *provider)
+ 			fRowMap = (uint32_t *)IOMallocData(sizeof(uint32_t) * fHeight);
+ 		}
+ 	}
++	if (PE_parse_boot_argn("sweetfb_rate", &sweet_fb_rate, sizeof(sweet_fb_rate)) && sweet_fb_rate >= 30 && sweet_fb_rate <= 120) {
++		sweet_fb_vsync_us = (1000000 + sweet_fb_rate / 2) / sweet_fb_rate;
++	} else {
++		sweet_fb_rate = 60;
++	}
+ 	publishModes();
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();
+@@ -494,6 +508,12 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	{
++		int v = 0;
++		fTeLock = PE_parse_boot_argn("sweetfb_telock", &v, sizeof(v)) && v != 0;
++	}
++#endif
+ 	{
+ 		uint32_t threads = 3;
+ 		thread_t thread;
+@@ -712,8 +732,23 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				if (intf != 0) {
+ 					frames = *(volatile uint32_t *)(intf + 0x800u + 0x0acu);
+ 				}
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++				/* a command-mode panel: no INTF frames, its TEs (and the period measured from them) */
++				{
++					uint64_t te_at = 0, pns = 0;
++					uint32_t te = 0;
++					if (sweet_panel_te(&te_at, &te)) {
++						frames = te;
++					}
++					absolutetime_to_nanoseconds(fb->fTePeriod, &pns);
++					IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u TEs, TE period %llu.%03llu ms%s\n",
++					    fb->fRateSwaps, fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull,
++					    (frames - last_frames) & 0xffffu, pns / 1000000ull, pns / 1000ull % 1000ull, fb->fTeLock ? ", locked" : "");
++				}
++#else
+ 				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u frames\n", fb->fRateSwaps,
+ 				    fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull, frames - last_frames);
++#endif
+ 				last_frames = frames;
+ 			}
+ 			fb->fRateSwaps = fb->fRateShown = fb->fRateFlips = fb->fRateLate = 0;
+@@ -758,6 +793,48 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			off = off > (int64_t)step ? (int64_t)step : off < -(int64_t)step ? -(int64_t)step : off;
+ 			fb->fNextTick -= off;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++		/*
++		 * The panel's period, from its TEs over 1-10 s; with sweetfb_telock=1 the next tick is on the
++		 * first TE more than half a period from now (plus sweetfb_telead us): one tick, one swap, one
++		 * panel frame. A fixed 16.667 ms beside a panel at another rate put two swaps into one panel
++		 * frame (one never seen) or none (one seen twice) every 1 / (the difference) seconds.
++		 */
++		{
++			uint64_t te_at = 0;
++			uint32_t te = 0;
++			if (sweet_panel_te(&te_at, &te) && te_at <= now) {
++				uint32_t n = (te - fb->fTeRefCount) & 0xffffu;
++				if (fb->fTeRefAt == 0 || te_at <= fb->fTeRefAt) {
++					fb->fTeRefAt = te_at;
++					fb->fTeRefCount = te;
++				} else if (n >= 60u) {
++					uint64_t p = (te_at - fb->fTeRefAt) / n, lo = 0, hi = 0;
++					nanoseconds_to_absolutetime(8000000ull, &lo);
++					nanoseconds_to_absolutetime(25000000ull, &hi);
++					if (p >= lo && p <= hi) {
++						fb->fTePeriod = p;
++					}
++					if (n >= 600u || p < lo || p > hi) {
++						fb->fTeRefAt = te_at;
++						fb->fTeRefCount = te;
++					}
++				}
++				uint64_t pp = fb->fTePeriod;
++				if (fb->fTeLock && pp != 0 && now - te_at < 2 * pp) {
++					static int lead_us = -1;
++					uint64_t lead = 0;
++					if (lead_us < 0) {
++						lead_us = 0;
++						(void)PE_parse_boot_argn("sweetfb_telead", &lead_us, sizeof(lead_us));
++					}
++					nanoseconds_to_absolutetime((uint64_t)lead_us * 1000ull, &lead);
++					uint64_t k = (now + pp / 2 - te_at) / pp + 1;
++					fb->fNextTick = te_at + k * pp + lead;
++				}
++			}
++		}
++#endif
+ 		if (fb->fNextTick <= now) {
+ 			fb->fNextTick = now + period;   /* fell behind (a long GPU wait): start again from here */
+ 		}
+@@ -1174,7 +1251,7 @@ AppleCLCD::publishModes(void)
+ 	OSDictionary *timing = OSDictionary::withCapacity(8), *horizontal = OSDictionary::withCapacity(4);
+ 	OSDictionary *vertical = OSDictionary::withCapacity(4), *color = OSDictionary::withCapacity(8);
+ 	OSArray *timings = OSArray::withCapacity(1), *colors = OSArray::withCapacity(1);
+-	const uint64_t rate = 60ull << 16;
++	const uint64_t rate = (uint64_t)sweet_fb_rate << 16;
+ 	if (timing && horizontal && vertical && color && timings && colors) {
+ 		sweet_fb_set_number(color, "ID", SWEET_FB_COLOR_ID);
+ 		sweet_fb_set_number(color, "PixelEncoding", 0);
