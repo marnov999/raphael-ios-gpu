@@ -428,3 +428,14 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   render thread 33%. Left: occasional slow glTexImage2D 3-6 ms (new textures as pages scroll in).
 - Clock: 0123 lets kern.sweet_rtc read PM8150 RTC (SID 0 0x60); sweettime needs the time set once in Settings.
 - User goal later: panel ~81 Hz + locked 80 fps (memory raphael-81hz-goal), only after locked 60.
+- **Apps opening (2026-11-03 night):** (1) "apps crash on open" = binaries 0644 (IPA zip has no mode bits; xpcproxy
+  access(X_OK) EACCES, found with sweettrace=xpcproxy) -> tools/ipa-fix-exec.py, ipa-install.py uses Mach-O magic.
+  (2) 0126: GPU imports of dead surfaces released at once (CA's per-frame 13.9 MB surfaces kept 2 s ~ 1.6 GB >
+  SWEET_SURFACE_WIRED_MAX -> backboardd create 0xe00002bd). (3) Geometry Dash black: main thread in
+  +[AVCaptureFigAudioDevice _devices] -> FigXPCRemoteClientCreate (capture servers never started in 16.7) ->
+  libsweet-media now starts them without a camera (tools/build-media.sh), mediaserverd via sweet_media_shim again
+  (launchd.plist edited live; phone's original in backup/launchd.plist.phone-20261103). HCR + GD run.
+- 0125: scanout decided on layers that HAVE a surface (mask 0x80000007 swaps = only layer 0 filled were copied ->
+  flicker between stale boot fb and scanout). 0127: USB gadget recovers from bus reset / replug.
+- Debug: sweetsample=PROC (boot-arg) + ipsw dyld a2s (slide from "SMP PROC[pid] slide"); SweetGLES logs now to
+  192.168.9.1:5151 (listener: tools/usblog.py out/logs/gles-5151.log 5151).
