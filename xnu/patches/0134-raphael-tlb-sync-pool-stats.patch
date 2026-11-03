@@ -1,11 +1,12 @@
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
-index 9aa2e84..d92ff8e 100644
+index 9aa2e84..4527f7f 100644
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -1960,20 +1960,47 @@ static int                g_kgsl_ready;  /* submit path live */
+@@ -1960,20 +1960,48 @@ static int                g_kgsl_ready;  /* submit path live */
   * after a PTE is cleared (redwood_gpu_unmap) and after a table entry is added to the live
   * pagetable: the MMU-500 caches intermediate walks, so without it a stale "invalid" L1/L2
   * entry translation-faults (fsr.TF) the new region. */
++extern void IODelay(unsigned microseconds);       /* IOKit/IOLib.h */
 +/* (how the syncs went, for the five-second line: done in the busy look, done later, never; their time) */
 +static uint32_t g_tlb_quick, g_tlb_slow, g_tlb_never;
 +static uint64_t g_tlb_time;
@@ -53,7 +54,7 @@ index 9aa2e84..d92ff8e 100644
  }
  
  /* One zeroed 4K table, NC-mapped (redwood space_new_table: a 16K page gives four). */
-@@ -3598,6 +3625,17 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+@@ -3598,6 +3626,17 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
  		}
  		g_gpu_ticks = 0;
  		g_gpu_timed = 0;
