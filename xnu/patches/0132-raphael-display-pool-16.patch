@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index cfd7e3f..25e438a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -99,8 +99,16 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+  * memory is whole, and a full-screen surface takes a free one (it goes back when the surface goes).
+  */
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-/* raphael (u4): backboardd's first four full-screen surfaces stay alive and the ones it shows come later */
+-#define SWEET_DISPLAY_POOL      8
++/*
++ * raphael (u4): backboardd's first four full-screen surfaces stay alive and the ones it shows come later;
++ * and in an animation it makes a new one each frame while the last 6-7 stay alive (u17: 2, 3, 884,
++ * 2647..2652), so 8 ran out ("no display buffer free") and every frame's surface was a new 13.9 MB of
++ * pages zeroed and pushed out of the cache. 16: the first SWEET_DISPLAY_POOL_ONE in one piece below
++ * 4 GB (only ~11 of 14 MB fit), the rest any pages (the display engine's own SMMU windows fetch those,
++ * sweet_mdp_smmu.c).
++ */
++#define SWEET_DISPLAY_POOL      16
++#define SWEET_DISPLAY_POOL_ONE  8
+ #else
+ #define SWEET_DISPLAY_POOL      4       /* two shown (SweetFramebuffer holds them) and two being drawn */
+ #endif
+@@ -128,6 +136,12 @@ sweet_surface_display_pool_init(void)
+ 		if (sweet_display_pool[i] != NULL) {
+ 			continue;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++		if (i >= SWEET_DISPLAY_POOL_ONE) {
++			sweet_display_pool[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut, size,
++			    0xFFFFFFFFFFFFF000ull);
++		} else
++#endif
+ 		sweet_display_pool[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000FFFFF000ull);
+ 		addr64_t pa = sweet_display_pool[i] ? sweet_display_pool[i]->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
