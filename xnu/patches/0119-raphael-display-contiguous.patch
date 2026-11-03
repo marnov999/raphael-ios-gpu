@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index cf4586c..7d70835 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1292,6 +1292,19 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 					sweet_gpu_reap_dead_now();      /* (a dead window server's buffers may hold them) */
+ 					mem = sweet_display_take(s->allocSize, &s->poolSlot);
+ 				}
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++				if (mem == NULL) {
++					/* raphael (u5): backboardd keeps more full-screen surfaces alive than any pool (the
++					 * shown ones come later, a set at a time): one piece below 4 GB made now, while it can be */
++					static uint32_t made, failed;
++					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++					    kIODirectionInOut | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000FFFFF000ull);
++					if (mem != NULL ? made++ < 16 : failed++ < 4) {
++						IOLog("SWEET SURF: a full-screen surface %s one piece below 4 GB (%u made, %u failed)\n",
++						    mem != NULL ? "in" : "NOT in", made, failed);
++					}
++				}
++#endif
+ 				if (mem == NULL) {
+ 					static uint32_t told;
+ 					if (told++ < 4) {
