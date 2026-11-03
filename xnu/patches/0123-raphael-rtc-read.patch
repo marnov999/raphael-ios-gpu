@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1f6f99e..043d223 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -107,16 +107,22 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	bool allowed = false;
+-	if (!sp_ready || !out || sid != SP_BATT_SID || addr > 0xffffu) {
++	if (!sp_ready || !out || addr > 0xffffu) {
+ 		return -1;
+ 	}
+-	for (unsigned i = 0; i < sizeof(sp_periph_ok) / sizeof(sp_periph_ok[0]);
++	for (unsigned i = 0; sid == SP_BATT_SID && i < sizeof(sp_periph_ok) / sizeof(sp_periph_ok[0]);
+ 	    ++i) {
+ 		if (peripheral == sp_periph_ok[i]) {
+ 			allowed = true;
+ 			break;
+ 		}
+ 	}
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	/* PM8150 RTC_RW (SID 0, 0x6000), read-only: kern.sweet_rtc (bsd/kern/sweet_amfi.c), the time of day */
++	if (sid == 0 && peripheral == 0x60) {
++		allowed = true;
++	}
++#endif
+ 	if (!allowed) {
+ 		return -1;
+ 	}

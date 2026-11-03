@@ -58,8 +58,8 @@ FILES = [
     ('gl', 'usr/local/lib/libgallium-24.2.8.dylib', 'davinci-ios/gpu/userland/mesa/gltest/libgallium-24.2.8.dylib', 0o755, 'e003f1637d005ddf'),  # push 2026-10-25 00:01Z (build-fdgl, sweet stats + restore->sysmem)
     ('gl', 'usr/local/lib/msm_dri.so', 'davinci-ios/gpu/userland/mesa/gltest/libgallium-24.2.8.dylib.bak-nofetchbarrier', 0o644, 'd2de82901800515e'),  # device copy 10-24 == this .bak (legacy, unused by eagl)
     ('gl', 'usr/local/lib/libredwood-gl.dylib', 'davinci-ios/gpu/hackios-port/obj/libredwood-gl.dylib', 0o755, '4baa16b92f671bac'),  # 2026-10-27 eagl.c: planar surfaces (camera preview) refilled when they change
-    ('gl', 'usr/local/lib/metalshim.dylib', 'davinci-ios/gpu/userland/metal/metalshim.dylib.device-20261024', 0o755, '28b8318855cef160'),  # push 2026-10-23 23:48Z (metalshim_vbl); == device copy 10-24. NOT metal/metalshim.dylib (older)
-    ('gl', 'usr/local/lib/sweet_shim', 'davinci-ios/gpu/userland/metal/sweet_shim', 0o755, 'f2c858d06ebb141c'),  # push 10-22; SpringBoard ProgramArguments[0]; == device copy
+    ('gl', 'usr/local/lib/metalshim.dylib', 'davinci-ios/gpu/userland/metal/metalshim.dylib.ate2', 0o755, 'a18697f9530d8c97'),  # davinci 10-29 12:20 (libate ASTC row clamp for SpringBoard); pushed to raphael 11-03  # push 2026-10-23 23:48Z (metalshim_vbl); == device copy 10-24. NOT metal/metalshim.dylib (older)
+    ('gl', 'usr/local/lib/sweet_shim', 'davinci-ios/gpu/userland/metal/sweet_shim.new', 0o755, '1070d97963185a36'),  # davinci 10-29 12:40 (first SpringBoard of a boot restarted once: wallpaper); pushed to raphael 11-03  # push 10-22; SpringBoard ProgramArguments[0]; == device copy
     ('gl', 'usr/libexec/backboardd_shim', 'davinci-ios/gpu/userland/metal/bbd_shim', 0o755, '9232fe0e6b48628b'),  # push 10-21 17:18Z; backboardd ProgramArguments[0]
     ('gl', 'usr/libexec/kgsl_test', 'davinci-ios/gpu/userland/kgsl_test', 0o755, 'c6092232e0eb561f'),  # inject_kgsltest.sh (mod image); job com.sweet.kgsltest
     ('gl', 'usr/local/gltest/sweet_push', 'davinci-ios/gpu/userland/push/sweet_push', 0o755, '3674708eb0015123'),  # inject_gltest.sh + push 10-23; job com.sweet.push. MUST be 0755

@@ -18,6 +18,32 @@ import host  # noqa: E402
 host.DEV = ("192.168.9.2", 5566)
 
 
+def cryptid(path):
+    """LC_ENCRYPTION_INFO_64 cryptid of the arm64 slice (a fat binary's too; host.py reads only thin ones)."""
+    import struct
+    d = open(path, "rb").read()
+    base = 0
+    if d[:4] == b"\xca\xfe\xba\xbe":                   # fat: big-endian header, the arm64 slice
+        n = struct.unpack(">I", d[4:8])[0]
+        for i in range(n):
+            ctype, _, off, size, _ = struct.unpack(">iiIII", d[8 + 20 * i:28 + 20 * i])
+            if ctype == 0x0100000c:
+                base = off
+                break
+        else:
+            return None
+    magic, _, _, _, ncmds = struct.unpack("<IiiII", d[base:base + 20])
+    if magic != 0xfeedfacf:
+        return None
+    at = base + 32
+    for _ in range(ncmds):
+        cmd, size = struct.unpack("<II", d[at:at + 8])
+        if cmd == 0x2c:                                    # LC_ENCRYPTION_INFO_64
+            return struct.unpack("<I", d[at + 16:at + 20])[0]
+        at += size
+    return 0
+
+
 def install(ipa):
     work = os.path.join(host.ROOT, "work", os.path.basename(ipa) + ".d")
     mine = not os.path.exists(work)                 # (davinci's own unpacked copies are left alone)
@@ -31,7 +57,7 @@ def install(ipa):
     if not exe or not os.path.exists(os.path.join(appdir, exe)):
         print("[ipa] %s: no CFBundleExecutable %r, skipped" % (ipa, exe))
         return False
-    cid = host.macho_cryptid(os.path.join(appdir, exe))
+    cid = cryptid(os.path.join(appdir, exe))
     if cid:
         print("[ipa] %s: FairPlay-encrypted (cryptid=%d), skipped" % (ipa, cid))
         return False

@@ -6,12 +6,14 @@ cd "$(dirname "$0")/.."
 RFINDT=${RFINDT:-/home/marnov/xmiphones/davinci-ios/gpu/userland/metal/rfindt}
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
+printf '-' > "$tmp"                    # (the last listing replaced by a marker: a 0-byte push does not land)
+python3 -I tools/push_file.py "$tmp" /tmp/rfindt.txt 0644 >/dev/null
 printf '%s\n%s' "$1" "${2:-}" > "$tmp"
 python3 -I tools/push_file.py "$tmp" /tmp/rfindt_args 0644 >/dev/null
 python3 -I tools/push_file.py "$RFINDT" /tmp/rfindt 0755 >/dev/null
 for _ in $(seq 1 60); do
 	sleep 1
-	if python3 -I tools/read_file.py /tmp/rfindt.txt > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+	if python3 -I tools/read_file.py /tmp/rfindt.txt > "$tmp" 2>/dev/null && [ "$(cat "$tmp")" != - ]; then
 		cat "$tmp"
 		exit 0
 	fi
