@@ -405,3 +405,26 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   test IPAs in /home/marnov/xmiphones/geekbench); flashing a boot image with these args (user's OK).
 - Every later root patch: sync -> hfs-journal-replay.py (dry run, then --apply) -> overlay -> back up the phone
   copies of the chunks that differ -> write-root.sh --changed. Disk: ~3 GB free after this.
+
+### 2026-11-03 evening (apps, wallpaper, widgets, frame pacing)
+- **USB 30x faster (0121+0122):** RX/TX TRB rings (64 in, 32 out, link TRB, CSP, UPDATE_TRANSFER); TRBs MUST be
+  uncached (ml_io_map view): 4 TRBs share a cache line, cleaning one wrote stale neighbours over the controller's
+  (u8: RX froze after 167 frames, iOS itself kept running). Push 36 MB/s; read 3.4 MB/s (TX side, not looked at).
+- **Apps:** 14 of davinci's IPAs (tools/ipa-install.py: davinci's host.py at 192.168.9.2, executables pushed 0644 +
+  gbx chmod so sweet_push does not spawn them, fat-binary cryptid check). NOT installed (space, ask user): ai,
+  asphalt8, gtasa (6.7 GB; root had 13.6 GB free before 5.2 GB of apps). System apps were in /Applications but
+  LaunchServices had only half-indexed (and no plugins): csstores renamed .old-20261103 -> lsd rebuild (first boot
+  ~20 min at the Apple logo, SpringBoard waits in _LSContextInitCommon) -> full iOS home screen, widgets.
+- **Wallpaper:** PosterBoard asserted "!_stateLock_switcherConfiguration" with an EMPTY Extensions/ (no poster
+  extensions indexed) -> fixed by the LS rebuild; then davinci's grey first-SpringBoard: userland/sweet_shim.c
+  (marker kern.bootsessionuuid -- boottime repeats with the epoch clock; restart 60 s in, 25 s came up grey).
+  TCC grants (davinci tccgrant): springboard Willow/MediaLibrary/Calendar/Reminders/AddressBook/BluetoothAlways/
+  Microphone/Camera/SpeechRecognition/Motion, PosterBoard + WallpaperKit.CollectionsPoster Motion. metalshim.ate2.
+- **Frame pacing (tools/measure.sh):** u10 home swipes median 19.6 ms, 43% missed. Causes found: (1) eagl copied
+  10.8 MB of zeroes per frame into the texture of CA's NEW full-screen surface (CA makes one per frame; only ids
+  2,3 live: userland/surfuse) -> userland/redwood-gl/eagl-raphael.patch clears it on the GPU (seed 0);
+  (2) 0119's contiguous-below-4GB search ran for each (cpm_allocate mutex_pause = 60% of the render thread) ->
+  0124 removed it (+ reap, double bzero). **u11: median 16.7 ms (60.0 fps), 2.5% missed slots**, tick->GL 5.3 ms,
+  render thread 33%. Left: occasional slow glTexImage2D 3-6 ms (new textures as pages scroll in).
+- Clock: 0123 lets kern.sweet_rtc read PM8150 RTC (SID 0 0x60); sweettime needs the time set once in Settings.
+- User goal later: panel ~81 Hz + locked 80 fps (memory raphael-81hz-goal), only after locked 60.
