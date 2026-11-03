@@ -15,6 +15,7 @@
  */
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
+#include <sys/sysctl.h>
 #define STEP_US 4000                    /* a move every 4 ms, as a 240 Hz digitizer */
 #include <CoreFoundation/CoreFoundation.h>
 #include <fcntl.h>
@@ -93,9 +94,20 @@ static uint32_t edge;               /* the contact began at a panel edge: the bi
 #define PANEL_H 2340.0
 
 
+/* the clocks up first, as a touch of the panel's own does (xnu 0139 kern.sweet_dvfs_kick) */
+static void
+kick(void)
+{
+	int v = 1;
+	(void)sysctlbyname("kern.sweet_dvfs_kick", NULL, NULL, &v, sizeof(v));
+}
+
 static void
 send(double px, double py, uint32_t mask, int touching)
 {
+	if (mask & kEventTouch) {
+		kick();
+	}
 	mask |= edge;
 	uint64_t now = mach_absolute_time();
 	double x = px / PANEL_W, y = py / PANEL_H;         /* the digitizer speaks in 0..1 */

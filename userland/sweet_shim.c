@@ -25,6 +25,12 @@ int main(int argc,char**argv){
     * 2026-10-29 a TCC privacy kill always gave it that second start. Until the cause is found: the first
     * SpringBoard of a boot is ended once, 25 s in, and launchd starts it again (off: gltest/no_sb_respring). */
    const char *bn = strrchr(argv[1], '/'); bn = bn ? bn + 1 : argv[1];
+   /* (2026-11-03) /usr/local/gltest/gl_cahook_sb saying 1: SpringBoard gets libcahook too (its display links and
+    * commits timed, userland/redwood-gl/cahook.c) */
+   if (strcmp(bn, "SpringBoard") == 0) {
+      char on = 0; int f = open("/usr/local/gltest/gl_cahook_sb", O_RDONLY);
+      if (f >= 0) { if (read(f, &on, 1) == 1 && on == '1') setenv("DYLD_INSERT_LIBRARIES", SHIM ":/usr/local/lib/libcahook.dylib", 1); close(f); }
+   }
    if (strcmp(bn, "SpringBoard") == 0 && access("/usr/local/gltest/no_sb_respring", F_OK) != 0) {
       /* the boot by kern.bootsessionuuid: kern.boottime is the same every boot while the clock starts at
        * the epoch (raphael 2026-11-03: the marker matched and the second boot got no restart) */

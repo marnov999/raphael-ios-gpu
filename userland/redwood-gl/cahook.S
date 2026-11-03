@@ -26,6 +26,12 @@ _ch_tramp_\n:
 	CH_TRAMP 3, 0x6db63bef, 0x6d0133ed, 0x6d022beb, 0x6d0323e9      /* Server::render_for_time */
 	CH_TRAMP 4, 0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd      /* Render::Context::will_commit */
 	CH_TRAMP 5, 0xd10183ff, 0x6d0123e9, 0xa9025ff8, 0xa90357f6      /* Render::Context::did_commit */
+	CH_TRAMP 6, 0xaa0103e0, 0xaa0203e1, 0xaa0303e2, 0x52800023      /* Display::DisplayLink::callback (a program's) */
+	CH_TRAMP 7, 0x6db733ed, 0x6d012beb, 0x6d0223e9, 0xa9036ffc      /* Display::DisplayLink::dispatch_items */
+	CH_TRAMP 8, 0xd10383ff, 0x6d062beb, 0x6d0723e9, 0xa9086ffc      /* Transaction::commit */
+	CH_TRAMP 9, 0x6db733ed, 0x6d012beb, 0x6d0223e9, 0xa9036ffc      /* Context::commit_transaction */
+	CH_TRAMP 10, 0x6dbb2beb, 0x6d0123e9, 0xa90257f6, 0xa9034ff4     /* Display::DisplayLinkItem::set_preferred_fps_range */
+	CH_TRAMP 11, 0x6db92beb, 0x6d0123e9, 0xa90267fa, 0xa9035ff8     /* DynamicFrameRateSource::set_preferred_fps_range */
 
 .macro CH_STUB n
 	.globl _ch_stub_\n
@@ -67,9 +73,15 @@ _ch_stub_\n:
 	CH_STUB 3
 	CH_STUB 4
 	CH_STUB 5
+	CH_STUB 6
+	CH_STUB 7
+	CH_STUB 8
+	CH_STUB 9
+	CH_STUB 10
+	CH_STUB 11
 
 	.data
 	.p2align 3
 	.globl _ch_back
 _ch_back:
-	.space 8 * 8
+	.space 8 * 16

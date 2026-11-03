@@ -1,11 +1,11 @@
 --- a/eagl.c	2026-11-03 23:22:00.456412083 +0100
-+++ b/eagl.c	2026-11-03 23:31:57.832002086 +0100
++++ b/eagl.c	2026-11-03 23:57:28.501549350 +0100
 @@ -191,6 +191,11 @@
  	write(2, line, (size_t)n);
  }
  
 +/* (raphael) cahook.c: CoreAnimation's render server's vsyncs, renders and commits, timed (gl_cahook) */
-+int ch_install(void (*say)(const char *, ...));
++int ch_install(void (*say)(const char *, ...), int set);
 +void ch_dump(void (*say)(const char *, ...));
 +static int cahook_on;
 +
@@ -200,7 +200,7 @@
 +		int fd = open("/usr/local/gltest/gl_cahook", O_RDONLY);
 +		if (fd >= 0) {
 +			if (read(fd, &on, 1) == 1 && on == '1') {
-+				cahook_on = ch_install(say) > 0;
++				cahook_on = ch_install(say, 0) > 0;
 +			}
 +			close(fd);
 +		}

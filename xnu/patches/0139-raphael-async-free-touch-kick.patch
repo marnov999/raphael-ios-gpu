@@ -1,0 +1,142 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 558c91d..1fd4347 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1875,7 +1875,9 @@ gpu_shader_tests(void)
+  * the a618's DCVS mailbox. Boot-arg sweetgpu=9.
+  */
+ #include <kern/locks.h>
++#include <kern/thread_call.h>
+ #include <sys/conf.h>
++#include <sys/sysctl.h>
+ #include <sys/uio.h>
+ #include <sys/vnode.h>
+ extern vnode_t rootvnode;
+@@ -2744,13 +2746,40 @@ static struct {
+ 
+ /* A buffer's memory and addresses given up for good: the GPU is done with it. */
+ #define SWEET_IMPORT_PAD_BYTES (128u * 0x1000u)   /* drm_do_ios_import's scratch pages after an import */
++/*
++ * What gpu_bo_destroy gives back after the GPU's addresses: the memory itself and the surface's hold, by
++ * a thread call of its own. Freed by the caller, a full-screen buffer's 10.8 MB of wired pages took ~8 ms
++ * with the GPU's lock held (kmem_free), in the window server's glDeleteTextures -- a frame missed each
++ * time (u18-u22: ~17 in 10 s of swipes). The addresses are out of the GPU's tables and its TLB first, so
++ * the GPU cannot reach the memory while it waits here. Boot-arg sweetgpu_syncfree=1: as before.
++ */
++#define GPU_FREE_Q 512u
++static struct { vm_offset_t cva; vm_size_t size; void *surf; } g_free_q[GPU_FREE_Q];
++static uint32_t g_free_head, g_free_tail;      /* (with the GPU's lock held) */
++static thread_call_t g_free_call;
++static void gpu_free_worker(thread_call_param_t p0, thread_call_param_t p1);
++
+ static void
+ gpu_bo_destroy(vm_offset_t cva, uint64_t gpuaddr, vm_size_t mmapsize, void *surf)
+ {
++	static int sync_free = -1;
+ 	/* an imported surface's addresses run on into its scratch pages (drm_do_ios_import) */
+ 	vm_size_t vsize = surf ? mmapsize + SWEET_IMPORT_PAD_BYTES : mmapsize;
+ 	gpu_unmap(gpuaddr, vsize);
+ 	gpu_address_free(gpuaddr, vsize);
++	if (sync_free < 0) {
++		sync_free = 0;
++		(void)PE_parse_boot_argn("sweetgpu_syncfree", &sync_free, sizeof(sync_free));
++		g_free_call = thread_call_allocate_with_options(gpu_free_worker, NULL, THREAD_CALL_PRIORITY_USER, 0);
++	}
++	if (!sync_free && g_free_call != NULL && g_free_tail - g_free_head < GPU_FREE_Q) {
++		uint32_t i = g_free_tail++ % GPU_FREE_Q;
++		g_free_q[i].cva = cva;
++		g_free_q[i].size = mmapsize;
++		g_free_q[i].surf = surf;
++		thread_call_enter(g_free_call);
++		return;
++	}
+ 	if (cva) {
+ 		kmem_free(kernel_map, cva, mmapsize);
+ 	}
+@@ -2759,6 +2788,32 @@ gpu_bo_destroy(vm_offset_t cva, uint64_t gpuaddr, vm_size_t mmapsize, void *surf
+ 	}
+ }
+ 
++static void
++gpu_free_worker(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	for (;;) {
++		vm_offset_t cva;
++		vm_size_t size;
++		void *surf;
++		gpu_lock();
++		if (g_free_head == g_free_tail) {
++			gpu_unlock();
++			return;
++		}
++		uint32_t i = g_free_head++ % GPU_FREE_Q;
++		cva = g_free_q[i].cva;
++		size = g_free_q[i].size;
++		surf = g_free_q[i].surf;
++		gpu_unlock();
++		if (cva) {
++			kmem_free(kernel_map, cva, size);
++		}
++		if (surf) {
++			sweet_surface_gpu_unref(surf);
++		}
++	}
++}
++
+ static void
+ gpu_drop_kept(struct gpu_kept *k)
+ {
+@@ -4514,6 +4569,24 @@ sweet_dvfs_kick(void)
+ 	}
+ }
+ 
++/*
++ * kern.sweet_dvfs_kick (root, written): the same from userland -- touches put in through the HID event
++ * system (tools/touch.sh's hidtouch) do not pass the kernel's digitizer, and after an idle while the
++ * first frames they brought were SpringBoard's at the idle clocks: its commits came 5-10 ms late (u22).
++ */
++static int
++sysctl_sweet_dvfs_kick SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, error = SYSCTL_IN(req, &v, sizeof(v));
++	if (error == 0 && req->newptr != USER_ADDR_NULL) {
++		sweet_dvfs_kick();
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_dvfs_kick, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_dvfs_kick, "I", "the clocks up now (something will be drawn)");
++
+ static void
+ clocks_apply(const struct sweet_clocks *k, const char *why)
+ {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7821022..43459c9 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -572,6 +572,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	collection->release();
+ }
+ 
++extern "C" void sweet_dvfs_kick(void);        /* bsd/dev/sweet_gpu.c: the clocks up (something will be drawn) */
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)
+@@ -581,6 +583,7 @@ sweet_hid_key(int key, int down)
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
+ 	};
+ 
++	sweet_dvfs_kick();
+ 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
+ 		gSweetButtons->key(usages[key], down != 0);
+ 	}
+@@ -589,6 +592,7 @@ sweet_hid_key(int key, int down)
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
++	sweet_dvfs_kick();              /* (a touch after an idle while: the frames it brings are drawn at speed) */
+ 	if (gSweetTouch) {
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
