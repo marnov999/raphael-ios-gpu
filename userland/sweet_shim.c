@@ -44,14 +44,19 @@ int main(int argc,char**argv){
          if (fd >= 0) { (void)write(fd, want, strlen(want)); close(fd); }
          pid_t sb = getpid();
          pid_t ch = fork();
-         snprintf(b, sizeof b, "[sweet_shim] first SpringBoard of boot %ld (marker %s): restart in 25 s by pid %d\n",
-                  (long)bt.tv_sec, wrote ? "written" : "NOT written", (int)ch);
+         /* raphael: 25 s (davinci's) is too early here -- the restarted SpringBoard and PosterBoard come up grey;
+          * a restart a minute in shows the wallpaper. /usr/local/gltest/sb_respring_secs = other seconds. */
+         int secs = 60;
+         FILE *sf = fopen("/usr/local/gltest/sb_respring_secs", "r");
+         if (sf != NULL) { if (fscanf(sf, "%d", &secs) != 1 || secs < 1 || secs > 600) secs = 60; fclose(sf); }
+         snprintf(b, sizeof b, "[sweet_shim] first SpringBoard of boot %ld (marker %s): restart in %d s by pid %d\n",
+                  (long)bt.tv_sec, wrote ? "written" : "NOT written", secs, (int)ch);
          if (ch != 0) LOG(b);
          if (ch == 0) {
             setsid();
             for (int i = 0; i < 64; i++) close(i);
             LOG("[sweet_shim] restart child waiting\n");
-            sleep(25);
+            sleep((unsigned)secs);
             LOG("[sweet_shim] SpringBoard's first start of this boot ended once (its wallpaper)\n");
             kill(sb, SIGKILL);
             _exit(0);
