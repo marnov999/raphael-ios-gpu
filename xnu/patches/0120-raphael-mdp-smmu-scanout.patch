@@ -1,0 +1,313 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 91fc11c..a0b436a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_prof.c			standard
+ bsd/dev/sweet_dpu.c			standard
+ bsd/dev/sweet_panel.c			standard
+ bsd/dev/sweet_reboot.c			standard
++bsd/dev/sweet_mdp_smmu.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_mdp_smmu.c b/bsd/dev/sweet_mdp_smmu.c
+new file mode 100644
+index 0000000..e921210
+--- /dev/null
++++ b/bsd/dev/sweet_mdp_smmu.c
+@@ -0,0 +1,249 @@
++/*
++ * SWEET (raphael): the display engine's own SMMU context, so that it can scan out a surface wherever
++ * its pages are (SweetFramebuffer.cpp scanOut, boot-arg sweetfb_scanout=1).
++ *
++ * The engine's pipes take 32-bit addresses. davinci gives CoreAnimation's full-screen surfaces one
++ * physical piece below 4 GB (SweetSurface's display pool); on raphael only 1 GB of the kernel's memory
++ * is below 4 GB (the window starts at 0xc0000000) and backboardd keeps 15 and more full-screen surfaces
++ * alive (u6, 2026-11-03: 11 found room), so most frames were still copied. As Android has it: the
++ * engine's stream (stock dt mdss_mdp smmu_sde_unsec: apps_smmu 0x800, mask 0x420) translated through a
++ * context bank of ours, the surfaces' pages mapped into 16 windows of 16 MB at 0x10000000 as they are
++ * shown (the least recently shown window taken for a new one), 0x80000000-0xffffffff mapped onto itself
++ * (two 1 GB blocks) so that the boot loader's framebuffer (0x9c000000) and the pool's buffers are what
++ * they were. MMU-500 setup as sweet_gpu.c's contexts (39-bit stage 1, 4 KB pages, non-cacheable
++ * attributes: the engine reads DRAM, the GPU has written it there).
++ */
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++#include <stdbool.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++uint32_t sweet_mdp_iova(uint32_t id, const void *owner, const uint64_t *pages, uint32_t n);
++
++#define SMMU_PA                 0x15000000u     /* apps_smmu */
++#define MDP_SID                 0x800u
++#define SMR_VALID               (1u << 31)
++#define CB_SCTLR                0x00u
++#define CB_TCR2                 0x10u
++#define CB_TTBR0                0x20u
++#define CB_TTBR1                0x28u
++#define CB_TCR                  0x30u
++#define CB_MAIR0                0x38u
++#define CB_MAIR1                0x3cu
++#define CB_FSR                  0x58u
++#define CB_FAR                  0x60u
++#define CB_TLBIASID             0x610u
++#define CB_TLBSYNC              0x7f0u
++#define CB_TLBSTATUS            0x7f4u
++#define CBAR_STAGE_1            (1u << 16 | 3u << 8 | 0xfu << 12)
++#define SCTLR_ON                (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
++#define TCR_39_BITS             (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
++#define TCR2_VAL                (1u | 1u << 4 | 7u << 15)
++#define MAIR0_VAL               0xf404ff44u
++#define FSR_ALL                 0xc00001feu
++#define PTE_PAGE                0xE43ull        /* page, AP[1] (unprivileged), outer shareable, AF, nG, attr 0 (NC) */
++#define PTE_BLOCK               0xE41ull
++#define PTE_TABLE               0x3ull
++
++#define SLOTS                   16u
++#define SLOT_BYTES              (16u << 20)
++#define IOVA_SLOT0              0x10000000u
++#define L3_PER_SLOT             (SLOT_BYTES >> 21)                       /* 2 MB a table */
++#define TABLES                  (2u + SLOTS * L3_PER_SLOT)               /* L1, L2, L3s */
++
++static int          ms_state;                   /* 0 not tried, 1 up, -1 not possible */
++static vm_offset_t  ms_g0, ms_cb;
++static uint32_t     ms_ctx;
++static vm_offset_t  ms_tables;                  /* TABLES pages of 4 KB, one piece */
++static uint64_t     ms_tables_pa;
++static struct {
++	uint32_t    id;
++	const void *owner;
++	uint64_t    used;
++} ms_slot[SLOTS];
++static uint64_t     ms_clock;
++
++static inline uint32_t
++ms_rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++ms_wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static volatile uint64_t *
++ms_table(unsigned i)
++{
++	return (volatile uint64_t *)(ms_tables + 4096u * i);
++}
++
++static void
++ms_flush(unsigned first, unsigned count)
++{
++	flush_dcache64((addr64_t)(ms_tables_pa + 4096u * first), 4096u * count, TRUE);
++}
++
++static void
++ms_tlb(void)
++{
++	ms_wr(ms_cb, CB_TLBIASID, ms_ctx);
++	ms_wr(ms_cb, CB_TLBSYNC, 1);
++	for (unsigned polls = 0; polls < 1000u && (ms_rd(ms_cb, CB_TLBSTATUS) & 1u); polls++) {
++		delay(1);
++	}
++}
++
++static bool
++ms_init(void)
++{
++	uint32_t idr0, idr1, nsmr, ncb, pgshift, npg, match = 0xffffffffu, cb;
++	static bool used[256];
++	vm_offset_t g1;
++	vm_size_t size = round_page((vm_size_t)TABLES * 4096u);
++	uint32_t on = 1;
++
++	(void)PE_parse_boot_argn("sweetfb_smmu", &on, sizeof(on));
++	if (!on || !(ms_g0 = ml_io_map(SMMU_PA, 0x1000))) {
++		return false;
++	}
++	idr0 = ms_rd(ms_g0, 0x20);
++	idr1 = ms_rd(ms_g0, 0x24);
++	nsmr = idr0 & 0xff;
++	ncb = idr1 & 0xff;
++	pgshift = (idr1 & (1u << 31)) ? 16 : 12;
++	npg = 1u << (((idr1 >> 28) & 7) + 1);
++	if (!(g1 = ml_io_map(SMMU_PA + (1u << pgshift), 0x1000))) {
++		return false;
++	}
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t smr = ms_rd(ms_g0, 0x800 + 4 * i), s2cr = ms_rd(ms_g0, 0xc00 + 4 * i);
++		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		if (!(smr & SMR_VALID)) {
++			continue;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[s2cr & 0xff] = true;
++		}
++		if (((id ^ MDP_SID) & ~mask) == 0 && match == 0xffffffffu) {
++			match = i;
++		}
++	}
++	if (match == 0xffffffffu) {
++		printf("SWEET MDP SMMU: no SMR for the display engine's stream %#x\n", MDP_SID);
++		return false;
++	}
++	printf("SWEET MDP SMMU: stream %#x: SMR %u %#x S2CR %#x (%u SMRs, %u banks)\n", MDP_SID, match,
++	    ms_rd(ms_g0, 0x800 + 4 * match), ms_rd(ms_g0, 0xc00 + 4 * match), nsmr, ncb);
++	for (cb = ncb - 1; cb > 0; cb--) {
++		vm_offset_t p = ml_io_map(SMMU_PA + ((vm_offset_t)(npg + cb) << pgshift), 0x1000);
++		if (p != 0 && !used[cb] && !(ms_rd(p, CB_SCTLR) & 1u)) {
++			ms_cb = p;
++			break;
++		}
++	}
++	if (cb == 0) {
++		printf("SWEET MDP SMMU: no free context bank of %u\n", ncb);
++		return false;
++	}
++	ms_ctx = cb;
++	if (kmem_alloc_contig(kernel_map, &ms_tables, size, PAGE_MASK, 0, 0, KMA_ZERO | KMA_PERMANENT | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	ms_tables_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)ms_tables)) + (ms_tables & PAGE_MASK);
++	/* L1: [0] the windows' L2, [2] [3] 0x80000000-0xffffffff onto itself; L2 [128..]: the windows' L3s */
++	ms_table(0)[0] = (ms_tables_pa + 4096u) | PTE_TABLE;
++	ms_table(0)[2] = 0x80000000ull | PTE_BLOCK;
++	ms_table(0)[3] = 0xc0000000ull | PTE_BLOCK;
++	for (uint32_t i = 0; i < SLOTS * L3_PER_SLOT; i++) {
++		ms_table(1)[(IOVA_SLOT0 >> 21) + i] = (ms_tables_pa + 4096ull * (2u + i)) | PTE_TABLE;
++	}
++	ms_flush(0, TABLES);
++	ms_wr(ms_cb, CB_SCTLR, 0);
++	ms_wr(g1, 0x800 + 4 * cb, 1u);                  /* CBA2R: 64-bit */
++	ms_wr(g1, 4 * cb, CBAR_STAGE_1);
++	ms_wr(ms_cb, CB_TCR2, TCR2_VAL);
++	ms_wr(ms_cb, CB_TCR, TCR_39_BITS);
++	ms_wr(ms_cb, CB_TTBR0, (uint32_t)ms_tables_pa);
++	ms_wr(ms_cb, CB_TTBR0 + 4, (uint32_t)(ms_tables_pa >> 32) | (cb << 16));       /* ASID = the bank */
++	ms_wr(ms_cb, CB_TTBR1, 0);
++	ms_wr(ms_cb, CB_TTBR1 + 4, 0);
++	ms_wr(ms_cb, CB_MAIR0, MAIR0_VAL);
++	ms_wr(ms_cb, CB_MAIR1, 0);
++	ms_wr(ms_cb, CB_FSR, FSR_ALL);
++	ms_tlb();
++	ms_wr(ms_cb, CB_SCTLR, SCTLR_ON);
++	ms_wr(ms_g0, 0xc00 + 4 * match, cb);            /* the engine's stream: translated by it */
++	printf("SWEET MDP SMMU: context bank %u: tables at %#llx, S2CR %u now %#x (0x80000000-0xffffffff as is, "
++	    "%u windows of 16 MB at %#x)\n", cb, ms_tables_pa, match, ms_rd(ms_g0, 0xc00 + 4 * match), SLOTS, IOVA_SLOT0);
++	return true;
++}
++
++/*
++ * The address the display engine is to fetch a surface at: the surface's 16 KB pages (PAGES, N of
++ * them, from its first) mapped into a window, which is kept while it is the same surface (ID, OWNER:
++ * its memory). 0: not possible (the frame is then copied).
++ */
++uint32_t
++sweet_mdp_iova(uint32_t id, const void *owner, const uint64_t *pages, uint32_t n)
++{
++	uint32_t slot = SLOTS, oldest = 0;
++	static uint32_t faults_told;
++
++	if (ms_state == 0) {
++		ms_state = ms_init() ? 1 : -1;
++	}
++	if (ms_state < 0 || n == 0 || (uint64_t)n * 16384u > SLOT_BYTES) {
++		return 0;
++	}
++	ms_clock++;
++	if (faults_told < 4 && (ms_rd(ms_cb, CB_FSR) & FSR_ALL) != 0) {
++		faults_told++;
++		printf("SWEET MDP SMMU: fault: FSR %#x FAR %#x_%08x\n", ms_rd(ms_cb, CB_FSR), ms_rd(ms_cb, CB_FAR + 4),
++		    ms_rd(ms_cb, CB_FAR));
++		ms_wr(ms_cb, CB_FSR, FSR_ALL);
++	}
++	for (uint32_t i = 0; i < SLOTS; i++) {
++		if (ms_slot[i].owner == owner && ms_slot[i].id == id) {
++			ms_slot[i].used = ms_clock;
++			return IOVA_SLOT0 + i * SLOT_BYTES;
++		}
++		if (ms_slot[i].used < ms_slot[oldest].used) {
++			oldest = i;
++		}
++	}
++	slot = oldest;                                  /* not shown for the longest (the last few never) */
++	for (uint32_t k = 0; k < SLOT_BYTES / 4096u; k++) {
++		uint64_t pa = k / 4u < n ? pages[k / 4u] + 4096ull * (k % 4u) : 0;
++		ms_table(2u + slot * L3_PER_SLOT + k / 512u)[k % 512u] = pa != 0 ? pa | PTE_PAGE : 0;
++	}
++	ms_flush(2u + slot * L3_PER_SLOT, L3_PER_SLOT);
++	ms_tlb();
++	ms_slot[slot].id = id;
++	ms_slot[slot].owner = owner;
++	ms_slot[slot].used = ms_clock;
++	{
++		static uint32_t told;
++		if (told++ < 8) {
++			printf("SWEET MDP SMMU: surface %u (%u pages) in window %u at %#x\n", id, n, slot,
++			    IOVA_SLOT0 + slot * SLOT_BYTES);
++		}
++	}
++	return IOVA_SLOT0 + slot * SLOT_BYTES;
++}
++#endif /* ARM64_BOARD_CONFIG_RAPHAEL */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 847d6d4..563f001 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -62,6 +62,9 @@ extern "C" uint32_t sweet_fb_scanout_id;       /* bsd/kern/sweet_amfi.c kern.swe
+ extern "C" void sweet_dpu_survey(void);
+ extern "C" void sweet_prof_start(void);
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++extern "C" uint32_t sweet_mdp_iova(uint32_t id, const void *owner, const uint64_t *pages, uint32_t n);   /* bsd/dev/sweet_mdp_smmu.c */
++#endif
+ extern "C" void sweet_dvfs_kick(void);      /* bsd/dev/sweet_gpu.c: wake the clocks (something is drawn) */
+ 
+ enum {
+@@ -1356,7 +1359,30 @@ AppleCLCD::present(const uint8_t *rec)
+ 			uint64_t need = (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4;
+ 			IOByteCount seg = 0;
+ 			addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+-			if (pa != 0 && seg >= need && pa + need <= 0x100000000ull && scanOut(s, pa, s->bytesPerRow, fScale)) {
++			uint64_t at = (pa != 0 && seg >= need && pa + need <= 0x100000000ull) ? pa : 0;
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++			if (at == 0 && pa != 0) {
++				/* not one piece below 4 GB: its pages in a window of the engine's own SMMU context */
++				static uint64_t pages[1024];
++				uint64_t first = off & ~0x3fffull;
++				uint32_t n = (uint32_t)((off + need - first + 0x3fffull) >> 14);
++				uint32_t iova = 0;
++				if (n <= 1024u) {
++					uint32_t k;
++					for (k = 0; k < n; k++) {
++						IOByteCount len = 0;
++						pages[k] = s->memory->getPhysicalSegment(first + ((uint64_t)k << 14), &len, kIOMemoryMapperNone) &
++						    ~0x3fffull;
++						if (pages[k] == 0) {
++							break;
++						}
++					}
++					iova = k == n ? sweet_mdp_iova(s->id, s->memory, pages, n) : 0;
++				}
++				at = iova != 0 ? iova + (off & 0x3fffull) : 0;
++			}
++#endif
++			if (at != 0 && scanOut(s, at, s->bytesPerRow, fScale)) {
+ 				if (sweet_tl_on) {
+ 					struct sweet_tl_swap *t = sweet_tl_find(get32(rec, 0x50));
+ 					if (t != NULL) {
