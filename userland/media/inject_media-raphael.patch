@@ -1,0 +1,20 @@
+--- a/src/inject_media.c
++++ b/src/inject_media.c
+@@ -657,9 +657,14 @@
+ 		register_hevc_encoder();
+ 		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+ 		    NULL, metal_check);
+-		/* after FigMediaServerStart (main() runs it before its run loop): the main queue runs once that is done */
+-		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL,
+-		    start_capture_servers);
+ 	}
++	/*
++	 * (raphael, no camera) The capture servers are started all the same: without them every
++	 * AVCaptureDevice listing waits forever (Geometry Dash's main thread in +[AVCaptureFigAudioDevice _devices]
++	 * -> FigXPCRemoteClientCreate, a black screen). With no camera they answer that there is none.
++	 * After FigMediaServerStart (main() runs it before its run loop): the main queue runs once that is done.
++	 */
++	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL,
++	    start_capture_servers);
+ 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
+ }

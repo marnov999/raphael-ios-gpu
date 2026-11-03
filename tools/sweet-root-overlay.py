@@ -40,7 +40,7 @@ import argparse, hashlib, os, plistlib, shutil, struct, sys
 # Claude session transcripts (push_file.py / push.sh, last push per path).
 FILES = [
     ('launchd', 'usr/local/gltest/sweettime', 'davinci-ios/gpu/userland/metal/sweettime', 0o755, '12ffbb8fc9df4a7a'),  # 2026-10-26: time of day = RTC (kern.sweet_rtc, 0162) + kept offset (job com.sweet.time)
-    ('launchd', 'usr/local/lib/libsweet-media.dylib', 'davinci-ios/camera/userland/libsweet-media.dylib', 0o755, 'f4677bffb1c2a052'),  # 2026-10-29 01:30: + MIUI tuning (.isp), AE reset on lens switch, total-zoom metadata (main/tele live), zoom asked at delivery; temporary diag: lines
+    ('launchd', 'usr/local/lib/libsweet-media.dylib', 'raphael-ios-gpu/out/userland/libsweet-media.dylib', 0o755, '04b7764f85bf7fe6'),  # tools/build-media.sh: davinci's + capture servers started without a camera (raphael 11-03; run WITHOUT --no-media-shim)  # 2026-10-29 01:30: + MIUI tuning (.isp), AE reset on lens switch, total-zoom metadata (main/tele live), zoom asked at delivery; temporary diag: lines
     ('launchd', 'usr/local/lib/sweet_media_shim', 'davinci-ios/camera/userland/sweet_media_shim', 0o755, '9c48829ed46d8fb5'),  # 2026-10-26: mediaserverd ProgramArguments[0]; inserts libsweet-media (execs without it if missing)
     ('launchd', 'usr/local/gltest/scset', 'davinci-ios/gpu/userland/metal/scset', 0o755, 'a838fc11ea8053b7'),  # 2026-10-25: publishes Plugin:InterfaceNamer *QUIET* at boot (job com.sweet.scquiet)
     ('assets', 'usr/local/gltest/inplace_copy_lpf.fragment.spv', 'backup/ios-root-sources-20261025/phone-only/inplace_copy_lpf.fragment.spv', 0o644, '05f9adab013b54c8'),  # only on the phone; pulled 2026-10-25
