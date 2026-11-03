@@ -1,6 +1,8 @@
 #!/bin/bash
-# write-root.sh IMAGE [SERIAL]: write the iOS root image (tools/build-root.sh) into raphael's iosdata
-# partition from rooted MIUI, chunk by chunk, each chunk checked on the partition afterwards.
+# write-root.sh [--changed] IMAGE [SERIAL]: write the iOS root image (tools/build-root.sh) into raphael's
+# iosdata partition from rooted MIUI, chunk by chunk, each chunk checked on the partition afterwards.
+# --changed: a chunk whose sha256 on the partition is already the image's is left as it is (for an image
+# patched after tools/sync-root-from-phone.sh: only what the patch touched is sent).
 #
 # Not a pipe into `su -c dd`: Magisk's su relays stdin so that toybox dd stops after its first 4 MiB
 # block and toybox `gzip -dc` writes nothing (2026-11-02: the whole first attempt landed nowhere, which
@@ -9,7 +11,9 @@
 # sent. Refuses anything but a raphael with an unmounted 25 GiB iosdata and an image that leaves the last
 # 8 MiB free (the kernel's log ring).
 set -euo pipefail
-IMG=${1:?usage: write-root.sh IMAGE [SERIAL]} SERIAL=${2:-53d545e6}
+CHANGED=0
+[ "${1:-}" = --changed ] && { CHANGED=1; shift; }
+IMG=${1:?usage: write-root.sh [--changed] IMAGE [SERIAL]} SERIAL=${2:-53d545e6}
 ADB="${ADB:-/home/marnov/xmiphones/platform-tools/adb} -s $SERIAL"
 PART=/dev/block/by-name/iosdata
 EXPECT=26843545600			# 25 GiB, tools/gpt-split.py
@@ -33,6 +37,10 @@ for ((i = 0; i < n; i++)); do
 	[ $((seek + cnt)) -le $blocks ] || cnt=$((blocks - seek))
 	dd if="$IMG" of="$HOSTTMP" bs=$BS skip=$seek count=$cnt status=none
 	want=$(sha256sum "$HOSTTMP" | cut -d' ' -f1)
+	if [ $CHANGED = 1 ] && [ "$(su_ "dd if=$PART bs=$BS skip=$seek count=$cnt 2>/dev/null | sha256sum" | cut -d' ' -f1)" = "$want" ]; then
+		printf 'chunk %2d/%d same\n' $((i + 1)) "$n"
+		continue
+	fi
 	if cmp -s -n $((cnt * BS)) "$HOSTTMP" /dev/zero; then
 		su_ "dd if=/dev/zero of=$PART bs=$BS seek=$seek count=$cnt conv=notrunc 2>/dev/null" >/dev/null
 		how=zero

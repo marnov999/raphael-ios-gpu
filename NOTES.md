@@ -333,3 +333,17 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - Next: userland (davinci's Mesa freedreno a6xx build, libredwood-gl FD_MESA_GMEM 1 MB, SweetGLES, RedwoodMetal,
   shims, root overlay) -> rewrite iosdata root (needs the user's OK) -> sweetmetal=1. USB gadget (sweetusb=2) on
   SM8150 still resets the phone: fixing it would give davinci's sweet_push fast loop (no root rewrites).
+
+### 2026-11-03 (userland: davinci's overlay on the live root)
+- The root on iosdata had a dirty HFS+ journal (every iOS run so far ended in a forced reset): Linux cannot replay
+  it, and patching under it would be undone/corrupted by XNU's replay. Clean way: iOS Settings > General > Shut
+  Down (power+vol-up 15 s = hardware reset, not clean); it then panics "halt/reset timed out" (no power-off
+  hook on raphael yet) AFTER unmounting -> tools/hfs-journal.py: cleanly unmounted, journal EMPTY.
+- tools/sync-root-from-phone.sh (pull only chunks whose sha differs) -> out/root image = phone root (11+12
+  chunks); tools/overlay-root.sh (privileged ubuntu container, Linux fsck_hfs only reports iOS's hard-link
+  counts) ran tools/sweet-root-overlay.py --accept-changed: 277 changes (Mesa freedreno/turnip, libredwood-gl,
+  metalshim + shims, RedwoodMetal, SweetGLES, launchd edits, staged apps, 2 dyld-cache patches, tools, assets).
+  Phone's pre-overlay copies of the 17 changed chunks: backup/root-preoverlay-20261103/ (CHUNKS.txt: index,
+  4M-block seek, count, sha) -> rollback = dd them back. tools/write-root.sh --changed wrote 17 chunks, all
+  verified (8704 MiB).
+- NOTE libredwood-gl sets FD_MESA_GMEM=524288 (davinci's A618): safe on the A640 (1 MB), only smaller bins.
