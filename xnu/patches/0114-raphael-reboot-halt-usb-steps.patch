@@ -1,0 +1,660 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index abb32e8..91fc11c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_prof.c			standard
+ bsd/dev/sweet_dpu.c			standard
+ bsd/dev/sweet_panel.c			standard
++bsd/dev/sweet_reboot.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 664fa16..8d95357 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3976,7 +3976,7 @@ static int gpu_set_level(uint32_t level, uint64_t *out);
+ static int g_level_quiet;       /* (the clock governor's changes: no measuring, no line) */
+ #define MSM_INFO_IOS_REBOOT 0x86u      /* private: value 0 = set the PMIC reboot reason "bootloader" and
+                                          * report; 1 = set it and reset (-> fastboot) */
+-static int sweet_reboot_fastboot(uint32_t mode);
++extern int sweet_reboot_fastboot(uint32_t mode);       /* bsd/dev/sweet_reboot.c */
+ /* With the lock held (drm_ioctl). */
+ static int
+ drm_ioctl_locked(unsigned nr, caddr_t data)
+@@ -4269,15 +4269,6 @@ gpu_set_level(uint32_t level, uint64_t *out)
+ 	return 0;
+ }
+ 
+-/* davinci reboots into fastboot through its PMIC's PON spare register; not done on raphael yet. */
+-static int
+-sweet_reboot_fastboot(uint32_t mode)
+-{
+-	(void)mode;
+-	printf("SWEET GPU: reboot to fastboot is not there on raphael\n");
+-	return -1;
+-}
+-
+ /* davinci's clock governor is told something is being drawn; raphael has none yet. */
+ void
+ sweet_dvfs_kick(void)
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+new file mode 100644
+index 0000000..e933954
+--- /dev/null
++++ b/bsd/dev/sweet_reboot.c
+@@ -0,0 +1,248 @@
++/*
++ * SWEET (raphael): reboot into fastboot, power off and restart, as davinci's sweet_gpu.c does them.
++ *
++ * The reboot target is the PMIC's: Linux's qcom-pon reboot-mode writes PON SOFT_RB_SPARE (PM8150
++ * SID 0, peripheral 0x08, register 0x8f) bits[7:1] = 2 for "bootloader" (pm8150.dtsi: pm8998-pon,
++ * reason shift 1), the register survives the SoC reset, and ABL reads and clears it. Written over
++ * SPMI v5 (sm8150.dtsi spmi_bus, the same regions as davinci's SM7150): an APID's read/write
++ * channel at chnls + 0x10000 * apid, the observer (reads) at obsrvr + 0x80 * apid.
++ *
++ *   sweet_reboot_fastboot(0)   set the reason only: any reset from now on comes up in fastboot
++ *   sweet_reboot_fastboot(1)   set it and reset (DRM MSM_INFO_IOS_REBOOT: userland fbreboot)
++ *
++ * Boot-arg sweetarmfb=1 sets the reason at boot (before the USB start and the GPU), so a hang that
++ * ends in a watchdog reset, or a panic, lands in fastboot instead of the flashed boot's iOS (whose
++ * boot would overwrite the log ring). PE_halt_restart (boot-arg sweethalt=0: not set) does power off
++ * and restart as Linux's msm-poweroff / qpnp-power-on: the reason cleared, the PMIC's PS_HOLD reset
++ * type set to shutdown or hard reset, PS_HOLD dropped (iOS's Shut Down ended in "halt/reset timed
++ * out" without it). A panic restart, when armed, is a PSCI reset (into fastboot).
++ */
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++#include <stdbool.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_log_sync(void);
++extern int (*PE_halt_restart)(unsigned int type);
++int sweet_reboot_fastboot(uint32_t mode);
++void sweet_reboot_init(void);
++
++#define SPMI_CORE_PA            0x0c440000u
++#define SPMI_CHNLS_PA           0x0c600000u
++#define SPMI_OBS_PA             0x0e600000u
++#define SPMI_CFG_PA             0x0c40a000u
++#define PON_PERIPH              0x08u
++#define PON_PERPH_SUBTYPE       0x05u
++#define PON_PS_HOLD_RST_CTL     0x5au
++#define PON_PS_HOLD_RST_CTL2    0x5bu
++#define PON_SOFT_RB_SPARE       0x8fu
++#define PON_REASON_BL           0x02u
++#define PON_RESET_EN            0x80u
++#define PON_TYPE_SHUTDOWN       0x04u
++#define PON_TYPE_HARD_RESET     0x07u
++#define PON_GEN2_PRIMARY        0x04u
++#define PON_GEN2_SECONDARY      0x05u
++
++#define IMEM_PA                 0x146bf000u     /* stock DT qcom,msm-imem@146bf000 */
++#define IMEM_RESTART_REASON_OFF 0x65cu
++#define RESTART_REASON_FASTBOOT 0x77665500u
++#define PSHOLD_PA               0x0c264000u     /* stock DT restart@c264000 (qcom,pshold) */
++#define PSCI_SYSTEM_RESET       0x84000009ull
++
++enum { SWEET_PE_HALT = 0, SWEET_PE_RESTART = 1, SWEET_PE_UPS_HALT = 3, SWEET_PE_PANIC_RESTART = 4,
++       SWEET_PE_PANIC_RESTART_NOCALLOUTS = 9 };  /* IOPlatformExpert.h kPE* */
++
++static vm_offset_t sr_core, sr_cfg, sr_obs;
++static unsigned sr_count, sr_apid = 0xffffu;
++static bool sr_armed;
++
++static void
++sr_psci_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	__asm__ volatile ("smc #0" : "+r"(x0) :: "memory", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
++}
++
++/* The arbiter mapped and PON's APID found (owner EE 0 preferred). 0 or -1. */
++static int
++sr_spmi_init(void)
++{
++	if (sr_apid != 0xffffu) {
++		return 0;
++	}
++	if (!sr_core) {
++		sr_core = ml_io_map(SPMI_CORE_PA, 0x2000u);
++		sr_cfg = ml_io_map(SPMI_CFG_PA, 0x1000u);
++		sr_obs = ml_io_map(SPMI_OBS_PA, 0x10000u);
++	}
++	if (!sr_core || !sr_cfg || !sr_obs) {
++		return -1;
++	}
++	sr_count = (*(volatile uint32_t *)(sr_core + 4)) & 0x7ffu;
++	for (unsigned i = 0; i < sr_count && i < 512u; i++) {
++		uint32_t map = *(volatile uint32_t *)(sr_core + 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != PON_PERIPH) {
++			continue;
++		}
++		if (sr_apid == 0xffffu || ((*(volatile uint32_t *)(sr_cfg + 0x700u + 4u * i)) & 7u) == 0u) {
++			sr_apid = i;
++		}
++	}
++	return sr_apid == 0xffffu ? -1 : 0;
++}
++
++/* One PON register by the observer channel (EXT_READL). */
++static int
++sr_pon_rd(uint8_t reg, uint8_t *out)
++{
++	unsigned off = 0x80u * sr_apid;
++	*(volatile uint32_t *)(sr_obs + off) = (1u << 27) | ((uint32_t)reg << 4);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000u; i++) {
++		uint32_t st = *(volatile uint32_t *)(sr_obs + off + 0x08u);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return -1;
++			}
++			*out = (uint8_t)*(volatile uint32_t *)(sr_obs + off + 0x18u);
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++/* One PON register by the APID's own read/write channel (EXT_WRITEL, 1 byte). */
++static int
++sr_pon_wr(uint8_t reg, uint8_t val)
++{
++	static vm_offset_t ch;
++	if (!ch && !(ch = ml_io_map(SPMI_CHNLS_PA + 0x10000u * sr_apid, 0x1000u))) {
++		return -1;
++	}
++	*(volatile uint32_t *)(ch + 0x10u) = val;                       /* WDATA0 */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (0u << 27) | ((uint32_t)reg << 4);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000u; i++) {
++		uint32_t st = *(volatile uint32_t *)(ch + 0x08u);       /* STATUS */
++		if (st & 1u) {
++			return (st & 0x0eu) ? -2 : 0;
++		}
++		delay(1);
++	}
++	return -3;
++}
++
++int
++sweet_reboot_fastboot(uint32_t mode)
++{
++	uint8_t old = 0, val, rb = 0xff;
++	int rc;
++
++	if (sr_spmi_init() != 0 || sr_pon_rd(PON_SOFT_RB_SPARE, &old) != 0) {
++		printf("SWEET REBOOT: PON not found / not readable (%u APIDs)\n", sr_count);
++		return -1;
++	}
++	val = (uint8_t)((old & 0x01u) | (PON_REASON_BL << 1));
++	rc = sr_pon_wr(PON_SOFT_RB_SPARE, val);
++	delay(50);
++	(void)sr_pon_rd(PON_SOFT_RB_SPARE, &rb);
++	printf("SWEET REBOOT: PON apid %u (owner ee %u) SOFT_RB_SPARE %#x -> %#x: write %d, reads back %#x%s\n",
++	    sr_apid, (*(volatile uint32_t *)(sr_cfg + 0x700u + 4u * sr_apid)) & 7u, old, val, rc, rb,
++	    rb == val ? " (SET: a reset now goes to fastboot)" : " (NOT set)");
++	{       /* and the IMEM cookie the downstream kernel also leaves (harmless if ABL ignores it) */
++		vm_offset_t imem = ml_io_map(IMEM_PA, 0x1000u);
++		if (imem) {
++			*(volatile uint32_t *)(imem + IMEM_RESTART_REASON_OFF) = RESTART_REASON_FASTBOOT;
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++	}
++	sr_armed = (rb == val);
++	if (mode == 0) {
++		return sr_armed ? 0 : -1;
++	}
++	printf("SWEET REBOOT: resetting\n");
++	sweet_log_sync();
++	delay(200000);                  /* the line out over the network first */
++	sr_psci_reset();
++	return -1;
++}
++
++static int
++sweet_halt_restart(unsigned int type)
++{
++	bool off = (type == SWEET_PE_HALT || type == SWEET_PE_UPS_HALT);
++	uint8_t spare = 0, ctl = 0, ctl2 = 0;
++	vm_offset_t ph;
++
++	if (type == SWEET_PE_PANIC_RESTART || type == SWEET_PE_PANIC_RESTART_NOCALLOUTS) {
++		if (!sr_armed) {
++			return -1;
++		}
++		sr_psci_reset();        /* armed: the panic comes back up in fastboot */
++		return -1;
++	}
++	if (!off && type != SWEET_PE_RESTART) {
++		return -1;
++	}
++	if (sr_spmi_init() == 0 && sr_pon_rd(PON_SOFT_RB_SPARE, &spare) == 0) {
++		/* an intended restart or power off: not into fastboot */
++		int w0 = sr_pon_wr(PON_SOFT_RB_SPARE, (uint8_t)(spare & 0x01u));
++		(void)sr_pon_rd(PON_PS_HOLD_RST_CTL, &ctl);
++		(void)sr_pon_rd(PON_PS_HOLD_RST_CTL2, &ctl2);
++		int w1 = sr_pon_wr(PON_PS_HOLD_RST_CTL2, (uint8_t)(ctl2 & ~PON_RESET_EN));
++		delay(500);             /* 10 sleep-clock cycles, with Linux's margin */
++		int w2 = sr_pon_wr(PON_PS_HOLD_RST_CTL,
++		    (uint8_t)((ctl & 0xf0u) | (off ? PON_TYPE_SHUTDOWN : PON_TYPE_HARD_RESET)));
++		int w3 = sr_pon_wr(PON_PS_HOLD_RST_CTL2, (uint8_t)(ctl2 | PON_RESET_EN));
++		printf("SWEET HALT: %s: reason %#x -> %#x, PS_HOLD type %#x -> %#x, writes %d %d %d %d\n",
++		    off ? "power off" : "restart", spare, spare & 0x01u, ctl,
++		    (ctl & 0xf0u) | (off ? PON_TYPE_SHUTDOWN : PON_TYPE_HARD_RESET), w0, w1, w2, w3);
++	} else {
++		printf("SWEET HALT: %s: PMIC PON not reachable\n", off ? "power off" : "restart");
++	}
++	sweet_log_sync();
++	delay(200000);                  /* the line out over the network first */
++	if (!off) {
++		sr_psci_reset();
++	}
++	ph = ml_io_map(PSHOLD_PA, 0x1000u);
++	if (ph) {
++		*(volatile uint32_t *)ph = 0u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
++/* From the UFS start (bsd/dev/sweet_ufs.c), the log running, before the USB start. */
++void
++sweet_reboot_init(void)
++{
++	uint32_t arm = 0, halt = 1;
++	uint8_t subtype = 0;
++
++	if (sr_spmi_init() != 0 || sr_pon_rd(PON_PERPH_SUBTYPE, &subtype) != 0) {
++		printf("SWEET REBOOT: PMIC PON not found (%u APIDs): no fastboot reboot, no power off\n", sr_count);
++		return;
++	}
++	printf("SWEET REBOOT: PON apid %u, subtype %#x\n", sr_apid, subtype);
++	if (PE_parse_boot_argn("sweetarmfb", &arm, sizeof(arm)) && arm) {
++		printf("SWEET REBOOT: armed for fastboot: %d\n", sweet_reboot_fastboot(0));
++	}
++	(void)PE_parse_boot_argn("sweethalt", &halt, sizeof(halt));
++	/* PS_HOLD_RST_CTL/CTL2 as above only on a gen2 PON (PMIC5: PM8150 is one) */
++	if (halt && PE_halt_restart == NULL &&
++	    (subtype == PON_GEN2_PRIMARY || subtype == PON_GEN2_SECONDARY)) {
++		PE_halt_restart = sweet_halt_restart;
++		printf("SWEET REBOOT: power off / restart hook set\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_RAPHAEL */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 016cfc2..5dc3e1b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_reboot_init(void);
+ extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+@@ -660,6 +661,9 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	sweet_reboot_init();       /* PON fastboot reason (sweetarmfb=1) + power off (bsd/dev/sweet_reboot.c) */
++#endif
+ 	sweet_usb_probe();
+ 	sweet_gpu_init();         /* nothing unless boot-arg sweetgpu (bsd/dev/sweet_gpu.c) */
+ 	return 0;
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 6f4365c..7600738 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -94,6 +94,97 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++/*
++ * raphael: davinci's start reset the phone (g2, 2026-11-02), and the K20 Pro port's six rounds
++ * (Gsjsjzhznsz/ios-raphael t14-t19, rolled back) wedged a CPU on the first endpoint command. The
++ * Mi 9T Pro's controller is a DWC_usb31 (GSNPSID "3110") with maximum-speed super-speed-plus behind
++ * a QMP USB3/DP PHY (stock DT ssusb@a600000, ssphy@88e8000), not davinci's high-speed-only DWC3, and
++ * after `fastboot boot` ABL leaves it halted on a SuperSpeed link (DSTS speed 4, address 7) with
++ * its event buffer at ABL's 0xfdbf9000. What was never looked at there: the SS PHY's pipe clock
++ * (the DWC31 runs parts of its device logic on it), the core reset (the stock driver resets the
++ * whole controller through GCC_USB30_PRIM_BCR before it sets it up) and the SMMU stream of its DMA.
++ * So the state is reported, and the start runs on its own thread, one step at a time, each step
++ * logged and on the flash (sweet_log_sync) before it runs: a step that hangs the bus is the last
++ * line of the log. sweetusbstop=N stops before step N; sweetusbfix= bits (default UD_FIX_DEFAULT):
++ *   1  core reset through GCC_USB30_PRIM_BCR (0xf000), ABL's global setup put back after it
++ *   2  UTMI clock as the pipe clock (Linux dwc3_qcom_select_utmi_clk: a high-speed-only port)
++ *   4  no device soft reset (DCTL.CSFTRST)
++ *   8  leave GUSB2PHYCFG / GUSB3PIPECTL SUSPHY as ABL left them (default: cleared, the stock DT's
++ *      dis_u2_susphy, mainline's dis_u3_susphy for sm8150)
++ * sweetusbdelay=S waits S seconds first.
++ */
++#define UD_FIX_CORE_BCR         1u
++#define UD_FIX_UTMI_PIPE        2u
++#define UD_FIX_NO_CSFTRST       4u
++#define UD_FIX_KEEP_SUSPHY      8u
++#define UD_FIX_DEFAULT          (UD_FIX_CORE_BCR | UD_FIX_UTMI_PIPE)
++#define GCC_USB30_PRIM_BCR      0x0f000
++#define SMMU_PA                 0x15000000      /* apps_smmu */
++#define USB_SID                 0x140           /* stock DT iommus = <&apps_smmu 0x140 0> */
++
++extern void sweet_log_sync(void);
++static uint32_t ud_stop, ud_fix = UD_FIX_DEFAULT;
++static void ud_raphael_start(vm_offset_t dwc);
++static bool ud_raphael_prepare(void);
++
++static bool
++ud_step(unsigned n, const char *what)
++{
++	printf("SWEET USB: step %u: %s\n", n, what);
++	if (ud_stop != 0 && n >= ud_stop) {
++		printf("SWEET USB: stopped before step %u (sweetusbstop)\n", n);
++		sweet_log_sync();
++		return false;
++	}
++	sweet_log_sync();
++	return true;
++}
++
++/* Read-only: the clocks, registers and SMMU stream the start depends on. */
++static void
++ud_raphael_report(vm_offset_t gcc, vm_offset_t dwc, bool smmu)
++{
++	printf("SWEET USB: clk phy-aux 0x%08x phy-com-aux 0x%08x phy-pipe 0x%08x prim-clkref 0x%08x BCR 0x%08x\n",
++	    usb_rd(gcc, 0xf050), usb_rd(gcc, 0xf054), usb_rd(gcc, 0xf058), usb_rd(gcc, 0x8c008),
++	    usb_rd(gcc, GCC_USB30_PRIM_BCR));
++	printf("SWEET USB: DWC3 VER 0x%08x GUSB3PIPECTL 0x%08x GSBUSCFG0 0x%08x GSBUSCFG1 0x%08x GUCTL 0x%08x "
++	    "GUCTL1 0x%08x GFLADJ 0x%08x\n", usb_rd(dwc, 0xc1a0), usb_rd(dwc, 0xc2c0), usb_rd(dwc, 0xc100),
++	    usb_rd(dwc, 0xc104), usb_rd(dwc, 0xc12c), usb_rd(dwc, 0xc11c), usb_rd(dwc, 0xc630));
++	vm_offset_t qs = ml_io_map(0x0a6f8800, 0x100);
++	if (qs != 0) {
++		printf("SWEET USB: QSCRATCH GENERAL_CFG 0x%08x HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
++		    usb_rd(qs, 0x08), usb_rd(qs, 0x10), usb_rd(qs, 0x30));
++	}
++	if (!smmu) {
++		return;
++	}
++	printf("SWEET USB: reading the SMMU\n");
++	sweet_log_sync();
++	vm_offset_t sm = ml_io_map(SMMU_PA, 0x1000);
++	if (sm != 0) {
++		uint32_t cr0 = usb_rd(sm, 0x0), n = usb_rd(sm, 0x20) & 0xff;
++		bool found = false;
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t smr = usb_rd(sm, 0x800 + 4 * i), s2cr, type;
++			uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++			if (!(smr & (1u << 31)) || ((id ^ USB_SID) & ~mask) != 0) {
++				continue;
++			}
++			s2cr = usb_rd(sm, 0xc00 + 4 * i);
++			type = (s2cr >> 16) & 3;
++			printf("SWEET USB: SMMU stream 0x%x: SMR %u 0x%08x S2CR 0x%08x (%s)\n", USB_SID, i, smr, s2cr,
++			    type == 1 ? "bypass" : type == 0 ? "translated" : "FAULT");
++			found = true;
++		}
++		if (!found) {
++			printf("SWEET USB: SMMU stream 0x%x: no SMR of %u (sCR0 0x%08x: unmatched %s)\n", USB_SID, n, cr0,
++			    (cr0 & (1u << 10)) ? "FAULT" : "bypass");
++		}
++	}
++}
++#endif
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -137,9 +228,16 @@ sweet_usb_probe(void)
+ 	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	ud_raphael_report(gcc, dwc, enabled >= 2);
++	if (enabled >= 2) {
++		ud_raphael_start(dwc);
++	}
++#else
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
++#endif
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: phy ref clock off; QUSB2 PHY not read\n");
+ 		return;
+@@ -885,6 +983,12 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++#define UD_STEP(n, what) ud_step(n, what)
++#else
++#define UD_STEP(n, what) true
++#endif
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -902,25 +1006,45 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+-
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	printf("SWEET USB: fixes %#x, DMA at 0x%llx\n", ud_fix, ud.dma_pa);
++	if (!ud_raphael_prepare()) {
+ 		return;
+ 	}
++	if (!(ud_fix & UD_FIX_NO_CSFTRST))
++#endif
++	{
++		if (!UD_STEP(10, "device soft reset (DCTL.CSFTRST)")) {
++			return;
++		}
++		/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++		dwc_wr(DCTL, DCTL_CSFTRST);
++		for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++			delay(1000);
++		}
++		printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++		    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++		if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++			return;
++		}
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++		ud_sleep_ms(100);       /* DWC31: the bit clears before the reset is through (Linux: 50 ms) */
++#endif
++	}
+ 
++	if (!UD_STEP(11, "event buffer")) {
++		return;
++	}
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
+ 
++	if (!UD_STEP(12, "DCFG high speed, DEVTEN")) {
++		return;
++	}
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+@@ -928,17 +1052,25 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	dwc_wr(DEVTEN, 0x7);
+ 
+ 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	if (!UD_STEP(13, "ep0 DEPSTARTCFG") || ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    !UD_STEP(14, "ep0 OUT SETEPCONFIG") ||
+ 	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+ 	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    !UD_STEP(15, "ep0 IN SETEPCONFIG") ||
+ 	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+ 		printf("SWEET USB: endpoint 0 setup failed\n");
+ 		return;
+ 	}
++	if (!UD_STEP(16, "DALEPENA, ep0 SETUP transfer (DMA)")) {
++		return;
++	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
++	if (!UD_STEP(17, "VBUS override")) {
++		return;
++	}
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+@@ -951,6 +1083,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
++	if (!UD_STEP(18, "run (DCTL.RUN_STOP)")) {
++		return;
++	}
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+@@ -965,4 +1100,118 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		thread_deallocate(thread);
+ 	}
+ }
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++#define GUSB2PHYCFG             0xc200
++#define   GUSB2PHYCFG_SUSPHY    (1u << 6)
++#define   GUSB2PHYCFG_ENBLSLPM  (1u << 8)
++#define GUSB3PIPECTL            0xc2c0
++#define   GUSB3PIPECTL_SUSPHY   (1u << 17)
++#define GSNPSID                 0xc120
++#define QSCRATCH_GENERAL_CFG    0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
++
++static void
++qs_wr(vm_offset_t qs, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(qs + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Before the shared start's soft reset: steps 1-7. false: stop. */
++static bool
++ud_raphael_prepare(void)
++{
++	/* ABL's global setup, put back after the core reset (Linux sets these from the DT). */
++	static const uint32_t keep[] = { 0xc100, 0xc104, 0xc12c, 0xc11c, 0xc630, GUSB2PHYCFG, GUSB3PIPECTL };
++	uint32_t saved[sizeof(keep) / sizeof(keep[0])], gctl = dwc_rd(GCTL);
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE), qs = ml_io_map(QSCRATCH_PA, 0x100);
++
++	if (gcc == 0 || qs == 0) {
++		return false;
++	}
++	for (unsigned k = 0; k < sizeof(keep) / sizeof(keep[0]); k++) {
++		saved[k] = dwc_rd(keep[k]);
++	}
++	if (!ud_step(1, "halt the controller (DCTL.RUN_STOP off), mask events")) {
++		return false;
++	}
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	dwc_wr(DEVTEN, 0);
++	dwc_wr(GEVNTSIZ, dwc_rd(GEVNTSIZ) | (1u << 31));
++	if (ud_fix & UD_FIX_CORE_BCR) {
++		if (!ud_step(2, "core reset (GCC_USB30_PRIM_BCR)")) {
++			return false;
++		}
++		qs_wr(gcc, GCC_USB30_PRIM_BCR, 1);
++		ud_sleep_ms(1);
++		qs_wr(gcc, GCC_USB30_PRIM_BCR, 0);
++		ud_sleep_ms(10);
++		if (!ud_step(3, "read the core after its reset")) {
++			return false;
++		}
++		printf("SWEET USB: after core reset: GSNPSID 0x%08x GCTL 0x%08x DCTL 0x%08x DSTS 0x%08x GUSB2PHYCFG 0x%08x "
++		    "GUSB3PIPECTL 0x%08x\n", dwc_rd(GSNPSID), dwc_rd(GCTL), dwc_rd(DCTL), dwc_rd(DSTS),
++		    dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL));
++		if (!ud_step(4, "ABL's global setup back, device mode")) {
++			return false;
++		}
++		for (unsigned k = 0; k < sizeof(keep) / sizeof(keep[0]); k++) {
++			dwc_wr(keep[k], saved[k]);
++		}
++		/* device role (PRTCAPDIR 2), clock gating off (stock DT snps,disable-clk-gating) */
++		dwc_wr(GCTL, (gctl & ~(3u << 12)) | (2u << 12) | 1u);
++	}
++	if (ud_fix & UD_FIX_UTMI_PIPE) {
++		if (!ud_step(5, "UTMI clock as the pipe clock (QSCRATCH GENERAL_CFG)")) {
++			return false;
++		}
++		qs_wr(qs, QSCRATCH_GENERAL_CFG, usb_rd(qs, QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_DIS);
++		delay(1000);
++		qs_wr(qs, QSCRATCH_GENERAL_CFG, usb_rd(qs, QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++		delay(1000);
++		qs_wr(qs, QSCRATCH_GENERAL_CFG, usb_rd(qs, QSCRATCH_GENERAL_CFG) & ~PIPE_UTMI_CLK_DIS);
++		printf("SWEET USB: GENERAL_CFG 0x%08x\n", usb_rd(qs, QSCRATCH_GENERAL_CFG));
++	}
++	if (!(ud_fix & UD_FIX_KEEP_SUSPHY)) {
++		if (!ud_step(6, "PHY suspend off (GUSB2PHYCFG SUSPHY/ENBLSLPM, GUSB3PIPECTL SUSPHY)")) {
++			return false;
++		}
++		dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) & ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM));
++		dwc_wr(GUSB3PIPECTL, dwc_rd(GUSB3PIPECTL) & ~GUSB3PIPECTL_SUSPHY);
++		delay(10000);
++	}
++	if (!ud_step(7, "read before the soft reset")) {
++		return false;
++	}
++	printf("SWEET USB: GCTL 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x DCTL 0x%08x DSTS 0x%08x DEPCMD0 0x%08x\n",
++	    dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(DEPCMD(0)));
++	return true;
++}
++
++static void
++ud_raphael_thread(void *arg, wait_result_t wr __unused)
++{
++	uint32_t secs = 0;
++	PE_parse_boot_argn("sweetusbdelay", &secs, sizeof(secs));
++	if (secs) {
++		ud_sleep_ms(secs * 1000);
++	}
++	sweet_usb_gadget_start((vm_offset_t)arg);
++	printf("SWEET USB: start thread done\n");
++	sweet_log_sync();
++}
++
++static void
++ud_raphael_start(vm_offset_t dwc)
++{
++	thread_t thread;
++	PE_parse_boot_argn("sweetusbstop", &ud_stop, sizeof(ud_stop));
++	PE_parse_boot_argn("sweetusbfix", &ud_fix, sizeof(ud_fix));
++	if (kernel_thread_start(ud_raphael_thread, (void *)dwc, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
