@@ -1,0 +1,256 @@
+diff --git a/bsd/dev/sweet_panel.c b/bsd/dev/sweet_panel.c
+index 0ef6fe5..6e0e7ee 100644
+--- a/bsd/dev/sweet_panel.c
++++ b/bsd/dev/sweet_panel.c
+@@ -226,9 +226,10 @@ mdss(void)
+ }
+ 
+ /*
+- * The last TE: when it came (mach_absolute_time) and how many have come (16 bits, wrapping); false if
+- * the tear check is not counting a TE pin. The read pointer runs on from VSYNC_INIT_VAL after each TE
+- * at the configured lines a second, so the time since the TE is its lines past that.
++ * The last TE: when it came (mach_absolute_time); false if the tear check is not on a TE pin. The read
++ * pointer runs on from VSYNC_INIT_VAL after each TE at the configured lines a second, so the time since
++ * the TE is its lines past that. (The TE count, INT_COUNT_VAL [31:16], stays 0 while autorefresh runs:
++ * *count is only what it says.)
+  */
+ bool sweet_panel_te(uint64_t *at, uint32_t *count);
+ bool
+@@ -253,10 +254,84 @@ sweet_panel_te(uint64_t *at, uint32_t *count)
+ 	return true;
+ }
+ 
++/*
++ * The panel's refresh rate (boot-arg sweetpanel_hz, 30..91; tools/panel-hz.sh does the same live). The
++ * EA8076 runs its frames off the DSI bit clock: 60.214 Hz at the boot loader's 1103 MHz, 63.19 at 1157.7,
++ * 66.01 at 1209, 72.01, 74.99, 81.00 at 1483.8 (measured 2026-11-03) -- so the rate is the DSI0 PLL's,
++ * 1103 MHz * hz / 60.214, and nothing in the panel changes. Done between two panel frames with
++ * autorefresh paused (the panel shows its own RAM meanwhile): the PLL's decimal and fractional dividers
++ * (VCO = (dec + frac / 2^18) * 2 * 19.2 MHz, the bit clock: no post dividers), then the PLL off and on
++ * with the PHY's global clock gated (vendor mdss-dsi-pll-7nm.c dsi_pll_disable / dsi_pll_enable; the
++ * PHY digital reset there hung a write here, left out). The rate in milli-Hz the panel runs at now.
++ */
++#define DSI0_PLL                0x94900u
++#define PLL_DECIMAL_DIV_START_1 0x0e0u
++#define PLL_FRAC_DIV_START_LOW_1 0x0e4u         /* (MID_1 0x0e8, HIGH_1 0x0ec: bits 17:16) */
++#define PLL_COMMON_STATUS_ONE   0x1b0u          /* bit 0: locked */
++#define DSI0_PHY                0x94400u
++#define PHY_CMN_CLK_CFG1        0x014u          /* bit 5: the global clock on */
++#define PHY_CMN_PLL_CNTRL       0x03cu
++#define INTF1_AUTOREFRESH       0x2b4u
++#define BOOT_BITCLK_HZ          1103000000ull
++#define BOOT_PANEL_MHZ          60214ull        /* milli-Hz at that clock */
++
++static uint32_t g_panel_mhz = (uint32_t)BOOT_PANEL_MHZ;
++
++uint32_t sweet_panel_rate(void);
++uint32_t
++sweet_panel_rate(void)
++{
++	return g_panel_mhz;
++}
++
++int sweet_panel_set_hz(uint32_t hz);
++int
++sweet_panel_set_hz(uint32_t hz)
++{
++	vm_offset_t m = mdss();
++	if (m == 0 || hz < 30 || hz > 91) {
++		return -1;
++	}
++	volatile uint32_t *pll = (volatile uint32_t *)(m + DSI0_PLL), *phy = (volatile uint32_t *)(m + DSI0_PHY);
++	volatile uint32_t *tear = (volatile uint32_t *)(m + INTF1_TEAR);
++	uint64_t bitclk = BOOT_BITCLK_HZ * hz * 1000ull / BOOT_PANEL_MHZ;
++	uint64_t x = (bitclk << 18) / 38400000ull;     /* (dec << 18) | frac */
++	uint32_t dec = (uint32_t)(x >> 18), frac = (uint32_t)(x & 0x3ffffu);
++	uint32_t autorefresh = tear[INTF1_AUTOREFRESH / 4], cfg1 = phy[PHY_CMN_CLK_CFG1 / 4];
++	int locked = 0;
++
++	tear[INTF1_AUTOREFRESH / 4] = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(20000);                   /* a frame's transfer (13.7 ms at 60 Hz) done */
++	pll[PLL_DECIMAL_DIV_START_1 / 4] = dec;
++	pll[PLL_FRAC_DIV_START_LOW_1 / 4] = frac & 0xffu;
++	pll[PLL_FRAC_DIV_START_LOW_1 / 4 + 1] = frac >> 8 & 0xffu;
++	pll[PLL_FRAC_DIV_START_LOW_1 / 4 + 2] = frac >> 16 & 0x3u;
++	phy[PHY_CMN_CLK_CFG1 / 4] = cfg1 & ~(1u << 5);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	phy[PHY_CMN_PLL_CNTRL / 4] = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	phy[PHY_CMN_PLL_CNTRL / 4] = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (int i = 0; i < 50 && !locked; i++) {
++		delay(100);
++		locked = pll[PLL_COMMON_STATUS_ONE / 4] & 1u;
++	}
++	phy[PHY_CMN_CLK_CFG1 / 4] = cfg1 | 1u << 5 | 1u << 4;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	tear[INTF1_AUTOREFRESH / 4] = autorefresh != 0 ? autorefresh : 0x80000001u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	g_panel_mhz = hz * 1000u;
++	printf("SWEET PANEL: %u Hz: DSI bit clock %llu Hz (dec %#x frac %#x), PLL %s\n", hz, bitclk, dec, frac,
++	    locked ? "locked" : "NOT locked");
++	return locked ? 0 : -1;
++}
++
+ /*
+  * kern.sweet_mdss (root): in { op, off, val, n, bytes[56] }, out { val, ok, at, count }.
+  * op 0 reads the word at MDSS + off, 1 writes val there (and reads it back), 2 sends bytes[0..n) to the
+- * panel as one DCS long write, 3 samples the TE (sweet_panel_te).
++ * panel as one DCS long write, 3 samples the TE (sweet_panel_te), 4 sets the panel to val Hz
++ * (sweet_panel_set_hz; out val: the rate in milli-Hz).
+  */
+ struct sweet_mdss_req {
+ 	uint32_t op, off, val, n;
+@@ -321,6 +396,10 @@ sysctl_sweet_mdss SYSCTL_HANDLER_ARGS
+ 	case 3:
+ 		out.ok = sweet_panel_te(&out.at, &out.count);
+ 		break;
++	case 4:
++		out.ok = sweet_panel_set_hz(in.val) == 0;
++		out.val = g_panel_mhz;
++		break;
+ 	default:
+ 		return EINVAL;
+ 	}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..248963d 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -897,6 +897,18 @@ bsd_init(void)
+ 		}
+ #endif
+ 		printf("cannot mount root, errno = %d\n", err);
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++		{
++			/* a root that will not mount (the wrong ufsroot=, say): back to fastboot after ~60 tries
++			 * with sweetarmfb=1, instead of retrying with no userland to reboot it from */
++			extern int sweet_reboot_fastboot(uint32_t mode);
++			static uint32_t tries;
++			int armed = 0;
++			if (++tries >= 60 && PE_parse_boot_argn("sweetarmfb", &armed, sizeof(armed)) && armed) {
++				printf("SWEET REBOOT: no root after %u tries: to fastboot (%d)\n", tries, sweet_reboot_fastboot(1));
++			}
++		}
++#endif
+ 	}
+ 
+ 	IOSecureBSDRoot(rootdevice);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cdd1b35..67cb16b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,8 @@ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+ extern "C" uint32_t sweet_mdp_iova(uint32_t id, const void *owner, const uint64_t *pages, uint32_t n);   /* bsd/dev/sweet_mdp_smmu.c */
+ extern "C" bool sweet_panel_te(uint64_t *at, uint32_t *count);  /* bsd/dev/sweet_panel.c: the panel's last TE */
++extern "C" int sweet_panel_set_hz(uint32_t hz);                 /* bsd/dev/sweet_panel.c: the panel's refresh rate */
++extern "C" uint32_t sweet_panel_rate(void);                     /* (milli-Hz, now) */
+ #endif
+ extern "C" void sweet_dvfs_kick(void);      /* bsd/dev/sweet_gpu.c: wake the clocks (something is drawn) */
+ 
+@@ -303,9 +305,7 @@ public:
+ 	uint64_t      fNextTick;      /* the timer's next deadline: a fixed 60 Hz cadence, not 16.7 ms after the work */
+ 	/* raphael, boot-arg sweetfb_telock=1: the ticks on the panel's TEs (the panel's period, measured) */
+ 	uint64_t      fTePeriod;      /* abs time a TE, measured over seconds (0: not yet) */
+-	uint64_t      fTeRefAt;       /* a TE some seconds ago, and the TE count then */
+-	uint32_t      fTeRefCount;
+-	uint32_t      fTeSecCount;    /* the TE count at the last FPS line */
++	uint64_t      fTeRefAt;       /* a TE some seconds ago */
+ 	bool          fTeLock;
+ 	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled);
+ 	void scanBack(void);
+@@ -481,6 +481,15 @@ AppleCLCD::start(IOService *provider)
+ 		sweet_fb_vsync_us = (1000000 + sweet_fb_rate / 2) / sweet_fb_rate;
+ 	} else {
+ 		sweet_fb_rate = 60;
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++		/* boot-arg sweetpanel_hz: the panel at that rate (its DSI clock), and CoreAnimation told so */
++		uint32_t panel_hz = 0;
++		if (PE_parse_boot_argn("sweetpanel_hz", &panel_hz, sizeof(panel_hz)) && panel_hz != 0 &&
++		    sweet_panel_set_hz(panel_hz) == 0) {
++			sweet_fb_rate = panel_hz;
++			sweet_fb_vsync_us = (1000000 + panel_hz / 2) / panel_hz;
++		}
++#endif
+ 	}
+ 	publishModes();
+ 	fLock = IOLockAlloc();
+@@ -733,17 +742,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					frames = *(volatile uint32_t *)(intf + 0x800u + 0x0acu);
+ 				}
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-				/* a command-mode panel: no INTF frames, its TEs (and the period measured from them) */
++				/* a command-mode panel: no INTF frames; the panel's period, measured from its TEs */
+ 				{
+-					uint64_t te_at = 0, pns = 0;
+-					uint32_t te = 0;
+-					if (sweet_panel_te(&te_at, &te)) {
+-						frames = te;
+-					}
++					uint64_t pns = 0;
+ 					absolutetime_to_nanoseconds(fb->fTePeriod, &pns);
+-					IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u TEs, TE period %llu.%03llu ms%s\n",
++					IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %llu.%03llu Hz%s\n",
+ 					    fb->fRateSwaps, fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull,
+-					    (frames - last_frames) & 0xffffu, pns / 1000000ull, pns / 1000ull % 1000ull, fb->fTeLock ? ", locked" : "");
++					    pns != 0 ? 1000000000000ull / pns / 1000ull : 0, pns != 0 ? 1000000000000ull / pns % 1000ull : 0,
++					    fb->fTeLock ? ", ticks on its TEs" : "");
+ 				}
+ #else
+ 				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u frames\n", fb->fRateSwaps,
+@@ -795,32 +801,35 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+ 		/*
+-		 * The panel's period, from its TEs over 1-10 s; with sweetfb_telock=1 the next tick is on the
+-		 * first TE more than half a period from now (plus sweetfb_telead us): one tick, one swap, one
+-		 * panel frame. A fixed 16.667 ms beside a panel at another rate put two swaps into one panel
+-		 * frame (one never seen) or none (one seen twice) every 1 / (the difference) seconds.
++		 * The panel's period, from its TEs (sweet_panel_te: when the last one came) over up to 30 s:
++		 * the TEs between two samples are their distance in periods of the rate the panel was set to
++		 * (sweet_panel_rate), rounded; a measurement more than 1% off that rate is a bad sample. With
++		 * sweetfb_telock=1 the next tick is on the first TE more than half a period from now (plus
++		 * sweetfb_telead us): one tick, one swap, one panel frame. The fixed 16.667 ms beside the panel's
++		 * 60.214 Hz put two swaps into one panel frame (one never seen) or none (one seen twice) every
++		 * 4.7 s.
+ 		 */
+ 		{
+-			uint64_t te_at = 0;
++			uint64_t te_at = 0, nominal = 0;
+ 			uint32_t te = 0;
++			nanoseconds_to_absolutetime(1000000000000ull / sweet_panel_rate(), &nominal);
+ 			if (sweet_panel_te(&te_at, &te) && te_at <= now) {
+-				uint32_t n = (te - fb->fTeRefCount) & 0xffffu;
+-				if (fb->fTeRefAt == 0 || te_at <= fb->fTeRefAt) {
++				uint64_t pp = fb->fTePeriod != 0 ? fb->fTePeriod : nominal;
++				if (fb->fTeRefAt == 0 || te_at <= fb->fTeRefAt || te_at - fb->fTeRefAt > 3000 * pp) {
+ 					fb->fTeRefAt = te_at;
+-					fb->fTeRefCount = te;
+-				} else if (n >= 60u) {
+-					uint64_t p = (te_at - fb->fTeRefAt) / n, lo = 0, hi = 0;
+-					nanoseconds_to_absolutetime(8000000ull, &lo);
+-					nanoseconds_to_absolutetime(25000000ull, &hi);
+-					if (p >= lo && p <= hi) {
+-						fb->fTePeriod = p;
+-					}
+-					if (n >= 600u || p < lo || p > hi) {
+-						fb->fTeRefAt = te_at;
+-						fb->fTeRefCount = te;
++				} else {
++					uint64_t dt = te_at - fb->fTeRefAt, n = (dt + pp / 2) / pp;
++					if (n >= 8) {
++						uint64_t est = dt / n;
++						if (est > nominal - nominal / 100 && est < nominal + nominal / 100) {
++							fb->fTePeriod = est;
++						}
++						if (n >= 2400) {
++							fb->fTeRefAt = te_at;
++						}
+ 					}
+ 				}
+-				uint64_t pp = fb->fTePeriod;
++				pp = fb->fTePeriod;
+ 				if (fb->fTeLock && pp != 0 && now - te_at < 2 * pp) {
+ 					static int lead_us = -1;
+ 					uint64_t lead = 0;

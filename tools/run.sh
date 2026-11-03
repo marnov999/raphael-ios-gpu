@@ -6,12 +6,14 @@ cd "$(dirname "$0")/.."
 RUNLOG=${RUNLOG:-/home/marnov/xmiphones/davinci-ios/gpu/userland/metal/runlog}
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
+printf '-' > "$tmp"                    # (the last output replaced by a marker, as rfind.sh: else it was read as this run's)
+python3 -I tools/push_file.py "$tmp" /tmp/runlog.txt 0644 >/dev/null
 echo "$*" > "$tmp"
 python3 -I tools/push_file.py "$tmp" /tmp/runlog_args 0644 >/dev/null
 python3 -I tools/push_file.py "$RUNLOG" /tmp/runlog 0755 >/dev/null
 for _ in $(seq 1 70); do
 	sleep 1
-	if python3 -I tools/read_file.py /tmp/runlog.txt > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+	if python3 -I tools/read_file.py /tmp/runlog.txt > "$tmp" 2>/dev/null && [ -s "$tmp" ] && [ "$(cat "$tmp")" != - ]; then
 		cat "$tmp"
 		exit 0
 	fi
