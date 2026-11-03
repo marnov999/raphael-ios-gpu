@@ -1,0 +1,404 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8d95357..4cf8bed 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -980,12 +980,26 @@ rail_vote(uint32_t level, const uint16_t *rail, unsigned nrail, const uint16_t *
+ 
+ /*
+  * The speeds: this phone's dt qcom,gpu-pwrlevels for speed bin 0, with the RPMh level of each from
+- * its gpu OPP table (NOT the lower ones some ports use). Level 0 is the "off" one.
++ * its gpu OPP table (NOT the lower ones some ports use). Level 0 is the "off" one. Speed bin 1 (the
++ * fuse dt qcom,gpu-speed-bin = <0x4130 0xe0000000 29> in qfprom 0x780000) adds 675 MHz (OPP
++ * microvolt 0x141: level 320); boot-arg sweetgpu_675=0 leaves it out.
+  */
+ static const struct { uint32_t khz, level; } g_speeds[] = {
+-	{ 0, 0 }, { 257000, 64 }, { 345000, 128 }, { 427000, 192 }, { 499200, 224 }, { 585000, 256 },
++	{ 0, 0 }, { 257000, 64 }, { 345000, 128 }, { 427000, 192 }, { 499200, 224 }, { 585000, 256 }, { 675000, 320 },
+ };
+-#define GPU_LEVELS (sizeof(g_speeds) / sizeof(g_speeds[0]))
++#define GPU_LEVELS_MAX (sizeof(g_speeds) / sizeof(g_speeds[0]))
++static uint32_t g_nspeeds = GPU_LEVELS_MAX - 1u;
++#define GPU_LEVELS g_nspeeds
++
++static void
++gpu_speed_bin(void)
++{
++	vm_offset_t q = ml_io_map(0x00784000u, 0x1000u);
++	uint32_t bin = q ? (gpu_rd(q, 0x130u) & 0xe0000000u) >> 29 : 0xffu, on = 1;
++	(void)PE_parse_boot_argn("sweetgpu_675", &on, sizeof(on));
++	g_nspeeds = (bin == 1u && on) ? (uint32_t)GPU_LEVELS_MAX : (uint32_t)GPU_LEVELS_MAX - 1u;
++	printf("SWEET GPU: speed bin %u: top %u MHz\n", bin, g_speeds[g_nspeeds - 1u].khz / 1000u);
++}
+ static uint32_t g_gpu_khz;
+ 
+ struct hfi_perf_table {
+@@ -1010,6 +1024,7 @@ gmu_core_power(void)
+ 		printf("SWEET GMU: cmd-db lacks a rail\n");
+ 		return false;
+ 	}
++	gpu_speed_bin();
+ 	perf.gpu_levels = GPU_LEVELS;
+ 	for (unsigned i = 0; i < GPU_LEVELS; i++) {
+ 		perf.gpu[i].khz = g_speeds[i].khz;
+@@ -1862,6 +1877,8 @@ gpu_shader_tests(void)
+ #include <kern/locks.h>
+ #include <sys/conf.h>
+ #include <sys/uio.h>
++#include <sys/vnode.h>
++extern vnode_t rootvnode;
+ #include <miscfs/devfs/devfs.h>
+ #include <mach/memory_object_types.h>
+ #include <mach/vm_prot.h>
+@@ -1874,7 +1891,7 @@ gpu_shader_tests(void)
+ extern int sweet_panel_brightness(uint32_t level);        /* bsd/dev/sweet_panel.c */
+ static uint64_t g_res_gpu;                                  /* the result page's GPU address */
+ static uint32_t g_gpu_nlevels;                              /* level 0 the fastest (davinci's numbering) */
+-static uint32_t g_gpu_mhz[GPU_LEVELS];
++static uint32_t g_gpu_mhz[GPU_LEVELS_MAX];
+ 
+ /* a6xx PM4 type-7 packet header. The parity bit of each field is the bit that
+  * makes the field's popcount odd. Verified: cp_type7(CP_ME_INIT=0x48, 11) =
+@@ -4269,10 +4286,299 @@ gpu_set_level(uint32_t level, uint64_t *out)
+ 	return 0;
+ }
+ 
+-/* davinci's clock governor is told something is being drawn; raphael has none yet. */
++/*
++ * The CPU's clock (boot-arg sweetcpufreq=1), as davinci's sweet_gpu.c (HackiOS redwood_cpufreq.c) does it:
++ * the boot loader leaves each cluster at a modest frequency; the OSM firmware (stock dt
++ * qcom,clk-cpu-osm: osm_l3_base 0x18321000, osm_pwrcl_base 0x18323000, osm_perfcl_base 0x18325800,
++ * osm_perfpcl_base 0x18327800) has each cluster's table of frequencies and switches clock source and
++ * supply by itself when told which row is wanted. Register layout: the vendor's clk-cpu-osm.c. The
++ * cluster's hardware limits still throttle it when hot. The real frequency is measured before and
++ * after from OSM's own cycle counters.
++ */
++#define OSM_FREQ_REG(r)      (0x110u + 32u * (r))
++#define OSM_CORE_DCVS_CTRL   0xBCu
++#define OSM_PERF_STATE(n)    (0x920u + 4u * (n))
++#define OSM_CYCLES(n)        (0x9C0u + 4u * (n))
++#define OSM_CLUSTERS         4u
++static const struct { uint32_t pa; unsigned cores; const char *name; } osm_clusters[OSM_CLUSTERS] = {
++	{ 0x18321000u, 1, "L3" }, { 0x18323000u, 4, "silver (cpu0-3)" }, { 0x18325800u, 3, "gold (cpu4-6)" },
++	{ 0x18327800u, 1, "prime (cpu7)" },
++};
++
++static uint32_t
++osm_row_khz(uint32_t data)
++{
++	return (data >> 30) ? 19200u * (data & 0xFFu) : 300000u;
++}
++
++static uint32_t
++osm_measured_mhz(vm_offset_t base, unsigned n)
++{
++	uint32_t c0 = gpu_rd(base, OSM_CYCLES(n)), c1;
++	uint64_t t0 = mach_absolute_time(), ns;
++	delay_for_interval(10, NSEC_PER_MSEC);
++	c1 = gpu_rd(base, OSM_CYCLES(n));
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns ? (uint32_t)((uint64_t)(c1 - c0) * 1000u / ns) : 0;
++}
++
++static vm_offset_t g_osm_base[OSM_CLUSTERS];
++static uint32_t    g_osm_top[OSM_CLUSTERS];
++static bool        g_osm_per_core[OSM_CLUSTERS];
++
++static void
++osm_set(unsigned c, uint32_t row)
++{
++	vm_offset_t base = g_osm_base[c];
++	if (base == 0) {
++		return;
++	}
++	if (row > g_osm_top[c]) {
++		row = g_osm_top[c];
++	}
++	for (unsigned n = 0; n < (g_osm_per_core[c] ? osm_clusters[c].cores : 1u); n++) {
++		gpu_wr(base, OSM_PERF_STATE(n), row);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Every cluster's table read and printed, and its top row asked for. */
++static void
++sweet_cpufreq(void)
++{
++	for (unsigned c = 0; c < OSM_CLUSTERS; c++) {
++		vm_offset_t base = ml_io_map(osm_clusters[c].pa, 0x1000u);
++		uint32_t top = 0, top_khz = 0, was, before;
++		char line[300];
++		int at = 0;
++		g_osm_base[c] = base;
++		if (!base) {
++			continue;
++		}
++		for (uint32_t r = 0; r < 40u; r++) {
++			uint32_t khz = osm_row_khz(gpu_rd(base, OSM_FREQ_REG(r)));
++			if (r > 0 && khz <= top_khz) {
++				break;                                      /* the table ends by repeating its last row */
++			}
++			top = r;
++			top_khz = khz;
++			if (at < (int)sizeof(line) - 8) {
++				at += snprintf(line + at, sizeof(line) - (size_t)at, " %u", khz / 1000u);
++			}
++		}
++		g_osm_top[c] = top;
++		g_osm_per_core[c] = (gpu_rd(base, OSM_CORE_DCVS_CTRL) & 1u) != 0;
++		was = gpu_rd(base, OSM_PERF_STATE(0));
++		before = osm_measured_mhz(base, 0);
++		printf("SWEET CPUFREQ: %s: table (MHz):%s; row %u now, measured %u MHz; per-core %d\n", osm_clusters[c].name,
++		    line, was, before, g_osm_per_core[c]);
++		osm_set(c, top);
++		delay_for_interval(20, NSEC_PER_MSEC);
++		printf("SWEET CPUFREQ: %s: row %u (%u MHz) asked; measured %u MHz\n", osm_clusters[c].name, top,
++		    top_khz / 1000u, osm_measured_mhz(base, 0));
++	}
++}
++
++/*
++ * The clocks, as asked (on with sweetcpufreq=1): /usr/local/gltest/clocks, read every half second,
++ *     l3=ROW little=ROW big=ROW prime=ROW gpu=LEVEL auto=0|1 boost=0|1
++ * ROW: a row of the cluster's table (the CPUFREQ lines; past the last row is the last; little = silver,
++ * big = gold), LEVEL: the GPU's (0 the fastest). Without the file: every cluster at its top, the GPU
++ * at the level nearest 427 MHz, auto=1 (after 1.5 s with nothing drawn -- no swap, no submission -- the
++ * rows of "idle" until something is), boost=1 (the GPU at its fastest while it is busy over 85%).
++ * davinci's governor (2026-10-25), its clusters made raphael's four.
++ */
++static volatile uint64_t g_dvfs_active;         /* mach time of the last swap or submission */
++static int g_dvfs_on;
++static int g_dvfs_chan;
++static volatile int g_dvfs_idle;
++struct sweet_clocks {
++	uint32_t row[OSM_CLUSTERS];             /* L3, silver, gold, prime */
++	uint32_t gpu;
++	int autoidle;
++	int boost;
++};
++static struct sweet_clocks g_clocks = { { 99, 99, 99, 99 }, 2, 1, 1 };
++static const struct sweet_clocks g_clocks_idle = { { 3, 3, 2, 2 }, 99, 1, 0 };
++static const struct sweet_clocks g_clocks_dark = { { 0, 0, 0, 0 }, 99, 0, 0 };   /* the display off: all lowest */
++extern int sweet_panel_off(void);               /* bsd/dev/sweet_panel.c */
++
+ void
+ sweet_dvfs_kick(void)
+ {
++	g_dvfs_active = mach_absolute_time();
++	if (g_dvfs_on && g_dvfs_idle) {
++		thread_wakeup((event_t)&g_dvfs_chan);
++	}
++}
++
++static void
++clocks_apply(const struct sweet_clocks *k, const char *why)
++{
++	uint32_t level = k->gpu, rows[OSM_CLUSTERS];
++	uint64_t o = 0;
++	static uint32_t told;
++	if (g_gpu_nlevels != 0 && level >= g_gpu_nlevels) {
++		level = g_gpu_nlevels - 1u;
++	}
++	for (unsigned c = 0; c < OSM_CLUSTERS; c++) {
++		rows[c] = k->row[c] > g_osm_top[c] ? g_osm_top[c] : k->row[c];
++		osm_set(c, rows[c]);
++	}
++	if (g_kgsl_ready && level != g_gpu_level) {
++		gpu_lock();
++		g_level_quiet = 1;
++		(void)gpu_set_level(level, &o);
++		g_level_quiet = 0;
++		gpu_unlock();
++	}
++	if (told++ < 40) {
++		uint32_t mhz[OSM_CLUSTERS];
++		for (unsigned c = 0; c < OSM_CLUSTERS; c++) {
++			mhz[c] = g_osm_base[c] ? osm_row_khz(gpu_rd(g_osm_base[c], OSM_FREQ_REG(rows[c]))) / 1000u : 0;
++		}
++		printf("SWEET CLOCKS: %s: L3 %u MHz, silver %u MHz, gold %u MHz, prime %u MHz, GPU level %u (%u MHz)\n", why,
++		    mhz[0], mhz[1], mhz[2], mhz[3], g_gpu_level,
++		    g_gpu_nlevels ? g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : 0] : 0);
++	}
++}
++
++/* /usr/local/gltest/clocks into *k (what it does not say stays); true if it was read */
++static bool
++clocks_file(struct sweet_clocks *k)
++{
++	static const char *keys[7] = { "l3=", "little=", "big=", "prime=", "gpu=", "auto=", "boost=" };
++	char text[128];
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx;
++	int resid = 0;
++	if (rootvnode == NULLVP) {
++		return false;
++	}
++	ctx = vfs_context_kernel();
++	if (vnode_lookup("/usr/local/gltest/clocks", 0, &vp, ctx) != 0) {
++		return false;
++	}
++	bzero(text, sizeof(text));
++	(void)vn_rdwr(UIO_READ, vp, (caddr_t)text, sizeof(text) - 1, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	vnode_put(vp);
++	for (unsigned i = 0; i < 7u; i++) {
++		const char *at = strnstr(text, keys[i], sizeof(text));
++		uint32_t v = 0;
++		bool any = false;
++		if (at == NULL) {
++			continue;
++		}
++		for (at += strlen(keys[i]); *at >= '0' && *at <= '9'; at++) {
++			v = v * 10u + (uint32_t)(*at - '0');
++			any = true;
++		}
++		if (!any) {
++			continue;
++		}
++		if (i < OSM_CLUSTERS) {
++			k->row[i] = v;
++		} else if (i == 4u) {
++			k->gpu = v;
++		} else if (i == 5u) {
++			k->autoidle = v != 0;
++		} else {
++			k->boost = v != 0;
++		}
++	}
++	return true;
++}
++
++static void
++dvfs_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t idle_after, was_ticks = 0, was_at = 0;
++	uint32_t boosted = 99u, calm = 0;
++	struct sweet_clocks applied;
++	bool first = true;
++	nanoseconds_to_absolutetime(1500ull * NSEC_PER_MSEC, &idle_after);
++	bzero(&applied, sizeof(applied));
++	for (unsigned tick = 0;; tick++) {
++		struct sweet_clocks want;
++		bool idle, dark = sweet_panel_off() != 0;
++		assert_wait_timeout((event_t)&g_dvfs_chan, THREAD_UNINT, 100, NSEC_PER_MSEC);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++		if (tick % 5u == 0) {
++			struct sweet_clocks k = g_clocks;
++			if (clocks_file(&k) && memcmp(&k, &g_clocks, sizeof(k)) != 0) {
++				g_clocks = k;
++			}
++		}
++		idle = g_clocks.autoidle && mach_absolute_time() - g_dvfs_active > idle_after;
++		g_dvfs_idle = idle;
++		want = dark ? g_clocks_dark : idle ? g_clocks_idle : g_clocks;
++		want.autoidle = g_clocks.autoidle;
++		if (dark) {
++			idle = true;                    /* (no GPU boost) */
++		}
++		{
++			/* The GPU faster while it is what holds the frames up: busy over 85% of the last 100 ms, the
++			 * fastest level; under 50% for half a second, a level back towards the one asked (gpu=). */
++			uint64_t now = mach_absolute_time(), ns = 0, ticks;
++			uint32_t mhz = g_gpu_nlevels ? g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : 0] : 257u;
++			if (g_kgsl_ready) {
++				gpu_lock();
++				gpu_times();
++				ticks = g_gpu_busy_ticks;
++				gpu_unlock();
++			} else {
++				ticks = was_ticks;
++			}
++			absolutetime_to_nanoseconds(now - was_at, &ns);
++			if (was_at != 0 && ns != 0 && mhz != 0) {
++				uint64_t busy_permille = (ticks - was_ticks) / mhz * 1000000ull / ns;      /* (us of GPU work / us) */
++				if (boosted > want.gpu) {
++					boosted = want.gpu;
++				}
++				if (!want.boost || idle) {
++					boosted = want.gpu;
++					calm = 0;
++				} else if (busy_permille > 850u) {
++					boosted = 0;
++					calm = 0;
++				} else if (busy_permille < 500u && boosted < want.gpu && ++calm >= 5u) {
++					boosted++;
++					calm = 0;
++				}
++				want.gpu = boosted;
++			}
++			was_ticks = ticks;
++			was_at = now;
++		}
++		if (first || memcmp(&want, &applied, sizeof(want)) != 0) {
++			clocks_apply(&want, dark ? "display off" : idle ? "idle" : "as asked");
++			applied = want;
++			first = false;
++		}
++	}
++}
++
++/* After the bring-up: the GPU's resting level (nearest 427 MHz) and the governor's thread. */
++static void
++clocks_start(void)
++{
++	thread_t thread;
++	uint32_t on = 0;
++	if (!PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on)) || !on) {
++		return;
++	}
++	for (uint32_t i = 0; i < g_gpu_nlevels; i++) {
++		if (g_gpu_mhz[i] <= 430u) {
++			g_clocks.gpu = i;
++			break;
++		}
++	}
++	g_dvfs_active = mach_absolute_time();
++	g_dvfs_on = 1;
++	if (kernel_thread_start(dvfs_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ 
+ /*
+@@ -4388,9 +4694,16 @@ gpu_thread(void *arg, wait_result_t wr)
+ 	if (gpu_level >= 9) {
+ 		gpu_nodes_register();   /* first: an open waits for the bring-up (kgsl_open) */
+ 	}
++	{
++		uint32_t cpufreq = 0;
++		if (PE_parse_boot_argn("sweetcpufreq", &cpufreq, sizeof(cpufreq)) && cpufreq) {
++			sweet_cpufreq();
++		}
++	}
+ 	gpu_probe();
+ 	g_gpu_boot_done = 1;
+ 	thread_wakeup((event_t)&g_gpu_boot_done);
++	clocks_start();
+ 	printf("SWEET GPU: bring-up (sweetgpu=%d) over: %s\n", gpu_level,
+ 	    g_kgsl_ready ? "the GPU is kept for the window server" : "no GPU for userland");
+ 	(void)thread_terminate(current_thread());
+diff --git a/bsd/dev/sweet_panel.c b/bsd/dev/sweet_panel.c
+index 6e9fa25..8a1eb3f 100644
+--- a/bsd/dev/sweet_panel.c
++++ b/bsd/dev/sweet_panel.c
+@@ -44,6 +44,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ 
+ int sweet_panel_brightness(uint32_t level);
+ int sweet_panel_power(int on);
++int sweet_panel_off(void);
+ void sweet_panel_new_frame(void);
+ void sweet_panel_wake_tick(void);
+ 
+@@ -188,6 +189,13 @@ sweet_panel_wake_tick(void)
+ {
+ }
+ 
++/* The display is off (the clock governor's "display off" clocks: bsd/dev/sweet_gpu.c). */
++int
++sweet_panel_off(void)
++{
++	return g_off;
++}
++
+ int
+ sweet_panel_power(int on)
+ {
