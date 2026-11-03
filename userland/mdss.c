@@ -6,6 +6,7 @@
  *   mdss w OFF VAL [OFF VAL..]   write, read back ("sleep MS" pairs wait between them; also comma-joined)
  *   mdss dcs B B .. [, B B ..]   DCS long writes to the panel, one packet per comma-separated group
  *   mdss te [SECS]               the panel's TEs for SECS (3): rate, period min/mean/max
+ *   mdss touch 0|1               the touchscreen's own touches off (kern.sweet_touch_mute) / on
  *   mdss line [MS]               the tear check's read pointer every 0.1 ms for MS (20): line, us
  */
 #include <stdio.h>
@@ -201,6 +202,15 @@ main(int argc, char **argv)
 			}
 			printf(": %s\n", o.ok ? "sent" : "NOT sent");
 		}
+		return 0;
+	}
+	if (strcmp(argv[1], "touch") == 0 && argc >= 3) {      /* touch 0: the touchscreen muted, 1: on */
+		int mute = atoi(argv[2]) == 0;
+		if (sysctlbyname("kern.sweet_touch_mute", NULL, NULL, &mute, sizeof(mute)) != 0) {
+			perror("kern.sweet_touch_mute");
+			return 1;
+		}
+		printf("touchscreen %s\n", mute ? "muted (injected touches only)" : "on");
 		return 0;
 	}
 	if (strcmp(argv[1], "te") == 0) {
