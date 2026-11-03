@@ -379,5 +379,20 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   sweetarmfb=1: any reset/panic lands in fastboot; then `fb.sh boot out/raphael-ios-tomiui.img` = MIUI for adb.
   Dev images from now on: sweetusb=2 sweetarmfb=1 (+ sweetgpu=9 sweetmetal=1), ROOT=iosdata,
   ADT=out/raphael-full-fw.adt. Next: GPU clock governor (257 MHz) + zero-copy IOSurface import (10.8 MB/frame).
+- **Metal on raphael (u2, no kernel change): mtlcompute 256/256, mtlrender exact pixels, mtldrawable surface exact**
+  (tools/run.sh = davinci's runlog over USB). IOAcceleratorES already has MetalPluginName + IOGLES props (0112).
+  RedwoodMetal's debug UDP goes to davinci's 192.168.7.1:5141 (unreachable here; stdout via run.sh is enough).
+- **0116 (u3/u4): CPU clocks + governor WORK.** OSM tables (MHz): L3 300..1612 (15 rows), silver 300..1785 (18),
+  gold 710..2419 (17), prime 825..2841 (20); ABL left gold at 710 and prime at 825 (their lowest!). Governor:
+  as asked L3 1612 / silver 1785 / gold 2419 / prime 2841, GPU 585 while busy; idle after 1.5 s: 614/576/940/1056,
+  GPU 257. Speed bin fuse = 0 (top 585). The overlay had installed davinci's clocks file (l3=10 little=9 big=12
+  = other rows here): overlay now writes "l3=14 little=17 big=16 prime=19"; pushed to the phone over USB.
+- Scanout (sweetfb_scanout=1, HZ=60): DPU as on davinci (VIG0 0x9c000000 1080x2340 stride 4320 -> CTL0 -> LM0 ->
+  INTF1). Never engaged: CA's full-screen surfaces here are bpr 4544 / 13893632 bytes (davinci 4608) -> 0117
+  accepts 4500..4608 and 14 MiB buffers; then the 4 pool buffers went to surfaces 2-5, which stay alive, and the
+  shown ones (11-14) found none -> 0118 pool of 8.
+- Per-frame "1 textures refilled (10809 KB)": eagl frame-start refresh of a non-target, non-shared surface whose
+  seed moved (eagl.c:1305); render targets are "copied into its memory by the GPU" (blit_targets, as davinci).
+  Which surface is still open.
 - Every later root patch: sync -> hfs-journal-replay.py (dry run, then --apply) -> overlay -> back up the phone
   copies of the chunks that differ -> write-root.sh --changed. Disk: ~3 GB free after this.
