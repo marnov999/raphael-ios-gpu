@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7d70835..e851752 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1288,22 +1288,15 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			    s->planeCount == 0 && s->bytesPerRow >= SWEET_DISPLAY_BPR_MIN && s->bytesPerRow <= SWEET_DISPLAY_BPR &&
+ 			    strcmp(maker, "backboardd") == 0) {
+ 				mem = sweet_display_take(s->allocSize, &s->poolSlot);
++#if !defined(ARM64_BOARD_CONFIG_RAPHAEL)
++				/* (raphael: not here. CoreAnimation makes a new full-screen surface every frame and the
++				 * pool is out most of the time; reaping on each, and 0119's search for one piece below
++				 * 4 GB, were 60% of the render thread (u10 profile: cpm_allocate's mutex_pause). The
++				 * display engine's SMMU windows (sweet_mdp_smmu.c) scan out any surface.) */
+ 				if (mem == NULL) {
+ 					sweet_gpu_reap_dead_now();      /* (a dead window server's buffers may hold them) */
+ 					mem = sweet_display_take(s->allocSize, &s->poolSlot);
+ 				}
+-#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-				if (mem == NULL) {
+-					/* raphael (u5): backboardd keeps more full-screen surfaces alive than any pool (the
+-					 * shown ones come later, a set at a time): one piece below 4 GB made now, while it can be */
+-					static uint32_t made, failed;
+-					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-					    kIODirectionInOut | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000FFFFF000ull);
+-					if (mem != NULL ? made++ < 16 : failed++ < 4) {
+-						IOLog("SWEET SURF: a full-screen surface %s one piece below 4 GB (%u made, %u failed)\n",
+-						    mem != NULL ? "in" : "NOT in", made, failed);
+-					}
+-				}
+ #endif
+ 				if (mem == NULL) {
+ 					static uint32_t told;
+@@ -1321,6 +1314,9 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
+ 		} else {
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++			if (s->poolSlot != 0)           /* (fresh pages come zeroed: vm_page_alloc_list's bzero_phys) */
++#endif
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;

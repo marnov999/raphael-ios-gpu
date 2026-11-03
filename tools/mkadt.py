@@ -266,6 +266,11 @@ def build(seed=None, qemu=False, highmem=False, raphael=False, cpus=None, fullra
     ])
 
     product_props = d22ap_product()
+    if product_props:
+        # artwork-display-gamut: D22AP's "P3" makes CoreAnimation draw for a wide-gamut panel (davinci: b3a8/w30r
+        # surfaces; raphael u9: a new 13.9 MB display surface every frame instead of a swap chain of two, each
+        # filled by the CPU). davinci's tree says sRGB.
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
