@@ -1,0 +1,120 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 77b53a1..9aa2e84 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2330,6 +2330,18 @@ extern void     sweet_surface_gpu_unref(void *surface);
+ extern bool     sweet_surface_gpu_live(void *surface);
+ extern uint32_t sweet_surface_gpu_seed(void *surface);
+ extern void     sweet_surface_gpu_flush(void *surface);
++extern bool     sweet_surface_gpu_pool(void *surface);
++/* boot-arg sweetsurf_poolzero=1: display pool surfaces zeroed by the processor when made (then pushed out at first use) */
++static bool
++sweet_pool_zero(void)
++{
++	static int v = -1;
++	if (v < 0) {
++		v = 0;
++		(void)PE_parse_boot_argn("sweetsurf_poolzero", &v, sizeof(v));
++	}
++	return v != 0;
++}
+ extern int64_t  sweet_surface_gpu_push_written(void *surface);   /* bytes, -1: push it all out */
+ void sweet_dvfs_kick(void);     /* the clock governor (sweet_cpufreq's): something is being drawn */
+ void sweet_dvfs_wake_now(void); /* and back from the display-off clocks at once (a wake) */
+@@ -3530,7 +3542,9 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 			if (b == NULL || b->surf == NULL) { continue; }
+ 			seed = sweet_surface_gpu_seed(b->surf);
+ 			if (seed == b->seed && began - b->pushed < again) { continue; }
+-			written = b->pushed != 0 ? sweet_surface_gpu_push_written(b->surf) : -1;
++			/* (a display pool surface: the GPU's alone, nothing of it in the cache, first use or not) */
++			written = b->pushed != 0 || (sweet_surface_gpu_pool(b->surf) && !sweet_pool_zero()) ?
++			    sweet_surface_gpu_push_written(b->surf) : -1;
+ 			b->seed = seed;
+ 			b->pushed = began;
+ 			if (written < 0) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7c690f1..cfd7e3f 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -131,6 +131,22 @@ sweet_surface_display_pool_init(void)
+ 		sweet_display_pool[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000FFFFF000ull);
+ 		addr64_t pa = sweet_display_pool[i] ? sweet_display_pool[i]->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++		/*
++		 * Out of this processor's cache once, here: only the GPU writes these buffers from now on (a
++		 * surface of the pool is not zeroed by the processor when made, and the submissions naming one
++		 * do not push it out of the cache, sweet_surface_gpu_pool): a 13.9 MB push-out and bzero a
++		 * frame, 4.7 GB in 5 s of home screen swipes at 81 Hz (u16), for CoreAnimation's new
++		 * full-screen surface of every frame, whose every pixel the GL bridge's copy writes.
++		 */
++		if (sweet_display_pool[i] != NULL) {
++			uintptr_t va = (uintptr_t)sweet_display_pool[i]->getBytesNoCopy();
++			for (uintptr_t line = va & ~(uintptr_t)63; line < va + size; line += 64) {
++				__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++#endif
+ 		IOLog("SWEET SURF: display buffer %u: %s at %#llx, %llu of %lu bytes in one piece\n", i,
+ 		    sweet_display_pool[i] ? "made" : "NOT MADE", (unsigned long long)pa, (unsigned long long)seg, (unsigned long)size);
+ 	}
+@@ -286,12 +302,18 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
+ 	/* Memory of a program's own with a surface made around it is not in whole pages, and seldom
+ 	 * in rows the GPU takes (HackiOS surfaceBuffer refuses it): the GL bridge copies it instead. */
+ 	if (s->wrapped) { s->release(); return -1; }
+-	/* One entry per 4K GPU page (the GPU maps 4K pages; a 16K kernel page is four of them). */
+-	for (off = 0; off < s->allocSize; off += 4096) {
++	/* One entry per 4K GPU page (the GPU maps 4K pages; a 16K kernel page is four of them), a physical
++	 * run at a time: a page at a time was 3400 getPhysicalSegment walks for each of CoreAnimation's
++	 * full-screen surfaces (one a frame), 0.7 ms of the render thread a frame (u15 profile); the display
++	 * pool's are one piece. */
++	for (off = 0; off < s->allocSize;) {
+ 		IOByteCount seglen = 0;
+ 		addr64_t phys = s->memory->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
+-		if (phys == 0 || n >= maxpages) { s->release(); return -1; }
+-		pa[n++] = (uint64_t)(phys & ~((addr64_t)4095));
++		if (phys == 0 || seglen == 0) { s->release(); return -1; }
++		for (IOByteCount in = 0; in < seglen && off < s->allocSize; in += 4096, off += 4096) {
++			if (n >= maxpages) { s->release(); return -1; }
++			pa[n++] = (uint64_t)((phys + in) & ~((addr64_t)4095));
++		}
+ 	}
+ 	*npages = n;
+ 	*allocSize = s->allocSize;
+@@ -481,6 +503,19 @@ sweet_surface_push_written(SweetSurface *s)
+ 	return pushed;
+ }
+ 
++/* A surface of the display pool (raphael: never written by a processor, never pushed out of the cache) */
++extern "C" bool
++sweet_surface_gpu_pool(void *surface)
++{
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	SweetSurface *s = (SweetSurface *)surface;
++	return s != NULL && s->poolSlot != 0;
++#else
++	(void)surface;
++	return false;
++#endif
++}
++
+ extern "C" int64_t
+ sweet_surface_gpu_push_written(void *surface)
+ {
+@@ -1330,7 +1365,14 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+ #if defined(ARM64_BOARD_CONFIG_RAPHAEL)
+-			if (s->poolSlot != 0)           /* (fresh pages come zeroed: vm_page_alloc_list's bzero_phys) */
++			/* (fresh pages come zeroed: vm_page_alloc_list's bzero_phys; the display pool's are the GPU's
++			 * alone, see sweet_surface_display_pool_init: boot-arg sweetsurf_poolzero=1 zeroes them) */
++			static int pool_zero = -1;
++			if (pool_zero < 0) {
++				pool_zero = 0;
++				(void)PE_parse_boot_argn("sweetsurf_poolzero", &pool_zero, sizeof(pool_zero));
++			}
++			if (s->poolSlot != 0 && pool_zero)
+ #endif
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
