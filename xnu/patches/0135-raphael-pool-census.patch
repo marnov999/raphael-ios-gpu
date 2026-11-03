@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4527f7f..0895e6a 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3630,9 +3630,22 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 			uint64_t tlb_ns;
+ 			absolutetime_to_nanoseconds(g_tlb_time, &tlb_ns);
+ 			extern uint32_t sweet_display_hits, sweet_display_misses, sweet_display_busy_now;
++			extern void sweet_display_census(uint32_t *live, uint32_t *dead);
++			uint32_t live = 0, dead = 0, open = 0, kept = 0, left = 0, k;
++			sweet_display_census(&live, &dead);
++			for (k = 0; k < KGSL_MAX_BO; k++) {
++				if (g_bo[k].surf != NULL && sweet_surface_gpu_pool(g_bo[k].surf)) {
++					open += g_bo[k].used == 1;
++					kept += g_bo[k].used == 3;
++				}
++			}
++			for (k = 0; k < g_left_count; k++) {
++				left += g_left[k].surf != NULL && sweet_surface_gpu_pool(g_left[k].surf);
++			}
+ 			printf("SWEET DRM: TLB syncs: %u at once, %u later, %u never; %llu us in all; display buffers: %u given, "
+-			    "%u not (none free), %u busy\n", g_tlb_quick, g_tlb_slow, g_tlb_never, tlb_ns / 1000ull, sweet_display_hits,
+-			    sweet_display_misses, sweet_display_busy_now);
++			    "%u not (none free), %u busy at the last: now %u of surfaces somebody has, %u of none (GPU buffers of them: "
++			    "%u open, %u kept, %u left)\n", g_tlb_quick, g_tlb_slow, g_tlb_never, tlb_ns / 1000ull, sweet_display_hits,
++			    sweet_display_misses, sweet_display_busy_now, live, dead, open, kept, left);
+ 			sweet_display_hits = sweet_display_misses = 0;
+ 			g_tlb_quick = g_tlb_slow = g_tlb_never = 0;
+ 			g_tlb_time = 0;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 236ed40..ba3821b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -107,7 +107,7 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+  * 4 GB (only ~11 of 14 MB fit), the rest any pages (the display engine's own SMMU windows fetch those,
+  * sweet_mdp_smmu.c).
+  */
+-#define SWEET_DISPLAY_POOL      16
++#define SWEET_DISPLAY_POOL      32      /* (at most: boot-arg sweetsurf_pool, 16) */
+ #define SWEET_DISPLAY_POOL_ONE  8
+ #else
+ #define SWEET_DISPLAY_POOL      4       /* two shown (SweetFramebuffer holds them) and two being drawn */
+@@ -131,7 +131,13 @@ void
+ sweet_surface_display_pool_init(void)
+ {
+ 	vm_size_t size = SWEET_DISPLAY_SIZE;
+-	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
++	unsigned count = SWEET_DISPLAY_POOL;
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	count = 16;
++	(void)PE_parse_boot_argn("sweetsurf_pool", &count, sizeof(count));
++	count = count < 1 ? 1 : count > SWEET_DISPLAY_POOL ? SWEET_DISPLAY_POOL : count;
++#endif
++	for (unsigned i = 0; i < count; i++) {
+ 		IOByteCount seg = 0;
+ 		if (sweet_display_pool[i] != NULL) {
+ 			continue;
+@@ -169,6 +175,30 @@ sweet_surface_display_pool_init(void)
+ /* (for the GPU's five-second line: full-screen surfaces given a display buffer, and not; buffers busy at the last) */
+ extern "C" uint32_t sweet_display_hits, sweet_display_misses, sweet_display_busy_now;
+ uint32_t sweet_display_hits, sweet_display_misses, sweet_display_busy_now;
++static SweetSurface *sweet_display_owner[SWEET_DISPLAY_POOL];     /* (not a reference: cleared by its free) */
++
++/* The busy display buffers now: of a surface somebody has (in the table, users), and of one nobody has any more (held by the kernel alone) */
++extern "C" void
++sweet_display_census(uint32_t *live, uint32_t *dead)
++{
++	*live = *dead = 0;
++	if (sweet_surface_lock == NULL) {
++		return;
++	}
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
++		SweetSurface *o = sweet_display_owner[i];
++		if (!sweet_display_busy[i] || o == NULL) {
++			continue;
++		}
++		if (o->id != 0 && o->id < SWEET_SURFACE_MAX_ID && sweet_surface_table[o->id] == o && sweet_surface_users[o->id] != 0) {
++			(*live)++;
++		} else {
++			(*dead)++;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++}
+ 
+ static IOBufferMemoryDescriptor *
+ sweet_display_take(uint32_t size, uint32_t *slot)
+@@ -202,6 +232,7 @@ SweetSurface::free()
+ 	}
+ 	if (poolSlot != 0) {
+ 		extern bool sweet_display_busy[];
++		sweet_display_owner[poolSlot - 1] = NULL;
+ 		sweet_display_busy[poolSlot - 1] = false;   /* the pool keeps its own reference */
+ 	}
+ 	if (pages != NULL) {
+@@ -1363,6 +1394,9 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			    s->planeCount == 0 && s->bytesPerRow >= SWEET_DISPLAY_BPR_MIN && s->bytesPerRow <= SWEET_DISPLAY_BPR &&
+ 			    strcmp(maker, "backboardd") == 0) {
+ 				mem = sweet_display_take(s->allocSize, &s->poolSlot);
++				if (mem != NULL) {
++					sweet_display_owner[s->poolSlot - 1] = s;
++				}
+ #if !defined(ARM64_BOARD_CONFIG_RAPHAEL)
+ 				/* (raphael: not here. CoreAnimation makes a new full-screen surface every frame and the
+ 				 * pool is out most of the time; reaping on each, and 0119's search for one piece below
