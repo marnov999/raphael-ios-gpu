@@ -273,7 +273,7 @@ FLAGS = {
     # RedwoodMetal allowlist (backboardd only via the metal_backboardd switch file, not installed here)
     'metal_allow': b'metal_test\nmtltry\nmtlcompute\nmtlrender\nmtldrawable\nMetalDemo\nMobileNotes\nPreferences\n',  # 10-26: Notes (PencilKit), Settings (CoreImage icons; with metal_profile=1)
     # kernel 0115 (sweetcpufreq=1): CPU/L3/GPU clock rows (devtools/clocks.sh); all max
-    'clocks': b'l3=10 little=9 big=12 gpu=0\n',
+    'clocks': b'l3=14 little=17 big=16 prime=19\n',  # raphael (xnu 0116): every OSM cluster at its top row while drawing; GPU by the governor
     # eagl: environment for backboardd's Mesa; shader cache dir MUST be writable by uid 501
     'gl_env': b'MESA_SHADER_CACHE_DIR=/var/tmp/mesa_shader_cache\n',
     # eagl worker_priority(): disabled (gl_no_worker_prio non-empty), gl_worker_prio then unused

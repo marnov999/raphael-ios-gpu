@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ca9b581..6b05ee1 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -953,7 +953,11 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
+ 
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	pos = pos > 4194304 ? pos - 4194304 : 0;        /* the whole ring (4 MiB): the boot from its first line */
++#else
+ 	pos = pos > 65536 ? pos - 65536 : 0;
++#endif
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index bed0efd..f620bc5 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -102,13 +102,22 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ #define SWEET_DISPLAY_W         1125u
+ #define SWEET_DISPLAY_H         2436u
+ #define SWEET_DISPLAY_BPR       4608u
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++/* raphael: CoreAnimation's full-screen surfaces have 4544-byte rows and 13893632 bytes (u3, 2026-11-03),
++ * davinci's 4608 and less: any row from 1125 * 4 to 4608 bytes, and buffers of 14 MiB */
++#define SWEET_DISPLAY_BPR_MIN   (SWEET_DISPLAY_W * 4u)
++#define SWEET_DISPLAY_SIZE      (14u << 20)
++#else
++#define SWEET_DISPLAY_BPR_MIN   SWEET_DISPLAY_BPR
++#define SWEET_DISPLAY_SIZE      round_page((vm_size_t)SWEET_DISPLAY_BPR * SWEET_DISPLAY_H)
++#endif
+ static IOBufferMemoryDescriptor *sweet_display_pool[SWEET_DISPLAY_POOL];
+ bool sweet_display_busy[SWEET_DISPLAY_POOL];
+ 
+ void
+ sweet_surface_display_pool_init(void)
+ {
+-	vm_size_t size = round_page((vm_size_t)SWEET_DISPLAY_BPR * SWEET_DISPLAY_H);
++	vm_size_t size = SWEET_DISPLAY_SIZE;
+ 	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
+ 		IOByteCount seg = 0;
+ 		if (sweet_display_pool[i] != NULL) {
+@@ -1271,7 +1280,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			char maker[32] = "";
+ 			proc_selfname(maker, sizeof(maker));
+ 			if (s->width == SWEET_DISPLAY_W && s->height == SWEET_DISPLAY_H && s->pixelFormat == 'BGRA' &&
+-			    s->planeCount == 0 && s->bytesPerRow == SWEET_DISPLAY_BPR && strcmp(maker, "backboardd") == 0) {
++			    s->planeCount == 0 && s->bytesPerRow >= SWEET_DISPLAY_BPR_MIN && s->bytesPerRow <= SWEET_DISPLAY_BPR &&
++			    strcmp(maker, "backboardd") == 0) {
+ 				mem = sweet_display_take(s->allocSize, &s->poolSlot);
+ 				if (mem == NULL) {
+ 					sweet_gpu_reap_dead_now();      /* (a dead window server's buffers may hold them) */
