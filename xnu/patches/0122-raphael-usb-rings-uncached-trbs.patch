@@ -1,0 +1,84 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 8374369..827448d 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -695,7 +695,10 @@ ud_rx_done(void)
+  * other. As Linux's dwc3 runs a bulk endpoint (gadget.c __dwc3_prepare_one_trb): its TRBs in a ring
+  * closed by a link TRB, one endless transfer, CSP on the OUT ones so that a short packet (the end of
+  * every frame) ends only its TRB, IOC for an XferInProgress event each, and UPDATE_TRANSFER whenever
+- * TRBs are given back to the controller or added.
++ * TRBs are given back to the controller or added. The TRBs are read and written through an uncached view
++ * (Linux: coherent memory): four share a cache line, and cleaning the line of one given back wrote stale
++ * copies of its neighbours over what the controller had just written into them (u8: the ring stopped
++ * taking frames after 167).
+  */
+ #define DEPCMD_UPDATETRANSFER   7
+ #define TRB_CSP                 (1u << 3)
+@@ -708,7 +711,7 @@ ud_rx_done(void)
+ #define RG_TX_BUF(i)            (0x2000u + UD_FRAME_MAX * (RX_N + (i)))
+ #define RG_SIZE                 (0x2000u + UD_FRAME_MAX * (RX_N + TX_N))
+ #define RX_CTL                  (TRBCTL_NORMAL | TRB_HWO | TRB_CSP | TRB_IOC)
+-static vm_offset_t rg;
++static vm_offset_t rg, rg_nc;                  /* the ring area; its TRBs (first 0x2000 bytes) uncached */
+ static uint64_t    rg_pa;
+ static uint32_t    rx_next, rx_rsc, tx_head, tx_tail, tx_used, tx_rsc;
+ static bool        tx_on;
+@@ -719,15 +722,22 @@ rg_sync(uint32_t off, uint32_t len)
+ 	flush_dcache64((addr64_t)(rg_pa + off), len, TRUE);
+ }
+ 
++static volatile uint32_t *
++rg_t(uint32_t off)
++{
++	return (volatile uint32_t *)(rg_nc + off);
++}
++
+ static void
+ rg_trb(uint32_t off, uint64_t pa, uint32_t len, uint32_t ctl)
+ {
+-	volatile uint32_t *t = (volatile uint32_t *)(rg + off);
++	volatile uint32_t *t = rg_t(off);
+ 	t[0] = (uint32_t)pa;
+ 	t[1] = (uint32_t)(pa >> 32);
+ 	t[2] = len;
+-	t[3] = ctl;
+-	rg_sync(off, 16);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	t[3] = ctl;                             /* (HWO last) */
++	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+ static bool
+@@ -739,7 +749,11 @@ ud_rings(void)
+ 		return false;
+ 	}
+ 	rg_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)rg));
+-	return rg_pa != 0;
++	if (rg_pa != 0 && rg_nc == 0) {
++		rg_sync(0, 0x2000);             /* (the cached view's zeroes out first) */
++		rg_nc = ml_io_map(rg_pa, 0x2000);
++	}
++	return rg_pa != 0 && rg_nc != 0;
+ }
+ 
+ /* STARTTRANSFER at a TRB of the ring; the transfer's resource index, or ~0 */
+@@ -772,8 +786,7 @@ ud_rx_ring_done(void)
+ 	unsigned n;
+ 	for (n = 0; n < RX_N; n++) {
+ 		uint32_t off = RG_RX_TRB(rx_next);
+-		volatile uint32_t *t = (volatile uint32_t *)(rg + off);
+-		rg_sync(off, 16);
++		volatile uint32_t *t = rg_t(off);
+ 		if (t[3] & TRB_HWO) {
+ 			break;
+ 		}
+@@ -793,8 +806,7 @@ ud_tx_ring_kick_locked(void)
+ {
+ 	bool added = false;
+ 	while (tx_used > 0) {
+-		volatile uint32_t *t = (volatile uint32_t *)(rg + RG_TX_TRB(tx_tail));
+-		rg_sync(RG_TX_TRB(tx_tail), 16);
++		volatile uint32_t *t = rg_t(RG_TX_TRB(tx_tail));
+ 		if (t[3] & TRB_HWO) {
+ 			break;
+ 		}
