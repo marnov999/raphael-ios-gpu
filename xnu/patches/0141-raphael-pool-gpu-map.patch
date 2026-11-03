@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 1fd4347..0e61736 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2361,6 +2361,7 @@ extern bool     sweet_surface_gpu_live(void *surface);
+ extern uint32_t sweet_surface_gpu_seed(void *surface);
+ extern void     sweet_surface_gpu_flush(void *surface);
+ extern bool     sweet_surface_gpu_pool(void *surface);
++extern uint32_t sweet_surface_gpu_pool_slot(void *surface);
+ /* boot-arg sweetsurf_poolzero=1: display pool surfaces zeroed by the processor when made (then pushed out at first use) */
+ static bool
+ sweet_pool_zero(void)
+@@ -2753,6 +2754,29 @@ static struct {
+  * time (u18-u22: ~17 in 10 s of swipes). The addresses are out of the GPU's tables and its TLB first, so
+  * the GPU cannot reach the memory while it waits here. Boot-arg sweetgpu_syncfree=1: as before.
+  */
++/*
++ * (raphael) The display pool's buffers in the GPU's address space for good: mapped at the first import of a
++ * surface of each, and that mapping is every later one's -- CoreAnimation makes a full-screen surface a
++ * frame, and each was 3400 page table entries written and taken out again, and a TLB flush, on the window
++ * server's render thread (the 6-8 ms before the first GL call of its slowest frames, u24). The buffers are
++ * never freed, so what the GPU may still write there after a surface is gone is the pool's own memory.
++ * Boot-arg sweetgpu_poolmap=0: as before.
++ */
++#define GPU_POOL_SLOTS 32u
++static uint64_t g_pool_va[GPU_POOL_SLOTS + 1];
++static vm_size_t g_pool_size[GPU_POOL_SLOTS + 1];
++
++static bool
++gpu_pool_va(uint64_t gpuaddr)
++{
++	for (unsigned i = 1; i <= GPU_POOL_SLOTS; i++) {
++		if (g_pool_va[i] != 0 && g_pool_va[i] == gpuaddr) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ #define GPU_FREE_Q 512u
+ static struct { vm_offset_t cva; vm_size_t size; void *surf; } g_free_q[GPU_FREE_Q];
+ static uint32_t g_free_head, g_free_tail;      /* (with the GPU's lock held) */
+@@ -2765,8 +2789,10 @@ gpu_bo_destroy(vm_offset_t cva, uint64_t gpuaddr, vm_size_t mmapsize, void *surf
+ 	static int sync_free = -1;
+ 	/* an imported surface's addresses run on into its scratch pages (drm_do_ios_import) */
+ 	vm_size_t vsize = surf ? mmapsize + SWEET_IMPORT_PAD_BYTES : mmapsize;
+-	gpu_unmap(gpuaddr, vsize);
+-	gpu_address_free(gpuaddr, vsize);
++	if (!(surf != NULL && gpu_pool_va(gpuaddr))) {          /* (a display buffer's stays mapped) */
++		gpu_unmap(gpuaddr, vsize);
++		gpu_address_free(gpuaddr, vsize);
++	}
+ 	if (sync_free < 0) {
+ 		sync_free = 0;
+ 		(void)PE_parse_boot_argn("sweetgpu_syncfree", &sync_free, sizeof(sync_free));
+@@ -3182,7 +3208,9 @@ kgsl_do_gpumem_free(uint32_t id)
+ 	 * ~1.6 GB, past SWEET_SURFACE_WIRED_MAX, and backboardd's surfaces could no longer be made (apps
+ 	 * did not open, frames failed).
+ 	 */
+-	if (b->surf != NULL && !sweet_surface_gpu_live(b->surf)) {
++	/* (and a display buffer's surface, raphael: CoreAnimation's per-frame one, which is not imported again --
++	 * kept, it held its display buffer until gpu_import_expire, 11 of 16 at a time, u20) */
++	if (b->surf != NULL && (!sweet_surface_gpu_live(b->surf) || sweet_surface_gpu_pool(b->surf))) {
+ 		gpu_bo_release(b);
+ 		gpu_reap();
+ 		return 0;
+@@ -3894,10 +3922,23 @@ drm_do_ios_import(uint32_t surf_id, uint32_t *out_handle)
+ 	for (i = 0; i < SWEET_IMPORT_PAD_PAGES; i++) {
+ 		g_import_pa[npages + i] = g_import_scratch_pa;
+ 	}
+-	if (gpu_gpumem_map_phys(g_import_pa, npages + SWEET_IMPORT_PAD_PAGES, &gpuaddr) != 0) {
+-		sweet_surface_gpu_unref(surf);
+-		printf("SWEET DRM: ios_import surf %u FAILED (map %u pages)\n", surf_id, npages);
+-		return ENOMEM;
++	{
++		static int poolmap = -1;
++		uint32_t slot = sweet_surface_gpu_pool_slot(surf);
++		if (poolmap < 0) {
++			poolmap = 1;
++			(void)PE_parse_boot_argn("sweetgpu_poolmap", &poolmap, sizeof(poolmap));
++		}
++		if (poolmap && slot != 0 && slot <= GPU_POOL_SLOTS && g_pool_va[slot] != 0 && g_pool_size[slot] == (vm_size_t)npages * 0x1000u) {
++			gpuaddr = g_pool_va[slot];
++		} else if (gpu_gpumem_map_phys(g_import_pa, npages + SWEET_IMPORT_PAD_PAGES, &gpuaddr) != 0) {
++			sweet_surface_gpu_unref(surf);
++			printf("SWEET DRM: ios_import surf %u FAILED (map %u pages)\n", surf_id, npages);
++			return ENOMEM;
++		} else if (poolmap && slot != 0 && slot <= GPU_POOL_SLOTS && g_pool_va[slot] == 0) {
++			g_pool_va[slot] = gpuaddr;      /* (from now on this display buffer's, for good) */
++			g_pool_size[slot] = (vm_size_t)npages * 0x1000u;
++		}
+ 	}
+ 	kgsl_bo_unhash(b);
+ 	bzero(b, sizeof(*b));
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index aa70e05..2f39ed7 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -573,6 +573,19 @@ sweet_surface_gpu_pool(void *surface)
+ #endif
+ }
+ 
++/* Its display buffer (1..SWEET_DISPLAY_POOL; 0: none): its pages are the same for as long as the system runs */
++extern "C" uint32_t
++sweet_surface_gpu_pool_slot(void *surface)
++{
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	SweetSurface *s = (SweetSurface *)surface;
++	return s != NULL ? s->poolSlot : 0;
++#else
++	(void)surface;
++	return 0;
++#endif
++}
++
+ extern "C" int64_t
+ sweet_surface_gpu_push_written(void *surface)
+ {
