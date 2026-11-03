@@ -394,5 +394,14 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - Per-frame "1 textures refilled (10809 KB)": eagl frame-start refresh of a non-target, non-shared surface whose
   seed moved (eagl.c:1305); render targets are "copied into its memory by the GPU" (blit_targets, as davinci).
   Which surface is still open.
+- u6 (0119): on-demand contiguous below 4 GB found room for 3 more (11 total) then failed; swipes 25-29 fps (CA
+  frames ~7.5 ms of CPU, the copy path - scaled 1125->1080 CPU copy of 11 MB - halving the rate).
+- **u7 (0120, CI 41659308412) 16:08: SCANOUT THROUGH THE MDP's OWN SMMU CONTEXT -> davinci-level frame rate.**
+  MDP stream 0x800: SMR 3 0x84200800, S2CR was 0x2 (translated by bank 2, ABL/hyp's); ours = bank 54 (identity
+  0x80000000-0xffffffff + 16 windows of 16 MB at 0x10000000), 0 faults. 100% of frames scanned out; continuous
+  home-page swipes 54-60 fps (davinci final: 57-58); GPU stays at 427 MHz (never >85% busy).
+  Bench: tools/touch.sh unlock "swipe 540 2335 540 500 250", then swipes 900<->150 at y=1300; SWEET FPS lines.
+- Open: the per-frame 10.8 MB refill (~4.7 ms CPU "before it for the IOSurfaces"); app GLES needs an app (davinci's
+  test IPAs in /home/marnov/xmiphones/geekbench); flashing a boot image with these args (user's OK).
 - Every later root patch: sync -> hfs-journal-replay.py (dry run, then --apply) -> overlay -> back up the phone
   copies of the chunks that differ -> write-root.sh --changed. Disk: ~3 GB free after this.
