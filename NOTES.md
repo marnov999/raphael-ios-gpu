@@ -347,3 +347,16 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   4M-block seek, count, sha) -> rollback = dd them back. tools/write-root.sh --changed wrote 17 chunks, all
   verified (8704 MiB).
 - NOTE libredwood-gl sets FD_MESA_GMEM=524288 (davinci's A618): safe on the A640 (1 MB), only smaller bins.
+- **g7 (out/raphael-ios-g7.img, sweetgpu=9 sweetmetal=1) 01:0x: Apple logo for 24+ min.** Sampler
+  (SpringBoard, backboardd) symbolicated with ipsw dyld a2s: SpringBoard main thread in +[AVSystemController
+  sharedInstance], backboardd t1 in vfbremote_connect, both synchronous XPC to mediaserverd, which launchd never
+  started ("Missing executable ... /usr/local/lib/sweet_media_shim"): the overlay edited the job but never wrote
+  the launchd group's files. Also seen: bluetoothd and nanotimekitcompaniond respawn loops (not looked at).
+- 09:00 fix (20a8dd3): overlay writes the group's files; --no-media-shim (raphael has no davinci camera: Apple's
+  mediaserverd job unchanged). The forced reset left the journal dirty again (17 lists / 77 blocks) ->
+  tools/hfs-journal-replay.py --apply (also sets the clean-unmount bit: Linux hfsplus mounts read-only without
+  it, even with force). Synced 9 chunks, overlay --accept-changed --no-media-shim (3 changes; re-run 0),
+  phone copies of the 4 chunks it changed in backup/root-pre-g7b-20261103/, write-root --changed 4 chunks ok.
+  09:07 g7 booted again via fastboot boot. Result: (pending)
+- Every later root patch: sync -> hfs-journal-replay.py (dry run, then --apply) -> overlay -> back up the phone
+  copies of the chunks that differ -> write-root.sh --changed. Disk: ~3 GB free after this.
