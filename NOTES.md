@@ -370,5 +370,14 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   0x002f0406 faults unmatched streams -> no DMA (SETUP, events). DWC3 VER 0x3137302a (usb31 1.70a), phy pipe/aux
   clocks on. out/logs/u1-kernel.log. Fix 0115: SMR + bypass S2CR (or emulated-bypass context bank, as mainline
   arm-smmu-qcom) as step 8.
+- **u2 (0115, CI 41645904723; same args) 14:45: USB GADGET WORKS ON RAPHAEL - the full davinci dev loop.**
+  SMMU: the firmware turned the bypass S2CR into FAULT (read back 0x00020000) -> emulated bypass: context bank 55
+  of 56 (CBAR 0x00010000, SCTLR 0), SMR 4 = 0x80000140, S2CR 0x37. Host: 1209:0001 "Sweet iOS (USB Ethernet)",
+  cdc_ether enx02005e77ef01 (NM profile sweetusb-raphael, 192.168.9.1/24), ping 0.3 ms, live log on UDP 5149
+  (tools/usblog.py), sweet_push on 192.168.9.2:5566 (tools/push_file.py, read_file.py, screencap.py: lock screen
+  screenshot verified), tools/fbreboot.sh [IMAGE]: iOS -> fastboot in 4 s (PON reason) [-> fastboot boot IMAGE].
+  sweetarmfb=1: any reset/panic lands in fastboot; then `fb.sh boot out/raphael-ios-tomiui.img` = MIUI for adb.
+  Dev images from now on: sweetusb=2 sweetarmfb=1 (+ sweetgpu=9 sweetmetal=1), ROOT=iosdata,
+  ADT=out/raphael-full-fw.adt. Next: GPU clock governor (257 MHz) + zero-copy IOSurface import (10.8 MB/frame).
 - Every later root patch: sync -> hfs-journal-replay.py (dry run, then --apply) -> overlay -> back up the phone
   copies of the chunks that differ -> write-root.sh --changed. Disk: ~3 GB free after this.
