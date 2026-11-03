@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 9aa2e84..d92ff8e 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1960,20 +1960,47 @@ static int                g_kgsl_ready;  /* submit path live */
+  * after a PTE is cleared (redwood_gpu_unmap) and after a table entry is added to the live
+  * pagetable: the MMU-500 caches intermediate walks, so without it a stale "invalid" L1/L2
+  * entry translation-faults (fsr.TF) the new region. */
++/* (how the syncs went, for the five-second line: done in the busy look, done later, never; their time) */
++static uint32_t g_tlb_quick, g_tlb_slow, g_tlb_never;
++static uint64_t g_tlb_time;
+ static void
+ gpu_tlb_flush(void)
+ {
+ 	unsigned p;
++	uint64_t began = mach_absolute_time();
++	bool done = false;
+ 	if (!g_smmu) {
+ 		return;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	gpu_wr(g_smmu, 0x8000u + 0x610u, 0u);         /* CB0 S1_TLBIASID (ASID 0) */
+ 	gpu_wr(g_smmu, 0x8000u + 0x7F0u, 0u);         /* CB0 TLBSYNC */
+-	for (p = 0; p < 2000u; p++) {
+-		if (!(gpu_rd(g_smmu, 0x8000u + 0x7F4u) & 1u)) { break; }
+-		gpu_udelay(1);
++	/*
++	 * Looked at without sleeping first (a sync is a few microseconds): each look of the loop below
++	 * slept (delay_for_interval), with the GPU's lock held -- unmapping CoreAnimation's per-frame
++	 * surface took a frame's time (glDeleteTextures 8.4 ms median, u18) and the submissions waited.
++	 */
++	for (p = 0; p < 400u && !done; p++) {
++		done = !(gpu_rd(g_smmu, 0x8000u + 0x7F4u) & 1u);
++		if (!done) {
++			IODelay(1);
++		}
+ 	}
++	if (done) {
++		g_tlb_quick++;
++	}
++	for (p = 0; p < 2000u && !done; p++) {
++		done = !(gpu_rd(g_smmu, 0x8000u + 0x7F4u) & 1u);
++		if (!done) {
++			gpu_udelay(1);
++		}
++	}
++	if (!done) {
++		g_tlb_never++;
++	} else if (p != 0) {
++		g_tlb_slow++;
++	}
++	g_tlb_time += mach_absolute_time() - began;
+ }
+ 
+ /* One zeroed 4K table, NC-mapped (redwood space_new_table: a 16K page gives four). */
+@@ -3598,6 +3625,17 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 		}
+ 		g_gpu_ticks = 0;
+ 		g_gpu_timed = 0;
++		{
++			uint64_t tlb_ns;
++			absolutetime_to_nanoseconds(g_tlb_time, &tlb_ns);
++			extern uint32_t sweet_display_hits, sweet_display_misses, sweet_display_busy_now;
++			printf("SWEET DRM: TLB syncs: %u at once, %u later, %u never; %llu us in all; display buffers: %u given, "
++			    "%u not (none free), %u busy\n", g_tlb_quick, g_tlb_slow, g_tlb_never, tlb_ns / 1000ull, sweet_display_hits,
++			    sweet_display_misses, sweet_display_busy_now);
++			sweet_display_hits = sweet_display_misses = 0;
++			g_tlb_quick = g_tlb_slow = g_tlb_never = 0;
++			g_tlb_time = 0;
++		}
+ 		printf("SWEET DRM: %u submissions in %llu ms (%u IBs, %u buffers named, %llu KB of surfaces out of the cache, %llu KB of it whole); "
+ 		    "fence %u done %u; buffers: %u made, %u kept ones given again, %u given back, %u left, %llu MB kept; "
+ 		    "%u buffers %llu MB; %u waits of %llu us; va %llu MB in %u, %u holes (%u most), %llu KB lost, %u refused\n",
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 25e438a..236ed40 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -166,17 +166,28 @@ sweet_surface_display_pool_init(void)
+ 	}
+ }
+ 
++/* (for the GPU's five-second line: full-screen surfaces given a display buffer, and not; buffers busy at the last) */
++extern "C" uint32_t sweet_display_hits, sweet_display_misses, sweet_display_busy_now;
++uint32_t sweet_display_hits, sweet_display_misses, sweet_display_busy_now;
++
+ static IOBufferMemoryDescriptor *
+ sweet_display_take(uint32_t size, uint32_t *slot)
+ {
++	unsigned busy = 0;
++	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
++		busy += sweet_display_busy[i];
++	}
++	sweet_display_busy_now = busy;
+ 	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
+ 		if (sweet_display_pool[i] != NULL && !sweet_display_busy[i] && sweet_display_pool[i]->getLength() >= size) {
+ 			sweet_display_busy[i] = true;
+ 			sweet_display_pool[i]->retain();
+ 			*slot = i + 1;
++			sweet_display_hits++;
+ 			return sweet_display_pool[i];
+ 		}
+ 	}
++	sweet_display_misses++;
+ 	return NULL;
+ }
+ 

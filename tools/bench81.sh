@@ -7,6 +7,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 TAG=${1:?usage: bench81.sh TAG}
+LOG=${LOG:-out/logs/u4-usb.log}
+# the display off (auto-lock): the power button pressed (xnu 0133 kern.sweet_key), then unlocked
+if [ "$(tail -c 3000000 "$LOG" | strings | grep -o 'SWEET FB: display o[nf]*' | tail -1)" = "SWEET FB: display off" ]; then
+	tools/run.sh /tmp/mdss key 0 | grep -v '^runlog'
+	sleep 1
+fi
 tools/touch.sh "swipe 540 2335 540 500 250"
 sleep 2
 H=(); for _ in 1 2 3; do H+=("swipe 950 1300 150 1300 250" "sleep 700" "swipe 150 1300 950 1300 250" "sleep 700"); done
