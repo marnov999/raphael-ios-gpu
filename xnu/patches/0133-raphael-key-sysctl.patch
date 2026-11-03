@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 21ab6cd..a5ada5a 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -10,6 +10,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -18,6 +19,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern void IOSleep(unsigned int milliseconds);
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -237,4 +239,31 @@ sweet_keys_init(void)
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++/*
++ * kern.sweet_key (root): a button pressed and let go from userland -- 0 power (side button), 1 volume
++ * up, 2 volume down (SweetHID's numbering) -- as the buttons themselves send it: what wakes the display
++ * after auto-lock in a measurement with the touchscreen muted (tools/mdss key 0).
++ */
++static int
++sysctl_sweet_key SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int key = -1, error = SYSCTL_IN(req, &key, sizeof(key));
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error != 0 ? error : EINVAL;
++	}
++	if (key < 0 || key > 2) {
++		return EINVAL;
++	}
++	sweet_hid_key(key, 1);
++	IOSleep(80);
++	sweet_hid_key(key, 0);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_key, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_key, "I", "press a button: 0 power, 1 volume up, 2 volume down");
++#endif
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

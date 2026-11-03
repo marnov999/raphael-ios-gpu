@@ -7,6 +7,7 @@
  *   mdss dcs B B .. [, B B ..]   DCS long writes to the panel, one packet per comma-separated group
  *   mdss te [SECS]               the panel's TEs for SECS (3): rate, period min/mean/max
  *   mdss touch 0|1               the touchscreen's own touches off (kern.sweet_touch_mute) / on
+ *   mdss key N                   a button pressed and let go (0 power, 1 volume up, 2 volume down)
  *   mdss sysctl NAME [N [MS]]    a 32-bit sysctl, N times MS apart
  *   mdss line [MS]               the tear check's read pointer every 0.1 ms for MS (20): line, us
  */
@@ -212,6 +213,15 @@ main(int argc, char **argv)
 			return 1;
 		}
 		printf("touchscreen %s\n", mute ? "muted (injected touches only)" : "on");
+		return 0;
+	}
+	if (strcmp(argv[1], "key") == 0 && argc >= 3) {        /* key N: a button pressed (0 power, 1 volume up, 2 down) */
+		int key = atoi(argv[2]);
+		if (sysctlbyname("kern.sweet_key", NULL, NULL, &key, sizeof(key)) != 0) {
+			perror("kern.sweet_key");
+			return 1;
+		}
+		printf("key %d pressed\n", key);
 		return 0;
 	}
 	if (strcmp(argv[1], "sysctl") == 0 && argc >= 3) {    /* sysctl NAME [COUNT [MS]]: a 32-bit sysctl, COUNT times MS apart */
