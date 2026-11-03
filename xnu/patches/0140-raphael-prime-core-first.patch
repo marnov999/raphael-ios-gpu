@@ -1,0 +1,19 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index dc0210d..52fed13 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5075,7 +5075,13 @@ choose_processor(
+ 		if (big_first && (thread->sched_pri >= 46 || (big_first == 2 && window_server && thread->sched_pri >= 20)) &&
+ 		    thread->sched_pri < BASEPRI_RTQUEUES) {
+ 			processor_t busy = PROCESSOR_NULL, least = PROCESSOR_NULL;
+-			for (uint32_t cpu = big_cpu; cpu < MAX_SCHED_CPUS; cpu++) {
++			/*
++			 * From the last big core down: on SM8150 that is the prime core first (cpu7, 2.84 GHz and the
++			 * larger L2), then the gold ones (2.42 GHz). Counted up, the window server's render thread ran
++			 * 72% of its time on cpu4-5 and 8% on the prime core (u23), and its heaviest frames (8 ms of
++			 * layer work before the first GL call) missed the panel's 12.35 ms.
++			 */
++			for (int32_t cpu = MAX_SCHED_CPUS - 1; cpu >= (int32_t)big_cpu; cpu--) {
+ 				processor_t p = processor_array[cpu];
+ 				if (p == PROCESSOR_NULL || p->processor_set != pset || !p->is_recommended) {
+ 					continue;
