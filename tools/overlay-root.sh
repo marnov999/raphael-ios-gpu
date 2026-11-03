@@ -16,18 +16,21 @@ apt-get update -q >/dev/null
 apt-get install -y -q hfsprogs python3 >/dev/null
 # A root iOS has run on: its hard-link counts (iOS's own bookkeeping) are all Linux's fsck_hfs finds wrong;
 # anything else and the image is not mounted.
-if ! fsck.hfsplus -fn "$IMG" > /tmp/fsck.txt 2>&1; then
+check() {
+	fsck.hfsplus -fn "$IMG" > /tmp/fsck.txt 2>&1 && return
 	cat /tmp/fsck.txt
 	if grep -v "Incorrect number of file hard links" /tmp/fsck.txt | grep -qiE "incorrect|invalid|missing|overlapped|bad|error"; then
-		echo "fsck before the overlay found problems: not mounting" >&2
+		echo "fsck $1 the overlay found problems" >&2
 		exit 1
 	fi
 	echo "(only the hard-link count: going on)"
-fi
+}
+check before
 mkdir -p /mnt/iosroot
 mount -t hfsplus -o loop,force "$IMG" /mnt/iosroot
+grep -q " /mnt/iosroot hfsplus rw" /proc/mounts || { echo "mounted read-only (not cleanly unmounted? tools/hfs-journal-replay.py --apply)" >&2; umount /mnt/iosroot; exit 1; }
 python3 -I /src/tools/sweet-root-overlay.py --base /base "$@" /mnt/iosroot || { umount /mnt/iosroot; exit 1; }
 sync
 umount /mnt/iosroot
-fsck.hfsplus -fn "$IMG"
+check after
 echo OVERLAY_DONE

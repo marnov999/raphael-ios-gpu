@@ -414,9 +414,9 @@ class Overlay:
                 os.unlink(self.p(rel))
 
     # -- groups --------------------------------------------------------------------------------
-    def files(self, group):
+    def files(self, group, skip=()):
         for g, rel, src, mode, sha in FILES:
-            if g != group:
+            if g != group or rel in skip:
                 continue
             s = os.path.join(self.base, src)
             if not os.path.isfile(s):
@@ -438,6 +438,14 @@ class Overlay:
                 self.put(rel, val, 0o644)
 
     def g_launchd(self):
+        # 0. the group's own files (the binaries the jobs below start); before 2026-11-03 they were never
+        # written, so mediaserverd's job pointed at a missing sweet_media_shim and never started (raphael
+        # g7: SpringBoard and backboardd blocked on it for good, the Apple logo stayed)
+        media = (MEDIA_SHIM.lstrip('/'), 'usr/local/lib/libsweet-media.dylib')
+        for g, rel, src, mode, sha in FILES:
+            if g == 'launchd' and self.a.no_media_shim and rel in media:
+                self.remove(rel)
+        self.files('launchd', skip=media if self.a.no_media_shim else ())
         # 1. the launchd job cache
         rel = 'System/Library/xpc/launchd.plist'
         path = self.p(rel)
@@ -457,9 +465,13 @@ class Overlay:
             sb['ProgramArguments'] = [SWEET_SHIM] + pa
         sb.pop('Program', None)
         # mediaserverd: sweet_media_shim in front (camera/userland, libsweet-media.dylib = the camera, sweetcam=5)
+        # (--no-media-shim, for a phone without davinci's camera: Apple's mediaserverd as it is)
         ms = jobs[MS_KEY]
         pa = ms.get('ProgramArguments') or [ms['Program']]
-        if pa[0] != MEDIA_SHIM:
+        if self.a.no_media_shim:
+            if pa[0] == MEDIA_SHIM:
+                ms['ProgramArguments'] = pa[1:]
+        elif pa[0] != MEDIA_SHIM:
             ms['ProgramArguments'] = [MEDIA_SHIM] + pa
         ms.pop('Program', None)
         for k, job in SWEET_JOBS.items():
@@ -595,6 +607,8 @@ def main():
     ap.add_argument('--skip', default='')
     ap.add_argument('--accept-changed', action='store_true', help='install sources whose sha differs from the phone copy')
     ap.add_argument('--no-chown', action='store_true', help='testing on a scratch tree as a normal user')
+    ap.add_argument('--no-media-shim', action='store_true',
+                    help="keep Apple's mediaserverd job (no davinci camera library: raphael)")
     ap.add_argument('--reference-launchd', help='compare the edited launchd.plist with this one (e.g. launchd.plist.device-20261024.bak)')
     a = ap.parse_args()
     if not os.path.isdir(os.path.join(a.root, 'System/Library/xpc')):
