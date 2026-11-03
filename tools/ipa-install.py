@@ -76,8 +76,9 @@ def install(ipa):
     t0 = time.time()
     execs = []
     for n, (local, remote) in enumerate(files, 1):
-        if os.access(local, os.X_OK):
-            execs.append(remote)
+        with open(local, "rb") as f:            # (Mach-O by its magic: the zip gives no mode bits)
+            if f.read(4) in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+                execs.append(remote)
         ack = host.push(local, remote, 0o644)
         if ack != b"K":
             print("[ipa] ack %r for %s" % (ack, remote))
