@@ -357,6 +357,11 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   tools/hfs-journal-replay.py --apply (also sets the clean-unmount bit: Linux hfsplus mounts read-only without
   it, even with force). Synced 9 chunks, overlay --accept-changed --no-media-shim (3 changes; re-run 0),
   phone copies of the 4 chunks it changed in backup/root-pre-g7b-20261103/, write-root --changed 4 chunks ok.
-  09:07 g7 booted again via fastboot boot. Result: (pending)
+  09:07 g7 booted again via fastboot boot. **Result: lock screen, GPU COMPOSITING** (user: still slow, but none of
+  the software path's glitches). out/logs/g7b-kernel.log: backboardd's CoreAnimation draws through redwood-gl on
+  the A640 (6460+ frames, 4-15 ms of GL a frame). Slowness: (a) GPU at level 4 = 257 MHz (no governor on raphael);
+  (b) every frame "1 textures refilled from IOSurfaces (10809 KB)" + ~9 ms "before it" = a full-screen CPU copy
+  per frame (davinci: zero-copy MSM_INFO_IOS_IMPORT) -> both after USB.
+- 0114 (sweet_reboot.c + stepwise USB start, CI 41604338465): see the u1 entry.
 - Every later root patch: sync -> hfs-journal-replay.py (dry run, then --apply) -> overlay -> back up the phone
   copies of the chunks that differ -> write-root.sh --changed. Disk: ~3 GB free after this.
