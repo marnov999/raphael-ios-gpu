@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4cf8bed..77b53a1 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2327,6 +2327,7 @@ static uint32_t g_mmap_page_next = 4;   /* 4K-page units; multiple of 4 keeps id
+  * of this processor's cache. */
+ extern void    *sweet_surface_gpu_ref(uint32_t id);
+ extern void     sweet_surface_gpu_unref(void *surface);
++extern bool     sweet_surface_gpu_live(void *surface);
+ extern uint32_t sweet_surface_gpu_seed(void *surface);
+ extern void     sweet_surface_gpu_flush(void *surface);
+ extern int64_t  sweet_surface_gpu_push_written(void *surface);   /* bytes, -1: push it all out */
+@@ -2950,7 +2951,7 @@ gpu_import_expire(void)
+ 	}
+ 	last = now;
+ 	for (unsigned i = 0; i < KGSL_MAX_BO; i++) {
+-		if (g_bo[i].used == 3 && now - g_bo[i].kept_at > limit) {
++		if (g_bo[i].used == 3 && (now - g_bo[i].kept_at > limit || !sweet_surface_gpu_live(g_bo[i].surf))) {
+ 			gpu_import_drop(&g_bo[i]);
+ 		}
+ 	}
+@@ -3056,7 +3057,18 @@ kgsl_do_gpumem_free(uint32_t id)
+ {
+ 	struct kgsl_bo_ent *b = kgsl_bo_find(id);
+ 	if (!b) { return -1; }
+-	if (b->surf != NULL) {          /* an IOSurface's: kept a while (gpu_import_drop) */
++	/*
++	 * An IOSurface's: kept a while (gpu_import_drop) -- unless the surface is nobody's any more. raphael
++	 * (u11): CoreAnimation makes a new 13.9 MB full-screen surface every frame; 2 s of them kept held
++	 * ~1.6 GB, past SWEET_SURFACE_WIRED_MAX, and backboardd's surfaces could no longer be made (apps
++	 * did not open, frames failed).
++	 */
++	if (b->surf != NULL && !sweet_surface_gpu_live(b->surf)) {
++		gpu_bo_release(b);
++		gpu_reap();
++		return 0;
++	}
++	if (b->surf != NULL) {
+ 		b->used = 3;
+ 		b->kept_at = mach_absolute_time();
+ 		g_bo_count--;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e851752..7c690f1 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -315,6 +315,21 @@ sweet_surface_gpu_ref(uint32_t id)
+ 	return sweet_surface_copy(id);
+ }
+ 
++/* Is the surface still somebody's (in the table by its id): one that is not can never be imported again. */
++extern "C" bool
++sweet_surface_gpu_live(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	bool live;
++	if (s == NULL || sweet_surface_lock == NULL) {
++		return false;
++	}
++	IOLockLock(sweet_surface_lock);
++	live = s->id != 0 && s->id < SWEET_SURFACE_MAX_ID && sweet_surface_table[s->id] == s && sweet_surface_users[s->id] != 0;
++	IOLockUnlock(sweet_surface_lock);
++	return live;
++}
++
+ extern "C" void
+ sweet_surface_gpu_unref(void *surface)
+ {
