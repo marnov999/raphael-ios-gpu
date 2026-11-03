@@ -1,0 +1,104 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 7600738..ca9b581 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1119,7 +1119,84 @@ qs_wr(vm_offset_t qs, uint32_t off, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
+-/* Before the shared start's soft reset: steps 1-7. false: stop. */
++/*
++ * The DMA's SMMU stream. u1 (2026-11-03): every step ran and the host saw the device ("new high-speed
++ * USB device"), then "device descriptor read/64, error -110" and a reset: stream 0x140 had no SMR and
++ * the apps SMMU faults unmatched streams (sCR0.USFCFG), so the SETUP packet and the events never
++ * reached memory (ABL's own mapping is gone after it). As mainline arm-smmu-qcom.c: an SMR for it with
++ * an S2CR of type bypass, or, where the firmware turns a bypass S2CR into a fault one, a context bank
++ * that bypasses (CBAR S1_TRANS_S2_BYPASS, SCTLR.M = 0: "bypass_cbndx").
++ */
++static bool
++ud_smmu_stream(void)
++{
++	vm_offset_t g0 = ml_io_map(SMMU_PA, 0x1000), g1, cbp;
++	uint32_t idr0, idr1, nsmr, ncb, pgshift, npg, s2cr, cb;
++	int free_smr = -1;
++	static bool used[256];
++
++	if (g0 == 0) {
++		return false;
++	}
++	idr0 = usb_rd(g0, 0x20);
++	idr1 = usb_rd(g0, 0x24);
++	nsmr = idr0 & 0xff;
++	ncb = idr1 & 0xff;
++	pgshift = (idr1 & (1u << 31)) ? 16 : 12;
++	npg = 1u << (((idr1 >> 28) & 7) + 1);
++	g1 = ml_io_map(SMMU_PA + (1u << pgshift), 0x1000);
++	if (g1 == 0 || ncb == 0) {
++		return false;
++	}
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t smr = usb_rd(g0, 0x800 + 4 * i), id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++		if (!(smr & (1u << 31))) {
++			if (free_smr < 0) {
++				free_smr = (int)i;
++			}
++			continue;
++		}
++		s2cr = usb_rd(g0, 0xc00 + 4 * i);
++		if (((id ^ USB_SID) & ~mask) == 0) {
++			printf("SWEET USB: SMMU stream 0x%x already has SMR %u (S2CR 0x%08x)\n", USB_SID, i, s2cr);
++			return true;
++		}
++		if (((s2cr >> 16) & 3) == 0) {
++			used[s2cr & 0xff] = true;
++		}
++	}
++	if (free_smr < 0) {
++		printf("SWEET USB: SMMU: no free SMR of %u\n", nsmr);
++		return false;
++	}
++	qs_wr(g0, 0xc00 + 4 * (uint32_t)free_smr, 1u << 16);           /* S2CR type bypass */
++	s2cr = usb_rd(g0, 0xc00 + 4 * (uint32_t)free_smr);
++	if (((s2cr >> 16) & 3) != 1) {
++		for (cb = ncb - 1; cb > 0; cb--) {
++			cbp = ml_io_map(SMMU_PA + ((vm_offset_t)(npg + cb) << pgshift), 0x1000);
++			if (cbp != 0 && !used[cb] && !(usb_rd(cbp, 0x0) & 1u)) {
++				break;
++			}
++		}
++		if (cb == 0) {
++			printf("SWEET USB: SMMU: bypass S2CR reads back 0x%08x and no free context bank of %u\n", s2cr, ncb);
++			return false;
++		}
++		cbp = ml_io_map(SMMU_PA + ((vm_offset_t)(npg + cb) << pgshift), 0x1000);
++		qs_wr(cbp, 0x0, 0);                                     /* SCTLR: translation off */
++		qs_wr(g1, 4 * cb, 1u << 16);                            /* CBAR: S1 translate, S2 bypass */
++		qs_wr(g0, 0xc00 + 4 * (uint32_t)free_smr, cb);          /* S2CR: translate, that bank */
++		printf("SWEET USB: SMMU: bypass S2CR read back 0x%08x: context bank %u of %u bypasses instead "
++		    "(CBAR 0x%08x SCTLR 0x%08x)\n", s2cr, cb, ncb, usb_rd(g1, 4 * cb), usb_rd(cbp, 0x0));
++	}
++	qs_wr(g0, 0x800 + 4 * (uint32_t)free_smr, (1u << 31) | USB_SID);
++	printf("SWEET USB: SMMU stream 0x%x: SMR %d 0x%08x S2CR 0x%08x (%u SMRs, %u banks, page %u, %u pages)\n", USB_SID,
++	    free_smr, usb_rd(g0, 0x800 + 4 * (uint32_t)free_smr), usb_rd(g0, 0xc00 + 4 * (uint32_t)free_smr), nsmr, ncb,
++	    1u << pgshift, npg);
++	return true;
++}
++
++/* Before the shared start's soft reset: steps 1-8. false: stop. */
+ static bool
+ ud_raphael_prepare(void)
+ {
+@@ -1187,6 +1264,13 @@ ud_raphael_prepare(void)
+ 	}
+ 	printf("SWEET USB: GCTL 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x DCTL 0x%08x DSTS 0x%08x DEPCMD0 0x%08x\n",
+ 	    dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL), dwc_rd(DCTL), dwc_rd(DSTS), dwc_rd(DEPCMD(0)));
++	if (!ud_step(8, "SMMU stream 0x140 for the DMA")) {
++		return false;
++	}
++	if (!ud_smmu_stream()) {
++		printf("SWEET USB: no SMMU stream: not started (its DMA would fault)\n");
++		return false;
++	}
+ 	return true;
+ }
+ 

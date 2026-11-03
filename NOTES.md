@@ -362,6 +362,13 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   the A640 (6460+ frames, 4-15 ms of GL a frame). Slowness: (a) GPU at level 4 = 257 MHz (no governor on raphael);
   (b) every frame "1 textures refilled from IOSurfaces (10809 KB)" + ~9 ms "before it" = a full-screen CPU copy
   per frame (davinci: zero-copy MSM_INFO_IOS_IMPORT) -> both after USB.
-- 0114 (sweet_reboot.c + stepwise USB start, CI 41604338465): see the u1 entry.
+- **u1 (0114, CI 41604338465; sweetgpu=9 sweetmetal=1 sweetusb=2 sweetarmfb=1) 09:44: PON armed (apid 249,
+  subtype 4 = gen2, SOFT_RB_SPARE 0 -> 4 read back) and the reset landed in FASTBOOT by itself.** USB: all 18
+  steps ran, NO wedge (core BCR 0xf000 + ABL's global regs restored, UTMI as pipe clock GENERAL_CFG 0xd, SUSPHY
+  off, CSFTRST 1 ms, every DEPCMD ok, running DSTS 0x00020001); the host saw "new high-speed USB device" then
+  "device descriptor read/64, error -110", reset ~10 s later. Cause: SMMU stream 0x140 has NO SMR and sCR0
+  0x002f0406 faults unmatched streams -> no DMA (SETUP, events). DWC3 VER 0x3137302a (usb31 1.70a), phy pipe/aux
+  clocks on. out/logs/u1-kernel.log. Fix 0115: SMR + bypass S2CR (or emulated-bypass context bank, as mainline
+  arm-smmu-qcom) as step 8.
 - Every later root patch: sync -> hfs-journal-replay.py (dry run, then --apply) -> overlay -> back up the phone
   copies of the chunks that differ -> write-root.sh --changed. Disk: ~3 GB free after this.
