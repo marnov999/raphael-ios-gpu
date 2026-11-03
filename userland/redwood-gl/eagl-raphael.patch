@@ -1,0 +1,123 @@
+--- a/eagl.c
++++ b/eagl.c
+@@ -258,6 +258,7 @@
+ 	uint64_t sum;                   /* ... and what it added up to */
+ 	GLenum to, internal, format, type;
+ 	uint32_t plane, seed;
++	uint32_t out_seed;              /* (a mirrored target) the surface's seed once our frame went into it, 0: none */
+ 	GLsizei width, height;
+ };
+ 
+@@ -1025,6 +1026,59 @@
+ 	e->upload_bytes += row * (size_t)image->height;
+ }
+ 
++/*
++ * (raphael 2026-11-03) A surface nobody has written yet (seed 0; the kernel makes it zeroed) that is drawn
++ * into: CoreAnimation makes a new full-screen one every frame (1125x2436, 10.8 MB), and surface_to_texture()
++ * copied its zeroes into the texture with the CPU (~5 ms of the render thread a frame). The texture made
++ * without contents and cleared by the GPU instead. /usr/local/gltest/gl_no_fresh_clear: as before.
++ */
++static int
++no_fresh_clear(void)
++{
++	static int no = -1;
++	if (no < 0) {
++		struct stat flag;
++		no = stat("/usr/local/gltest/gl_no_fresh_clear", &flag) == 0;
++	}
++	return no;
++}
++
++static void
++texture_cleared(struct eagl *e, struct image *image)
++{
++	GLint fb = 0, scissor = 0;
++	GLfloat colour[4];
++	GLboolean mask[4];
++	static unsigned told;
++
++	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
++	    image->format, image->type, NULL);
++	glGetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
++	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
++	glGetBooleanv(0x0C23 /* GL_COLOR_WRITEMASK */, mask);
++	scissor = glIsEnabled(GL_SCISSOR_TEST);
++	if (e->reader == 0) {
++		glGenFramebuffers(1, &e->reader);
++	}
++	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
++	glDisable(GL_SCISSOR_TEST);
++	glColorMask(1, 1, 1, 1);
++	glClearColor(0, 0, 0, 0);
++	glClear(GL_COLOR_BUFFER_BIT);
++	glClearColor(colour[0], colour[1], colour[2], colour[3]);
++	glColorMask(mask[0], mask[1], mask[2], mask[3]);
++	if (scissor) {
++		glEnable(GL_SCISSOR_TEST);
++	}
++	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
++	image->seed = 0;
++	if (told++ < 3) {
++		say("redwood-gl: -attachImage: texture %u is new IOSurface %u (%dx%d, never written): cleared by the GPU, not copied\n",
++		    image->texture, IOSurfaceGetID(image->surface), image->width, image->height);
++	}
++}
++
+ /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
+ static void
+ target_to_surface(struct eagl *e, struct image *image)
+@@ -1057,6 +1111,7 @@
+ 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+ 			IOSurfaceUnlock(surface, 0, NULL);
+ 		}
++		image->out_seed = IOSurfaceGetSeed(surface);
+ 		return;
+ 	}
+ 	if (image->shared) {
+@@ -4984,6 +5039,31 @@
+ 	clear_now(e);
+ 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+ 	pixels = IOSurfaceGetPixelFormat(surface);
++	{
++		/*
++		 * (raphael 2026-11-03) CoreAnimation attaches its display surface to the same texture again every
++		 * frame. When nobody has written the surface since our last frame went into it (its seed is the
++		 * one target_to_surface() left), the texture holds what the surface holds already: no new mirror,
++		 * no CPU copy of the whole surface into the texture (10.8 MB, ~5 ms of the render thread a frame,
++		 * the frames' start ~8 ms after the tick). /usr/local/gltest/gl_no_reattach_skip: as before.
++		 */
++		static int skip_on = -1;
++		static unsigned skipped;
++		struct image *was = texture != 0 ? image_of(e, (GLuint)texture) : NULL;
++		if (skip_on < 0) {
++			struct stat flag;
++			skip_on = stat("/usr/local/gltest/gl_no_reattach_skip", &flag) != 0;
++		}
++		if (skip_on && was != NULL && was->surface == surface && was->target && was->mirror != 0 && was->out_seed != 0 &&
++		    was->invert == (inverted ? true : false) && IOSurfaceGetSeed(surface) == was->out_seed) {
++			if (skipped++ < 3) {
++				say("redwood-gl: -attachImage: texture %d is IOSurface %u again, unchanged since our frame: kept\n", texture,
++				    IOSurfaceGetID(surface));
++			}
++			eagl_leave(e, 0);
++			return YES;
++		}
++	}
+ 	{ static int n70; if (n70++ < 12) { void *ci = *(void **)((char *)surface + 0x70);
+ 	    say("redwood-gl: PROBE70 surf %p [+0x70]=%p fmt '%.4s' planes %zu\n", (void *)surface, ci,
+ 	        (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, IOSurfaceGetPlaneCount(surface)); } }
+@@ -5041,7 +5121,11 @@
+ 	began = now_us();
+ 	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
+ 		surface_changed(e, image);              /* (what it adds up to now) */
+-		surface_to_texture(e, image);
++		if (image->mirror != 0 && IOSurfaceGetSeed(surface) == 0 && !image->alpha_first && !no_fresh_clear()) {
++			texture_cleared(e, image);
++		} else {
++			surface_to_texture(e, image);
++		}
+ 	}
+ 	e->attaching += now_us() - began;
+ 	if (attached++ < 24) {
