@@ -5,7 +5,7 @@
 # a finger "down", so it first waits until the previous sequence has had time to end.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-HIDTOUCH=${HIDTOUCH:-/home/marnov/xmiphones/davinci-ios/gpu/userland/metal/hidtouch}
+HIDTOUCH=${HIDTOUCH:-out/userland/hidtouch}     # (raphael copy: moves every 4 ms on real-time deadlines)
 END=/tmp/raphael_touch_busy_until
 now=$(date +%s%N)
 if [ -f $END ] && [ "$(cat $END)" -gt "$now" ]; then

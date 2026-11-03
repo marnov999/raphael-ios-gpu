@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a5ada5a..e37581c 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -146,7 +146,7 @@ keys_wait(void)
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int state[3] = {0, 0, 0};
++	int state[3] = {0, 0, 0}, seen[3] = {0, 0, 0};
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
+@@ -163,8 +163,21 @@ keys_thread(void *arg, wait_result_t result)
+ 		} else {
+ 			errors = 0;
+ 		}
++		/*
++		 * A change counts once two looks in a row (20 ms apart) agree on it: a lone look saying "down"
++		 * pressed volume up by itself on raphael (2026-11-03: down, up at the next look, nobody at the
++		 * phone), as davinci's ghost button presses -- an SPMI read now and then returns junk (sweet_rtc).
++		 */
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			if (!(k == 1 ? gok : pok) || now[k] == state[k]) {
++				seen[k] = 0;
++				continue;
++			}
++			if (++seen[k] < 2) {
++				continue;
++			}
++			seen[k] = 0;
++			{
+ 				state[k] = now[k];
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e227e1b..fa48f9a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -309,6 +309,7 @@ public:
+ 	/* raphael, boot-arg sweetfb_telock=1: the ticks on the panel's TEs (the panel's period, measured) */
+ 	uint64_t      fTePeriod;      /* abs time a TE, measured over seconds (0: not yet) */
+ 	uint64_t      fTeRefAt;       /* a TE some seconds ago */
++	uint64_t      fTickLead;      /* sweetfb_telead: ticks this long after the TE, said to be at the TE */
+ 	bool          fTeLock;
+ 	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled);
+ 	void scanBack(void);
+@@ -664,6 +665,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * deadline, not whenever this ran.
+ 	 */
+ 	uint64_t at = fb->fNextTick != 0 && fb->fNextTick <= now ? fb->fNextTick : now;
++	/*
++	 * (raphael, sweetfb_telock=1 with sweetfb_telead) The vsync as the panel's TE, though it is sent the lead
++	 * after it: the programs' display links run on the times they are told (CA_HEARTBEAT_RATE), commit a ms
++	 * or so after the TE, and the window server, which draws when this comes, had drawn already -- the
++	 * commit raced the drawing at every frame, and lost ~5% of them (a refresh with nothing new).
++	 */
++	if (fb->fTickLead != 0 && at == fb->fNextTick && at > fb->fTickLead) {
++		at -= fb->fTickLead;
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)at, (uint32_t)(at >> 32),
+ 		(uint32_t)at, (uint32_t)(at >> 32),
+@@ -847,6 +857,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 						(void)PE_parse_boot_argn("sweetfb_telead", &lead_us, sizeof(lead_us));
+ 					}
+ 					nanoseconds_to_absolutetime((uint64_t)lead_us * 1000ull, &lead);
++					fb->fTickLead = lead;
+ 					uint64_t k = (now + pp / 2 - te_at) / pp + 1;
+ 					fb->fNextTick = te_at + k * pp + lead;
+ 				}

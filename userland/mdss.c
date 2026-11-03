@@ -7,6 +7,7 @@
  *   mdss dcs B B .. [, B B ..]   DCS long writes to the panel, one packet per comma-separated group
  *   mdss te [SECS]               the panel's TEs for SECS (3): rate, period min/mean/max
  *   mdss touch 0|1               the touchscreen's own touches off (kern.sweet_touch_mute) / on
+ *   mdss kill NAME               SIGKILL to the processes of that name
  *   mdss key N                   a button pressed and let go (0 power, 1 volume up, 2 volume down)
  *   mdss sysctl NAME [N [MS]]    a 32-bit sysctl, N times MS apart
  *   mdss line [MS]               the tear check's read pointer every 0.1 ms for MS (20): line, us
@@ -17,6 +18,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <signal.h>
 #include <mach/mach_time.h>
 
 struct req {
@@ -213,6 +215,29 @@ main(int argc, char **argv)
 			return 1;
 		}
 		printf("touchscreen %s\n", mute ? "muted (injected touches only)" : "on");
+		return 0;
+	}
+	if (strcmp(argv[1], "kill") == 0 && argc >= 3) {       /* kill NAME: SIGKILL to every process of that name */
+		int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+		size_t len = 0;
+		if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0) {
+			perror("kern.proc");
+			return 1;
+		}
+		len += len / 4;
+		struct kinfo_proc *kp = malloc(len);
+		if (kp == NULL || sysctl(mib, 3, kp, &len, NULL, 0) != 0) {
+			perror("kern.proc");
+			return 1;
+		}
+		int killed = 0;
+		for (size_t i = 0; i < len / sizeof(*kp); i++) {
+			if (strcmp(kp[i].kp_proc.p_comm, argv[2]) == 0) {
+				printf("kill %s pid %d: %d\n", argv[2], kp[i].kp_proc.p_pid, kill(kp[i].kp_proc.p_pid, SIGKILL));
+				killed++;
+			}
+		}
+		printf("%d killed\n", killed);
 		return 0;
 	}
 	if (strcmp(argv[1], "key") == 0 && argc >= 3) {        /* key N: a button pressed (0 power, 1 volume up, 2 down) */

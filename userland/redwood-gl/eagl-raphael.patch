@@ -1,6 +1,18 @@
---- a/eagl.c
-+++ b/eagl.c
-@@ -258,6 +258,7 @@
+--- a/eagl.c	2026-11-03 23:22:00.456412083 +0100
++++ b/eagl.c	2026-11-03 23:31:57.832002086 +0100
+@@ -191,6 +191,11 @@
+ 	write(2, line, (size_t)n);
+ }
+ 
++/* (raphael) cahook.c: CoreAnimation's render server's vsyncs, renders and commits, timed (gl_cahook) */
++int ch_install(void (*say)(const char *, ...));
++void ch_dump(void (*say)(const char *, ...));
++static int cahook_on;
++
+ static void
+ eagl_trace(const char *format, ...)
+ {
+@@ -258,6 +263,7 @@
  	uint64_t sum;                   /* ... and what it added up to */
  	GLenum to, internal, format, type;
  	uint32_t plane, seed;
@@ -8,7 +20,7 @@
  	GLsizei width, height;
  };
  
-@@ -1025,6 +1026,59 @@
+@@ -1025,6 +1031,59 @@
  	e->upload_bytes += row * (size_t)image->height;
  }
  
@@ -68,7 +80,7 @@
  /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
  static void
  target_to_surface(struct eagl *e, struct image *image)
-@@ -1057,6 +1111,7 @@
+@@ -1057,6 +1116,7 @@
  		if (IOSurfaceLock(surface, 0, NULL) == 0) {
  			IOSurfaceUnlock(surface, 0, NULL);
  		}
@@ -76,7 +88,18 @@
  		return;
  	}
  	if (image->shared) {
-@@ -4984,6 +5039,31 @@
+@@ -1383,6 +1443,10 @@
+ {
+ 	static unsigned unfollowed;
+ 
++	if (cahook_on && (e->frames & 7u) == 0) {
++		ch_dump(say);
++	}
++
+ 	gl_release_soon = true;         /* (the context is let go when this call is over: eagl_leave()) */
+ 	frame_thread = pthread_self();
+ 	frame_thread_known = true;
+@@ -4984,6 +5048,31 @@
  	clear_now(e);
  	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
  	pixels = IOSurfaceGetPixelFormat(surface);
@@ -108,7 +131,7 @@
  	{ static int n70; if (n70++ < 12) { void *ci = *(void **)((char *)surface + 0x70);
  	    say("redwood-gl: PROBE70 surf %p [+0x70]=%p fmt '%.4s' planes %zu\n", (void *)surface, ci,
  	        (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, IOSurfaceGetPlaneCount(surface)); } }
-@@ -5041,7 +5121,11 @@
+@@ -5041,7 +5130,11 @@
  	began = now_us();
  	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
  		surface_changed(e, image);              /* (what it adds up to now) */
@@ -121,3 +144,67 @@
  	}
  	e->attaching += now_us() - began;
  	if (attached++ < 24) {
+@@ -5254,6 +5347,45 @@
+ 		return;
+ 	}
+ 	setenv("CA_FORCE_TIMER", "1", 1);
++	{
++		/*
++		 * (raphael 2026-11-03) The display's heartbeat, which every program's display links run at: QuartzCore's
++		 * AppleCLCDDisplay::heartbeat_rate takes CA_HEARTBEAT_RATE (Hz) first, else timing of the display's it
++		 * does not get here -- it said 60 Hz (CADisplay refreshRate 0.016667) with the panel at 81, and
++		 * SpringBoard's page animations ran at 60 on it: 1 refresh in 4 with nothing new. The rate the
++		 * framebuffer publishes (TimingElements, VerticalAttributes PreciseSyncRate, 16.16).
++		 */
++		io_service_t display = IOServiceGetMatchingService(0, IOServiceMatching("IOMobileFramebuffer"));
++		CFTypeRef timings = display ? IORegistryEntryCreateCFProperty(display, CFSTR("TimingElements"), kCFAllocatorDefault, 0) : NULL;
++		double hz = 0;
++		if (timings != NULL && CFGetTypeID(timings) == CFArrayGetTypeID() && CFArrayGetCount(timings) > 0) {
++			CFDictionaryRef t = CFArrayGetValueAtIndex(timings, 0), v = NULL;
++			CFNumberRef rate = NULL;
++			int64_t fixed = 0;
++			if (CFGetTypeID(t) == CFDictionaryGetTypeID()) {
++				v = CFDictionaryGetValue(t, CFSTR("VerticalAttributes"));
++			}
++			if (v != NULL && CFGetTypeID(v) == CFDictionaryGetTypeID()) {
++				rate = CFDictionaryGetValue(v, CFSTR("PreciseSyncRate"));
++			}
++			if (rate != NULL && CFGetTypeID(rate) == CFNumberGetTypeID() && CFNumberGetValue(rate, kCFNumberSInt64Type, &fixed)) {
++				hz = (double)fixed / 65536.0;
++			}
++		}
++		if (timings != NULL) {
++			CFRelease(timings);
++		}
++		if (display) {
++			IOObjectRelease(display);
++		}
++		if (hz >= 30 && hz <= 240 && getenv("CA_HEARTBEAT_RATE") == NULL) {
++			char value[32];
++			snprintf(value, sizeof(value), "%.3f", hz);
++			setenv("CA_HEARTBEAT_RATE", value, 1);
++		}
++		say("redwood-gl: CoreAnimation's heartbeat: CA_HEARTBEAT_RATE %s (the display's timing: %.3f Hz)\n",
++		    getenv("CA_HEARTBEAT_RATE") ? getenv("CA_HEARTBEAT_RATE") : "not set", hz);
++	}
+ 	anchor = dlsym(RTLD_DEFAULT, "CACurrentMediaTime");
+ 	if (anchor != NULL) {
+ 		intptr_t slide = (intptr_t)anchor - (intptr_t)0x1882c1cc4;
+@@ -5272,6 +5404,17 @@
+ install(void)
+ {
+ 	use_vbl();
++	{
++		/* (a "1" in it: on; the file cannot be taken away by the dev loop, a "0" puts it off) */
++		char on = 0;
++		int fd = open("/usr/local/gltest/gl_cahook", O_RDONLY);
++		if (fd >= 0) {
++			if (read(fd, &on, 1) == 1 && on == '1') {
++				cahook_on = ch_install(say) > 0;
++			}
++			close(fd);
++		}
++	}
+ 	static const struct {
+ 		const char *name;
+ 		IMP ours;

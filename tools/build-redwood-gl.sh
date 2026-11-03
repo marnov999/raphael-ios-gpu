@@ -17,7 +17,7 @@ patch -s -d "$W" -p1 < userland/redwood-gl/eagl-raphael.patch
 export PATH=/home/marnov/xmiphones/kbuild/proton-clang/bin:$PATH
 python3 "$MKEAGL" "$SLOTS" "$MESA/src-mesa/src/mapi/glapi/registry/gl.xml" "$W/obj/exported-gl.txt" "$W/eagl.c" > "$W/obj/eagl_gen.h"
 "$CLANG" -target arm64-apple-ios16.0 -O2 -isysroot "$SDK" -I"$W/obj" -I"$W" -I"$MESA/src-mesa/include" -fuse-ld=lld -dynamiclib \
-	-install_name /usr/local/lib/libredwood-gl.dylib -o out/userland/libredwood-gl.dylib "$W/eagl.c" "$W/redwood_gl_egl.c" \
+	-install_name /usr/local/lib/libredwood-gl.dylib -o out/userland/libredwood-gl.dylib "$W/eagl.c" "$W/redwood_gl_egl.c" userland/redwood-gl/cahook.c userland/redwood-gl/cahook.S \
 	"$MESA/gltest/libEGL.1.dylib" "$MESA/gltest/libGLESv2.2.dylib" -framework CoreFoundation -framework IOKit -framework IOSurface \
 	-lobjc -Wl,-rpath,@loader_path
 "$LDID" -Hsha256 -Cadhoc -S out/userland/libredwood-gl.dylib
