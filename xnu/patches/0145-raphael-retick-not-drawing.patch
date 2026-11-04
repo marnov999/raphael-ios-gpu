@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 891f567..67fbced 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1987,6 +1987,8 @@ static int                g_kgsl_ready;  /* submit path live */
+  * entry translation-faults (fsr.TF) the new region. */
+ extern void IODelay(unsigned microseconds);       /* IOKit/IOLib.h */
+ /* (how the syncs went, for the five-second line: done in the busy look, done later, never; their time) */
++uint64_t sweet_ws_submit_at;            /* (mach time; read by SweetFramebuffer.cpp) */
++extern task_t current_task(void);
+ static uint32_t g_tlb_quick, g_tlb_slow, g_tlb_never;
+ /* (drm_ioctl's waits, for the five-second line) */
+ static uint32_t g_prep_calls, g_prep_zero, g_prep_nosync, g_waitf_calls;
+@@ -3719,6 +3721,14 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");             /* and what was written last is in memory */
+ 	sweet_dvfs_kick();
++	{
++		/* (when the window server last gave the GPU work: SweetFramebuffer's retick sends a tick's vsync again
++		 * only when it has not begun drawing since -- else it drew that tick twice) */
++		extern task_t sweet_window_server_task;
++		if (sweet_window_server_task != TASK_NULL && current_task() == sweet_window_server_task) {
++			sweet_ws_submit_at = mach_absolute_time();
++		}
++	}
+ 	fence = gpu_submit(ibva, ibdw, n);
+ 	if (fence == 0) {
+ 		return EIO;                                      /* the ring stayed full: the core is not reading it */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1740ef8..5c3d063 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -69,6 +69,7 @@ extern "C" int sweet_panel_set_hz(uint32_t hz);                 /* bsd/dev/sweet
+ extern "C" uint32_t sweet_panel_rate(void);                     /* (milli-Hz, now) */
+ #endif
+ extern "C" void sweet_dvfs_kick(void);      /* bsd/dev/sweet_gpu.c: wake the clocks (something is drawn) */
++extern "C" uint64_t sweet_ws_submit_at;     /* bsd/dev/sweet_gpu.c: the window server's last GPU submission */
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -904,7 +905,7 @@ AppleCLCD::retickFired(OSObject *owner, __unused IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	IOLockLock(fb->fLock);
+-	if (fb->fLastSwapAt < fb->fTickAt) {
++	if (fb->fLastSwapAt < fb->fTickAt && sweet_ws_submit_at < fb->fTickAt) {
+ 		for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 			((IOMobileFramebufferUserClient *)fb->fClients->getObject(i))->notify(SWEET_FB_NOTIFY_VSYNC, fb->fTickValues, 6);
+ 		}
