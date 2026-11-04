@@ -1,0 +1,93 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 08dfb2f..c7e124a 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -540,6 +540,8 @@ uint32_t sweet_fb_scanout_id;
+ /* (raphael) the vsync again US after a tick with no swap since (0: off), and only if the window server is not drawing: SweetFramebuffer.cpp */
+ extern uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_us, 0, "vsync again us after a tick with no swap");
++extern uint32_t sweet_big_sb;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_big_sb, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_big_sb, 0, "SpringBoard's threads to the big cores as the window server's");
+ extern uint32_t sweet_fb_drawtick;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_drawtick, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_drawtick, 0, "a frame flipped by the tick its drawing began");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_idle, 0, "retick only when not drawing");
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2f39ed7..ebe6418 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1056,6 +1056,17 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+ 	fRefs = OSArray::withCapacity(16);
++#if defined(ARM64_BOARD_CONFIG_RAPHAEL)
++	{
++		/* SpringBoard: its threads to the big cores as the window server's (osfmk/kern/sched_prim.c) */
++		extern task_t sweet_ui_server_task;
++		char name[32] = "";
++		proc_selfname(name, sizeof(name));
++		if (strcmp(name, "SpringBoard") == 0) {
++			sweet_ui_server_task = owningTask;
++		}
++	}
++#endif
+ 	return fLock != NULL && fRefs != NULL;
+ }
+ 
+diff --git a/osfmk/kern/sched_dualq.c b/osfmk/kern/sched_dualq.c
+index 27feba7..9f8f8f3 100644
+--- a/osfmk/kern/sched_dualq.c
++++ b/osfmk/kern/sched_dualq.c
+@@ -261,7 +261,7 @@ sched_dualq_choose_thread(
+ 		 * render thread's time in the frames that took over 14 ms, 4% in the others).
+ 		 * Boot-arg sweetbig_nosteal=0: as before.
+ 		 */
+-		extern task_t sweet_window_server_task;
++		extern task_t sweet_window_server_task, sweet_ui_server_task;
+ 		static int nosteal = -1;
+ 		static uint64_t patience;
+ 		if (nosteal < 0) {
+@@ -278,7 +278,8 @@ sched_dualq_choose_thread(
+ 		if (nosteal && processor->cpu_id < SWEET_BIG_CPU) {
+ 			thread_t head = run_queue_peek(main_runq);
+ 			if (head != THREAD_NULL && head->sched_pri >= 46 && head->sched_pri < BASEPRI_RTQUEUES &&
+-			    (nosteal >= 2 || (sweet_window_server_task != TASK_NULL && get_threadtask(head) == sweet_window_server_task)) &&
++			    (nosteal >= 2 || (sweet_window_server_task != TASK_NULL && get_threadtask(head) == sweet_window_server_task) ||
++			    (sweet_ui_server_task != TASK_NULL && get_threadtask(head) == sweet_ui_server_task)) &&
+ 			    mach_absolute_time() - head->last_made_runnable_time < patience) {
+ 				return THREAD_NULL;
+ 			}
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 52fed13..7a0c0e2 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5029,6 +5029,14 @@ choose_next_pset(
+ #define SWEET_BIG_CPU 6         /* SM7150: cpu0-5 Cortex-A55, cpu6-7 Cortex-A76 */
+ #endif
+ task_t sweet_window_server_task;        /* backboardd, once it opens the display (SweetFramebuffer.cpp) */
++/*
++ * (raphael) SpringBoard, once it opens IOSurface (SweetSurface.cpp): as the window server's -- its main thread
++ * builds each frame of the home screen's and app launches' animations, and ran 15% of those frames on the
++ * little cores (2-3 times slower), the commits that came after the window server's vsync (u32 Settings).
++ * Boot-arg sweetbig_sb=0: not.
++ */
++task_t sweet_ui_server_task;
++uint32_t sweet_big_sb = 1;              /* (kern.sweet_big_sb, bsd/kern/sweet_amfi.c) */
+ #endif
+ 
+ processor_t
+@@ -5071,7 +5079,14 @@ choose_processor(
+ 		 * to the big core running the least urgent thread (preempting it if less urgent than
+ 		 * itself, else queued there). sweetbig=1: only an idle big core, or a less urgent one.
+ 		 */
+-		bool window_server = sweet_window_server_task != TASK_NULL && get_threadtask(thread) == sweet_window_server_task;
++		static int sb_asked;
++		if (!sb_asked) {
++			sb_asked = 1;
++			(void)PE_parse_boot_argn("sweetbig_sb", &sweet_big_sb, sizeof(sweet_big_sb));
++		}
++		bool sb_too = sweet_big_sb != 0;
++		bool window_server = (sweet_window_server_task != TASK_NULL && get_threadtask(thread) == sweet_window_server_task) ||
++		    (sb_too && sweet_ui_server_task != TASK_NULL && get_threadtask(thread) == sweet_ui_server_task);
+ 		if (big_first && (thread->sched_pri >= 46 || (big_first == 2 && window_server && thread->sched_pri >= 20)) &&
+ 		    thread->sched_pri < BASEPRI_RTQUEUES) {
+ 			processor_t busy = PROCESSOR_NULL, least = PROCESSOR_NULL;
