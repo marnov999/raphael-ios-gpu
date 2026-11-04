@@ -7,8 +7,10 @@
  *   mdss dcs B B .. [, B B ..]   DCS long writes to the panel, one packet per comma-separated group
  *   mdss te [SECS]               the panel's TEs for SECS (3): rate, period min/mean/max
  *   mdss touch 0|1               the touchscreen's own touches off (kern.sweet_touch_mute) / on
+ *   mdss top [SECS]              the processes that used the most CPU over SECS (% of one core)
  *   mdss kill NAME               SIGKILL to the processes of that name
  *   mdss key N                   a button pressed and let go (0 power, 1 volume up, 2 volume down)
+ *   mdss sysctlw NAME VALUE      a 32-bit sysctl set
  *   mdss sysctl NAME [N [MS]]    a 32-bit sysctl, N times MS apart
  *   mdss line [MS]               the tear check's read pointer every 0.1 ms for MS (20): line, us
  */
@@ -19,6 +21,10 @@
 #include <unistd.h>
 #include <sys/sysctl.h>
 #include <signal.h>
+int proc_listallpids(void *buffer, int buffersize);       /* (libproc, not in this SDK) */
+int proc_name(int pid, void *buffer, uint32_t buffersize);
+int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);
+#include <sys/resource.h>
 #include <mach/mach_time.h>
 
 struct req {
@@ -217,6 +223,48 @@ main(int argc, char **argv)
 		printf("touchscreen %s\n", mute ? "muted (injected touches only)" : "on");
 		return 0;
 	}
+	if (strcmp(argv[1], "top") == 0) {                     /* top [SECS]: the processes that used the most CPU over SECS (3) */
+		double secs = argc >= 3 ? atof(argv[2]) : 3.0;
+		static struct { int pid; uint64_t t0; char name[32]; } p[2048];
+		int n = 0, pids[2048];
+		int got = proc_listallpids(pids, sizeof(pids));
+		for (int i = 0; i < got && n < 2048; i++) {
+			struct rusage_info_v0 ri;
+			if (proc_pid_rusage(pids[i], RUSAGE_INFO_V0, (rusage_info_t *)&ri) == 0) {
+				p[n].pid = pids[i];
+				p[n].t0 = ri.ri_user_time + ri.ri_system_time;
+				proc_name(pids[i], p[n].name, sizeof(p[n].name));
+				n++;
+			}
+		}
+		usleep((useconds_t)(secs * 1e6));
+		struct { double pct; int i; } top[2048];
+		int m = 0;
+		mach_timebase_info_data_t tb;
+		mach_timebase_info(&tb);
+		for (int i = 0; i < n; i++) {
+			struct rusage_info_v0 ri;
+			if (proc_pid_rusage(p[i].pid, RUSAGE_INFO_V0, (rusage_info_t *)&ri) == 0) {
+				uint64_t d = ri.ri_user_time + ri.ri_system_time - p[i].t0;      /* (mach time units) */
+				top[m].pct = (double)d * tb.numer / tb.denom / 1e9 / secs * 100.0;
+				top[m].i = i;
+				m++;
+			}
+		}
+		for (int a = 0; a < m; a++) {
+			for (int b = a + 1; b < m; b++) {
+				if (top[b].pct > top[a].pct) {
+					__typeof__(top[0]) t = top[a];
+					top[a] = top[b];
+					top[b] = t;
+				}
+			}
+		}
+		for (int a = 0; a < m && a < 12; a++) {
+			printf("%6.1f%%  %5d %s\n", top[a].pct, p[top[a].i].pid, p[top[a].i].name);
+		}
+		return 0;
+	}
 	if (strcmp(argv[1], "kill") == 0 && argc >= 3) {       /* kill NAME: SIGKILL to every process of that name */
 		int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
 		size_t len = 0;
@@ -247,6 +295,16 @@ main(int argc, char **argv)
 			return 1;
 		}
 		printf("key %d pressed\n", key);
+		return 0;
+	}
+	if (strcmp(argv[1], "sysctlw") == 0 && argc >= 4) {    /* sysctlw NAME VALUE: a 32-bit sysctl set */
+		uint32_t v = (uint32_t)strtoul(argv[3], NULL, 0), old = 0;
+		size_t len = sizeof(old);
+		if (sysctlbyname(argv[2], &old, &len, &v, sizeof(v)) != 0) {
+			perror(argv[2]);
+			return 1;
+		}
+		printf("%s: %u -> %u\n", argv[2], old, v);
 		return 0;
 	}
 	if (strcmp(argv[1], "sysctl") == 0 && argc >= 3) {    /* sysctl NAME [COUNT [MS]]: a 32-bit sysctl, COUNT times MS apart */

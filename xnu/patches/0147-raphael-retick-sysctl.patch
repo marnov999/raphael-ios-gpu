@@ -1,0 +1,98 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 9790f0a..6c9f5d8 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -537,6 +537,10 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_rtc, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCK
+  * went stale whenever backboardd's buffers changed (and a frozen phone looked like a live one).
+  */
+ uint32_t sweet_fb_scanout_id;
++/* (raphael) the vsync again US after a tick with no swap since (0: off), and only if the window server is not drawing: SweetFramebuffer.cpp */
++extern uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_us, 0, "vsync again us after a tick with no swap");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_idle, 0, "retick only when not drawing");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_scanout_id, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_scanout_id, 0,
+     "IOSurface id scanned out now");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 49cf9f1..4112ef9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -200,6 +200,9 @@ sweet_fb_timeline(int on)
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               sweet_fb_vsync_us
++/* (raphael) sweetfb_retick / sweetfb_retick_idle, and kern.sweet_fb_retick* (bsd/kern/sweet_amfi.c) */
++extern "C" uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
++uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
+ /* the panel's refresh as told to CoreAnimation, and the free-running tick's period (boot-arg sweetfb_rate, Hz: 60) */
+ static uint32_t sweet_fb_rate = 60, sweet_fb_vsync_us = 16667;
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+@@ -239,7 +242,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	 */
+ 	IOTimerEventSource *fRetick;
+ 	uint64_t            fTickValues[6], fTickAt, fLastSwapAt;
+-	uint32_t            fRetickUS, fReticks;
++	uint32_t            fReticks;
+ 	static void retickFired(OSObject *owner, IOTimerEventSource *sender);
+ 	uint64_t            fVsyncCount;
+ 
+@@ -528,12 +531,11 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
+-	(void)PE_parse_boot_argn("sweetfb_retick", &fRetickUS, sizeof(fRetickUS));
+-	if (fRetickUS != 0) {
+-		fRetick = IOTimerEventSource::timerEventSource(this, &AppleCLCD::retickFired);
+-		if (fRetick == NULL || fWorkLoop->addEventSource(fRetick) != kIOReturnSuccess) {
+-			fRetickUS = 0;
+-		}
++	(void)PE_parse_boot_argn("sweetfb_retick", &sweet_fb_retick_us, sizeof(sweet_fb_retick_us));
++	(void)PE_parse_boot_argn("sweetfb_retick_idle", &sweet_fb_retick_idle, sizeof(sweet_fb_retick_idle));
++	fRetick = IOTimerEventSource::timerEventSource(this, &AppleCLCD::retickFired);
++	if (fRetick != NULL && fWorkLoop->addEventSource(fRetick) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fRetick);
+ 	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+@@ -706,10 +708,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fVsyncDropped++;
+ 		}
+ 	}
+-	if (fb->fRetickUS != 0 && fb->fRetick != NULL) {
++	if (sweet_fb_retick_us != 0 && fb->fRetick != NULL) {
+ 		memcpy(fb->fTickValues, values, sizeof(values));
+ 		fb->fTickAt = now;
+-		fb->fRetick->setTimeoutUS(fb->fRetickUS);
++		fb->fRetick->setTimeoutUS(sweet_fb_retick_us);
+ 	}
+ 	if (0 && fb->fPowerOff) {   /* POWER-OFF HANDLING DISABLED: backboardd auto-dims the display
+ 	                             * seconds after boot (no backlight service), which skipped the panel
+@@ -791,8 +793,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					    fb->fRateSwaps, fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull,
+ 					    pns != 0 ? 1000000000000ull / pns / 1000ull : 0, pns != 0 ? 1000000000000ull / pns % 1000ull : 0,
+ 					    fb->fTeLock ? ", ticks on its TEs" : "", fb->fVsyncDropped);
+-					if (fb->fRetickUS != 0) {
+-						IOLog("SWEET FPS: %u vsyncs sent again (no swap %u us after the tick)\n", fb->fReticks, fb->fRetickUS);
++					if (sweet_fb_retick_us != 0) {
++						IOLog("SWEET FPS: %u vsyncs sent again (no swap %u us after the tick)\n", fb->fReticks, sweet_fb_retick_us);
+ 						fb->fReticks = 0;
+ 					}
+ 					fb->fVsyncDropped = 0;
+@@ -908,14 +910,10 @@ AppleCLCD::retickFired(OSObject *owner, __unused IOTimerEventSource *sender)
+ 	/*
+ 	 * Also when the window server is drawing the tick's frame already: a commit that came in meanwhile is in
+ 	 * the second drawing, which replaces the first before the flip (sweetfb_depth=2) -- the late commits
+-	 * shown in time; only when it has not begun (boot-arg sweetfb_retick_idle=1), 1 in 40 frames went
+-	 * unseen again against 1 in 120 (u28-u29).
++	 * shown in time; only when it has not begun (sweetfb_retick_idle=1), 1 in 40 frames went unseen again
++	 * against 1 in 120 (u28-u29). Both kern.sweet_fb_retick* too, to compare within a boot.
+ 	 */
+-	static int idle_only = -1;
+-	if (idle_only < 0) {
+-		idle_only = 0;
+-		(void)PE_parse_boot_argn("sweetfb_retick_idle", &idle_only, sizeof(idle_only));
+-	}
++	int idle_only = sweet_fb_retick_idle;
+ 	if (fb->fLastSwapAt < fb->fTickAt && (!idle_only || sweet_ws_submit_at < fb->fTickAt)) {
+ 		for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 			((IOMobileFramebufferUserClient *)fb->fClients->getObject(i))->notify(SWEET_FB_NOTIFY_VSYNC, fb->fTickValues, 6);
