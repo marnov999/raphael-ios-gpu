@@ -1,0 +1,87 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fa48f9a..1740ef8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -230,6 +230,16 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
++	/*
++	 * (raphael, boot-arg sweetfb_retick=US) The tick's vsync once more, US after it, when no swap has come
++	 * since: a program's commit that missed the window server's drawing at the tick (it came a ms or two
++	 * after) was drawn at the next tick only -- a refresh with nothing new, 1-2% of an animation's (u22-u27).
++	 * Drawn now, it is still flipped at the next tick (sweetfb_depth=2) and shown in time.
++	 */
++	IOTimerEventSource *fRetick;
++	uint64_t            fTickValues[6], fTickAt, fLastSwapAt;
++	uint32_t            fRetickUS, fReticks;
++	static void retickFired(OSObject *owner, IOTimerEventSource *sender);
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+@@ -517,6 +527,13 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	(void)PE_parse_boot_argn("sweetfb_retick", &fRetickUS, sizeof(fRetickUS));
++	if (fRetickUS != 0) {
++		fRetick = IOTimerEventSource::timerEventSource(this, &AppleCLCD::retickFired);
++		if (fRetick == NULL || fWorkLoop->addEventSource(fRetick) != kIOReturnSuccess) {
++			fRetickUS = 0;
++		}
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -688,6 +705,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fVsyncDropped++;
+ 		}
+ 	}
++	if (fb->fRetickUS != 0 && fb->fRetick != NULL) {
++		memcpy(fb->fTickValues, values, sizeof(values));
++		fb->fTickAt = now;
++		fb->fRetick->setTimeoutUS(fb->fRetickUS);
++	}
+ 	if (0 && fb->fPowerOff) {   /* POWER-OFF HANDLING DISABLED: backboardd auto-dims the display
+ 	                             * seconds after boot (no backlight service), which skipped the panel
+ 	                             * flush and left the screen black. Keep flushing the live rendered
+@@ -768,6 +790,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					    fb->fRateSwaps, fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull,
+ 					    pns != 0 ? 1000000000000ull / pns / 1000ull : 0, pns != 0 ? 1000000000000ull / pns % 1000ull : 0,
+ 					    fb->fTeLock ? ", ticks on its TEs" : "", fb->fVsyncDropped);
++					if (fb->fRetickUS != 0) {
++						IOLog("SWEET FPS: %u vsyncs sent again (no swap %u us after the tick)\n", fb->fReticks, fb->fRetickUS);
++						fb->fReticks = 0;
++					}
+ 					fb->fVsyncDropped = 0;
+ 				}
+ #else
+@@ -873,6 +899,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ }
+ 
++void
++AppleCLCD::retickFired(OSObject *owner, __unused IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	IOLockLock(fb->fLock);
++	if (fb->fLastSwapAt < fb->fTickAt) {
++		for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
++			((IOMobileFramebufferUserClient *)fb->fClients->getObject(i))->notify(SWEET_FB_NOTIFY_VSYNC, fb->fTickValues, 6);
++		}
++		fb->fReticks++;
++	}
++	IOLockUnlock(fb->fLock);
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -1006,6 +1046,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fPendingTick = fVsyncCount;
++	fLastSwapAt = mach_absolute_time();
+ 	fDirty = true;
+ 	fRateSwaps++;
+ 	sweet_dvfs_kick();
