@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5c3d063..49cf9f1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -905,7 +905,18 @@ AppleCLCD::retickFired(OSObject *owner, __unused IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	IOLockLock(fb->fLock);
+-	if (fb->fLastSwapAt < fb->fTickAt && sweet_ws_submit_at < fb->fTickAt) {
++	/*
++	 * Also when the window server is drawing the tick's frame already: a commit that came in meanwhile is in
++	 * the second drawing, which replaces the first before the flip (sweetfb_depth=2) -- the late commits
++	 * shown in time; only when it has not begun (boot-arg sweetfb_retick_idle=1), 1 in 40 frames went
++	 * unseen again against 1 in 120 (u28-u29).
++	 */
++	static int idle_only = -1;
++	if (idle_only < 0) {
++		idle_only = 0;
++		(void)PE_parse_boot_argn("sweetfb_retick_idle", &idle_only, sizeof(idle_only));
++	}
++	if (fb->fLastSwapAt < fb->fTickAt && (!idle_only || sweet_ws_submit_at < fb->fTickAt)) {
+ 		for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 			((IOMobileFramebufferUserClient *)fb->fClients->getObject(i))->notify(SWEET_FB_NOTIFY_VSYNC, fb->fTickValues, 6);
+ 		}
