@@ -480,3 +480,7 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - **0149 (u34/u35):** SpringBoard's threads get the window server's big-core treatment (kern.sweet_big_sb, A/B:
   1.07% vs 1.16% visible misses over 3365 frames: within noise, kept). This boot: home 1.16%, Settings 0.98%.
   Everyday image out/raphael-ios-u35.img (touch on; u34 = same with sweettouchmute=1 for benches).
+- **2026-11-04 10:58 flashed f11** to boot (sha256 a9b536cd...): u35's payload byte for byte (kernel run
+  41758673070, ADT out/raphael-full-fw-srgb.adt, ROOT=iosdata HZ=60, the 81 Hz args) packed FLASH=1
+  MIUI=backup/miui-unenc like f10 (charger mode + "Boot MIUI" kept). RAM-booted first (OK), then flashed;
+  cold boot -> panel 81.0 Hz, touch on. Rollback: backup/flashed/raphael-ios-f10.img (copy of f11 there too).
