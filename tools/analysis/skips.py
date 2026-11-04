@@ -32,9 +32,15 @@ names={0:'vsync',3:'render',5:'did_commit',6:'SB-link-cb',7:'SB-dispatch',8:'SB-
 P=statistics.median(b2-a for a,b2 in zip(ticks,ticks[1:]))
 def win(x): return bisect.bisect_right(ticks,x)-1
 skips=[]
-for k in range(1,len(sw)):
-    a0,a1=sw[k-1],sw[k]
-    if a1[1]-a0[1]<70000 and win(a1[1])-win(a0[1])>=2: skips.append(win(a0[1])+1)
+# a refresh that showed no new frame: two swaps of an animation whose flips (sw[3]) were 2+ ticks apart on the
+# panel (with sweetfb_drawtick a frame that came late can still be shown in time); the period it belongs to is
+# the one after the earlier swap came
+# (only the swaps that were flipped: one drawn again in the same tick -- sweetfb_retick -- replaces the other)
+fl=[x for x in sw if x[3]]
+for k in range(1,len(fl)):
+    a0,a1=fl[k-1],fl[k]
+    if a1[1]-a0[1]>=70000: continue
+    if win(a1[3])-win(a0[3])>=2: skips.append(win(a0[1])+1)
 def show(i,label):
     T=ticks[i]; out=[]; prev=None
     for x in ev:
@@ -74,7 +80,7 @@ for i in skips:
     elif tx[0]>=T: cls['committed after the vsync (late)']+=1; late.append((tx[0]-c)/1000)
     else: cls['committed in time (server side)']+=1
 print(dict(cls)); print('late commits: callback->commit ms',sorted(late))
-print('SUMMARY frames %d late %d server %d nolink %d nochange %d'%(len([1 for k in range(1,len(sw)) if sw[k][1]-sw[k-1][1]<70000]),cls['committed after the vsync (late)'],cls['committed in time (server side)'],cls['no SpringBoard display link in the period'],cls['link fired, nothing committed (no change)']))
+print('SUMMARY frames %d late %d server %d nolink %d nochange %d'%(len([1 for k in range(1,len(fl)) if fl[k][1]-fl[k-1][1]<70000]),cls['committed after the vsync (late)'],cls['committed in time (server side)'],cls['no SpringBoard display link in the period'],cls['link fired, nothing committed (no change)']))
 frames=len([1 for k in range(1,len(sw)) if sw[k][1]-sw[k-1][1]<70000])
 print('animation frames',frames,'real misses %.1f%%'%(100*cls['committed after the vsync (late)']/max(1,frames)))
 print('---- in-time-but-skipped detail')

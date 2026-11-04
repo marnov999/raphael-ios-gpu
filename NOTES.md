@@ -439,3 +439,41 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   flicker between stale boot fb and scanout). 0127: USB gadget recovers from bus reset / replug.
 - Debug: sweetsample=PROC (boot-arg) + ipsw dyld a2s (slide from "SMP PROC[pid] slide"); SweetGLES logs now to
   192.168.9.1:5151 (listener: tools/usblog.py out/logs/gles-5151.log 5151).
+
+### 2026-11-04 (81 Hz panel, frame pacing at 81)
+
+- **Panel at 81 Hz (xnu 0128-0129):** the EA8076's TE follows the DSI bit clock (60.214 Hz at ABL's 1103 MHz;
+  63.19/66.01/72.01/74.99/81.00 Hz measured at 1157.7/1209/1323/1378/1483.8 MHz). `sweetpanel_hz=81` reprograms
+  the DSI0 PLL between two frames (autorefresh off, _1 dividers, PLL off/on with the PHY clock gated; the vendor's
+  PHY digital reset write hangs: skipped); reboot = ABL's 60 again. Nothing flashed. Research: XDA dtbo_K20P_81Hz
+  (ZhenXin/Andy Chang), steroidraphael "84 and 90 can instantly brick your display for some" (90 needs the
+  user's OK). tools/panel-hz.sh HZ does it live.
+- **Vsync on the panel's TE (0128/0129):** the tear check's TE count field stays 0; the TE time comes from the
+  read-pointer line (INT_COUNT_VAL [15:0], 19.2 MHz / 136 per line). `sweetfb_telock=1`. The old 16.667 ms timer
+  vs the panel's 60.214 Hz doubled a frame every 4.7 s (the user's "random lag").
+- **CoreAnimation per-frame surface (0131-0141):** CA makes a NEW 13.9 MB full-screen framebuffer every frame and
+  keeps ~9 alive. Fixed costs: pool of 16-24 (`sweetsurf_pool=24`), no CPU bzero / whole-cache push-out of pool
+  buffers, import page walk by run, GPU kept imports of dead surfaces dropped, pool buffers GPU-mapped once
+  (0141), kmem_free of freed GPU buffers on a thread call (0139, the 8 ms glDeleteTextures), imports indexed by
+  surface id (0142). Prime core first for urgent threads (0140).
+- **Apps saw 60 Hz:** QuartzCore AppleCLCDDisplay::heartbeat_rate reads CA_HEARTBEAT_RATE first; libredwood-gl
+  (backboardd) now sets it from TimingElements (CADisplay refreshRate 0.012346). Phone's /usr/local/lib/
+  libredwood-gl.dylib is the new build (backup/libredwood-gl.phone-20261103.dylib = old 40f9eb3c);
+  sweet-root-overlay.py still pins the old hash: update before the next overlay.
+- **Presentation:** `sweetfb_depth=2` (a frame flipped no sooner than the tick after it is drawn for; 0148
+  kern.sweet_fb_drawtick=1: by the tick its drawing BEGAN = first window-server GPU submission). `sweetfb_telead=
+  2500` (vsync sent 2.5 ms after the TE, said to be at the TE). 6 ms lead halved CA's rate. `sweetfb_retick`
+  (0144-0147, resend the vsync) RUINS Settings (13% repeats): keep it 0 (default).
+- **Clocks:** /usr/local/gltest/clocks now "l3=14 little=17 big=16 prime=19 gpu=0" (GPU fixed 585 MHz; the
+  governor's level change waits for the whole GPU under its lock). Touches kick the CPU governor (0139, plus
+  kern.sweet_dvfs_kick from hidtouch): idle clocks made SpringBoard's first frames late.
+- **Measuring:** boot-arg sweettouchmute=1 or `mdss touch 0` (ghost touches), userland/hidtouch.c (4 ms moves on
+  real-time deadlines), tools/bench81.sh (home swipes + Settings open/close), bench81-stats.sh (rounds),
+  bench81-ab.sh (A/B by sysctl within ONE boot: boot-to-boot spread was as large as the effects),
+  tools/analysis/skips.py (every refresh without a new frame: still tails = SpringBoard committed nothing, not
+  visible; late = SpringBoard's commit after the vsync; server = window server late; uses FLIPPED frames only),
+  cahook tracer (gl_cahook / gl_cahook_sb saying 1: backboardd + SpringBoard events, libcahook via sweet_shim).
+- **Result u32/u33 (resend off, drawtick on), 3 rounds each:** median 81 fps everywhere; visible misses home
+  swipes 0.97%, Settings open/close 2.77% (late SpringBoard commits 21, window server late 21). NOT yet <1% in
+  Settings. Current boot image out/raphael-ios-u33.img (kernel run 41755528186, xnu up to 0148).
+- Next: Settings misses (app launch competes for the big cores; CA layer prep 8 ms frames); then other apps.
