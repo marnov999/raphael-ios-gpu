@@ -1,0 +1,88 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 67fbced..658c097 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1988,6 +1988,8 @@ static int                g_kgsl_ready;  /* submit path live */
+ extern void IODelay(unsigned microseconds);       /* IOKit/IOLib.h */
+ /* (how the syncs went, for the five-second line: done in the busy look, done later, never; their time) */
+ uint64_t sweet_ws_submit_at;            /* (mach time; read by SweetFramebuffer.cpp) */
++extern volatile uint64_t sweet_fb_vsync_count, sweet_fb_frame_tick;    /* SweetFramebuffer.cpp */
++extern volatile uint32_t sweet_fb_frame_open;
+ extern task_t current_task(void);
+ static uint32_t g_tlb_quick, g_tlb_slow, g_tlb_never;
+ /* (drm_ioctl's waits, for the five-second line) */
+@@ -3727,6 +3729,11 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 		extern task_t sweet_window_server_task;
+ 		if (sweet_window_server_task != TASK_NULL && current_task() == sweet_window_server_task) {
+ 			sweet_ws_submit_at = mach_absolute_time();
++			/* (the first of a frame: the tick it is drawn for -- SweetFramebuffer.cpp sweetfb_depth) */
++			if (!sweet_fb_frame_open) {
++				sweet_fb_frame_tick = sweet_fb_vsync_count;
++				sweet_fb_frame_open = 1;
++			}
+ 		}
+ 	}
+ 	fence = gpu_submit(ibva, ibdw, n);
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 6c9f5d8..08dfb2f 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -540,6 +540,8 @@ uint32_t sweet_fb_scanout_id;
+ /* (raphael) the vsync again US after a tick with no swap since (0: off), and only if the window server is not drawing: SweetFramebuffer.cpp */
+ extern uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_us, 0, "vsync again us after a tick with no swap");
++extern uint32_t sweet_fb_drawtick;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_drawtick, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_drawtick, 0, "a frame flipped by the tick its drawing began");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_idle, 0, "retick only when not drawing");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_scanout_id, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_scanout_id, 0,
+     "IOSurface id scanned out now");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4112ef9..9032262 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -203,6 +203,18 @@ sweet_fb_timeline(int on)
+ /* (raphael) sweetfb_retick / sweetfb_retick_idle, and kern.sweet_fb_retick* (bsd/kern/sweet_amfi.c) */
+ extern "C" uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
+ uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
++/*
++ * The tick a frame is drawn for (raphael, sweetfb_depth=2): the vsync count when the window server gave the
++ * GPU the frame's first work (bsd/dev/sweet_gpu.c), not when its swap came -- a frame begun at its tick
++ * that came a little after the next was flipped a tick later than its neighbours, and stayed up two
++ * refreshes (the "server" misses, half of those left, u31). Boot-arg sweetfb_drawtick=0: by the swap.
++ */
++extern "C" volatile uint64_t sweet_fb_vsync_count, sweet_fb_frame_tick;
++extern "C" volatile uint32_t sweet_fb_frame_open;
++extern "C" uint32_t sweet_fb_drawtick;
++uint32_t sweet_fb_drawtick = 1;         /* (kern.sweet_fb_drawtick, bsd/kern/sweet_amfi.c) */
++volatile uint64_t sweet_fb_vsync_count, sweet_fb_frame_tick;
++volatile uint32_t sweet_fb_frame_open;
+ /* the panel's refresh as told to CoreAnimation, and the free-running tick's period (boot-arg sweetfb_rate, Hz: 60) */
+ static uint32_t sweet_fb_rate = 60, sweet_fb_vsync_us = 16667;
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+@@ -672,6 +684,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fb_vsync_count = count;
+ 	if (sweet_tl_on && sweet_tl_nt < SWEET_TL_TICKS) {
+ 		sweet_tl_tick[sweet_tl_nt] = sweet_tl_us();
+ 		sweet_tl_nt = sweet_tl_nt + 1;
+@@ -1055,7 +1068,17 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		fHasEarly = true;
+ 	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+-	fPendingTick = fVsyncCount;
++	{
++		static int asked = 0;
++		if (!asked) {
++			asked = 1;
++			(void)PE_parse_boot_argn("sweetfb_drawtick", (void *)&sweet_fb_drawtick, sizeof(sweet_fb_drawtick));
++		}
++		/* (a frame whose drawing began more than a tick ago is not held for later: by the swap then) */
++		fPendingTick = sweet_fb_drawtick && sweet_fb_frame_open && fVsyncCount - sweet_fb_frame_tick <= 1 ? sweet_fb_frame_tick :
++		    fVsyncCount;
++		sweet_fb_frame_open = 0;
++	}
+ 	fLastSwapAt = mach_absolute_time();
+ 	fDirty = true;
+ 	fRateSwaps++;
