@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 1bb8784..891f567 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1012,6 +1012,17 @@ struct hfi_bw_table {
+ 	uint32_t cnoc_address[6], cnoc_data[2][6], ddr_address[8], ddr_data[16][8];
+ };
+ 
++static bool
++gpu_ddr_vote(void)
++{
++	static int v = -1;
++	if (v < 0) {
++		v = 0;
++		(void)PE_parse_boot_argn("sweetgpu_ddr", &v, sizeof(v));
++	}
++	return v != 0;
++}
++
+ static bool
+ gmu_core_power(void)
+ {
+@@ -1050,6 +1061,17 @@ gmu_core_power(void)
+ 		return false;
+ 	}
+ 	bw.ddr_data[0][0] = bw.ddr_data[0][1] = bw.ddr_data[0][2] = 0x40000000u;
++	/*
++	 * (raphael, boot-arg sweetgpu_ddr=1) The one level of bus votes the GMU is given, and puts in with each
++	 * speed: the system cache (SH0) and the DDR (MC0) at their fastest -- RPMh BCM commands (commit, valid,
++	 * average and peak, 14 bits each; past the top is the top). Nothing here voted the memory's speed: as
++	 * Linux's a640 table, "off", while Linux votes it for the GPU through its interconnect framework --
++	 * here nobody did, and the window server's frames waited on memory (CoreAnimation's layer work, the
++	 * GPU's full-screen clear and copy of each frame, the display's 81 Hz fetch).
++	 */
++	if (gpu_ddr_vote()) {
++		bw.ddr_data[0][0] = bw.ddr_data[0][1] = 0x6fffffffu;    /* BCM_TCS_CMD(1, 1, 0x3fff, 0x3fff) */
++	}
+ 	bw.cnoc_data[0][0] = 0x40000000u;
+ 	bw.cnoc_data[1][0] = 0x60000001u;
+ 	(void)PE_parse_boot_argn("sweetgpu_speed", &speed, sizeof(speed));
+@@ -1057,6 +1079,7 @@ gmu_core_power(void)
+ 		speed = 1;
+ 	}
+ 	vote[2] = speed;
++	vote[3] = gpu_ddr_vote() ? 0u : 0xffu;  /* (the bus votes of level 0 with it) */
+ 	g_gpu_khz = g_speeds[speed].khz;
+ 	printf("SWEET GMU: [HFI] votes gx %#x %#x %#x .. %#x, gmu %#x %#x; bus SH0 %#x MC0 %#x ACV %#x CN0 %#x; speed %u MHz\n",
+ 	    perf.gpu[0].vote, perf.gpu[1].vote, perf.gpu[2].vote, perf.gpu[GPU_LEVELS - 1u].vote, perf.gmu[0].vote, perf.gmu[1].vote,
+@@ -4520,6 +4543,7 @@ gpu_set_level(uint32_t level, uint64_t *out)
+ 	}
+ 	(void)gpu_fence_wait(gpu_last(), 1000u);
+ 	vote[2] = (uint32_t)GPU_LEVELS - 1u - level;
++	vote[3] = gpu_ddr_vote() ? 0u : 0xffu;
+ 	if (!hfi_send("a speed", HFI_GX_BW_PERF_VOTE, vote, 4)) {
+ 		*out = 0;
+ 		return EIO;
