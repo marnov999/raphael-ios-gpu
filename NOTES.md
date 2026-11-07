@@ -484,3 +484,18 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   41758673070, ADT out/raphael-full-fw-srgb.adt, ROOT=iosdata HZ=60, the 81 Hz args) packed FLASH=1
   MIUI=backup/miui-unenc like f10 (charger mode + "Boot MIUI" kept). RAM-booted first (OK), then flashed;
   cold boot -> panel 81.0 Hz, touch on. Rollback: backup/flashed/raphael-ios-f10.img (copy of f11 there too).
+
+### 2026-11-07 (MIUI vs iOS frame pacing, same bench)
+- MIUI side: out/raphael-ios-tomiui.img (fastboot boot: MIUI 12.5 / Android 11, Magisk root, no FBE). `adb input` is
+  blocked by MIUI (INJECT_EVENTS): userland/android/atouch.c (freestanding, tools/build-atouch.sh) = uinput
+  touchscreen + keys, 4 ms moves, `-g` EVIOCGRABs goodix_ts (ghost touches; the bench holds it the whole time).
+  tools/bench-miui.sh TAG [RUNS] runs tools/android/bench60-miui.sh (bench81.sh's gestures; nav-bar home button
+  instead of iOS's swipe up; Settings on home page 2; keeps the screen on, setting restored) under atrace gfx/view/
+  input/freq + gpu_frequency/kgsl_pwrlevel/kgsl_buslevel/memlat/bw_hwmon; traces in out/logs/miui/.
+- tools/analysis/frames.py: one report for both (`miui TRACE...`, `refreshes FILE` from tools/analysis/
+  ios-refreshes.py); idle gap 70 ms; MIUI "content" frames exclude the live Unity super wallpaper (~47 fps always),
+  bars, corners; MIUI still frames = app doFrame without DrawFrame (iOS still tails). Clocks CSV per trace.
+- Results (3 runs each; iOS u34 this boot): visible misses MIUI home 0.17% / Settings 2.68% (repeats 7.65%,
+  first 0.6 s 2.74%); iOS home 0.86% / Settings 3.20% (skips.py), all-repeat metric iOS 6.66% / 16.48%.
+  iOS p99 37 ms (3-refresh holds) on home; MIUI home p99 17.9 ms. MIUI clocks: schedutil, GPU 257 MHz 91% of the
+  home test (max 427), Settings GPU mean 343 (max 499), prime 825 MHz 73% of Settings; iOS fixed at max.
