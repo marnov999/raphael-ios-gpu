@@ -1,0 +1,88 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index c7e124a..b3c4099 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -542,6 +542,8 @@ extern uint32_t sweet_fb_retick_us, sweet_fb_retick_idle;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_us, 0, "vsync again us after a tick with no swap");
+ extern uint32_t sweet_big_sb;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_big_sb, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_big_sb, 0, "SpringBoard's threads to the big cores as the window server's");
++extern uint32_t sweet_fb_vsync_keep;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_vsync_keep, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_vsync_keep, 0, "the window server's vsync kept on when it asks it off");
+ extern uint32_t sweet_fb_drawtick;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_drawtick, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_drawtick, 0, "a frame flipped by the tick its drawing began");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_retick_idle, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_retick_idle, 0, "retick only when not drawing");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9032262..c31b584 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -215,6 +215,16 @@ extern "C" uint32_t sweet_fb_drawtick;
+ uint32_t sweet_fb_drawtick = 1;         /* (kern.sweet_fb_drawtick, bsd/kern/sweet_amfi.c) */
+ volatile uint64_t sweet_fb_vsync_count, sweet_fb_frame_tick;
+ volatile uint32_t sweet_fb_frame_open;
++/*
++ * (raphael, 2026-11-07) The window server's vsync kept on when it asks for it off (boot-arg sweetfb_vsynckeep,
++ * kern.sweet_fb_vsync_keep). CoreAnimation turns its vsync notifications off whenever nothing is due and on
++ * again when a commit comes (~4500 times in a bench): in a program-driven animation (the home page settling
++ * after a swipe) that was every frame, and each time the frame came two refreshes late -- shown three
++ * refreshes (37 ms) where MIUI's 60 Hz shows every one. Kept on, the next tick is there when the commit is.
++ */
++extern "C" uint32_t sweet_fb_vsync_keep;
++uint32_t sweet_fb_vsync_keep;
++static volatile uint32_t sweet_fb_vsync_offs, sweet_fb_vsync_kept, sweet_fb_vsync_told;
+ /* the panel's refresh as told to CoreAnimation, and the free-running tick's period (boot-arg sweetfb_rate, Hz: 60) */
+ static uint32_t sweet_fb_rate = 60, sweet_fb_vsync_us = 16667;
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+@@ -549,6 +559,7 @@ AppleCLCD::start(IOService *provider)
+ 	if (fRetick != NULL && fWorkLoop->addEventSource(fRetick) != kIOReturnSuccess) {
+ 		OSSafeReleaseNULL(fRetick);
+ 	}
++	(void)PE_parse_boot_argn("sweetfb_vsynckeep", &sweet_fb_vsync_keep, sizeof(sweet_fb_vsync_keep));
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -811,6 +822,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 						fb->fReticks = 0;
+ 					}
+ 					fb->fVsyncDropped = 0;
++					IOLog("SWEET FPS: vsync off asked %u times (kept on %u: sweetfb_vsynckeep %u)\n",
++					    sweet_fb_vsync_offs, sweet_fb_vsync_kept, sweet_fb_vsync_keep);
++					sweet_fb_vsync_offs = sweet_fb_vsync_kept = 0;
+ 				}
+ #else
+ 				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u frames\n", fb->fRateSwaps,
+@@ -1848,14 +1862,29 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kSweetFBNotifications:
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
++			bool kept = false;
+ 			IOLockLock(fFB->fLock);
+-			fFunc[type] = args->scalarInput[0];
+-			fRefcon[type] = args->scalarInput[1];
++			if (type == SWEET_FB_NOTIFY_VSYNC && args->scalarInput[0] == 0) {
++				sweet_fb_vsync_offs++;
++				if (sweet_fb_vsync_keep && fFunc[type] != 0) {
++					sweet_fb_vsync_kept++;
++					kept = true;    /* still sent: the next commit finds its tick */
++				}
++			}
++			if (!kept) {
++				fFunc[type] = args->scalarInput[0];
++				fRefcon[type] = args->scalarInput[1];
++			}
+ 			IOLockUnlock(fFB->fLock);
+-			char name[32];
+-			proc_selfname(name, sizeof(name));
+-			IOLog("SWEET FB: %s notifications type %u %s\n", name, type,
+-			    args->scalarInput[0] ? "on" : "off");
++			if (type != SWEET_FB_NOTIFY_VSYNC || sweet_fb_vsync_told < 12) {
++				char name[32];
++				if (type == SWEET_FB_NOTIFY_VSYNC) {
++					sweet_fb_vsync_told++;  /* (thousands of times: the FPS line counts them) */
++				}
++				proc_selfname(name, sizeof(name));
++				IOLog("SWEET FB: %s notifications type %u %s%s\n", name, type,
++				    args->scalarInput[0] ? "on" : "off", kept ? " (kept on: sweetfb_vsynckeep)" : "");
++			}
+ 		}
+ 		break;
+ 	case kSweetFBRequestPowerChange:
