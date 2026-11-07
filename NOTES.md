@@ -513,3 +513,12 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - MIUI DVFS spec (local, research/ is gitignored): research/miui-dvfs.md (gesture-timed floors over schedutil/msm-adreno-tz; our GPU level stall is
   likely our gpu_set_level's fence wait under gpu_lock, KGSL changes levels without idling).
 - Open: two power presses to wake the screen (probably 0138's key debounce dropping short presses).
+- **2026-11-07 bench additions + tool fixes.** tools/bench81.sh SECTIONS (default "home settings switcher hcr"):
+  switcher = swipe up and hold (hidtouch drag, now with the from-edge flag swipe had: iOS's system gestures need it),
+  cards scrolled 3x right/left, home; hcr = Hill Climb Racing (home page 2) fresh: START + gas 10 s measured from
+  START, then home + kill. tools/screencap.py now uses userland/screencap.c (raphael copy): it drops the CPU's cached
+  lines of the scanned-out pool surface first (0131 stopped flushing them; screenshots were a state behind).
+  iOS keeps the previous app's orientation (no accelerometer): after the landscape game the next app is landscape.
+- full1 (u36, gl_sb_fps 1.35, 3 rounds, frames.py): home 6.38% repeats (3+ holds 10), Settings 5.53%, switcher
+  8.43% (2x 23, 3x+ 10: worst now), hcr 3.23% (all 1x) but at START: one 123 ms freeze (r1), ~2.5 s at every 2nd
+  refresh (r3). Game frames only seen through backboardd's flips (TL caps at 600 swaps = ~7.5 s).

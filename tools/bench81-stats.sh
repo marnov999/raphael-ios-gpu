@@ -12,7 +12,7 @@ for r in $(seq 1 "$N"); do
 	tools/bench81.sh "$TAG-r$r" >/dev/null 2>&1
 	tail -c +$((gm + 1)) $G | strings > "$S/sb_$TAG-r$r.txt"
 done
-for t in home settings; do
+for t in home settings switcher hcr; do
 	for r in $(seq 1 "$N"); do
 		python3 tools/analysis/skips.py "$S/prof_$TAG-r$r-$t.txt" "$S/sb_$TAG-r$r.txt" | grep SUMMARY
 	done | awk -v t=$t '{f+=$3; l+=$5; s+=$7; n+=$9; c+=$11} END{printf "%s: %d frames: visible misses %d (%.2f%%: late %d, server %d, no link %d); still tails %d\n", t, f, l+s+n, 100*(l+s+n)/f, l, s, n, c}'

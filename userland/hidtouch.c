@@ -189,7 +189,8 @@ drag(char *args)
 		return;
 	}
 	args += used;
-	edge = 0;
+	/* from an edge as swipe's (iOS's system gestures, home and the app switcher, want it) */
+	edge = (x < EDGE_PX || x > PANEL_W - 1 - EDGE_PX || y < EDGE_PX || y > PANEL_H - 1 - EDGE_PX) ? kEventFromEdgeTip : 0;
 	next_at = 0;
 	last_sent = mach_absolute_time();
 	send(x, y, kEventRange | kEventTouch, 1);
@@ -204,6 +205,7 @@ drag(char *args)
 	}
 	usleep(16000);
 	send(x, y, kEventRange | kEventTouch, 0);
+	edge = 0;
 }
 
 int

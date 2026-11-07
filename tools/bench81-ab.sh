@@ -29,7 +29,7 @@ for c in $(seq 1 "$N"); do
 done
 for spec in "$@"; do
 	name=${spec%%:*}
-	for t in home settings; do
+	for t in home settings switcher hcr; do
 		for c in $(seq 1 "$N"); do
 			python3 tools/analysis/skips.py "$S/prof_$TAG-$name-c$c-$t.txt" "$S/sb_$TAG-$name-c$c.txt" | grep SUMMARY
 		done | awk -v n="$name" -v t=$t '{f+=$3; l+=$5; s+=$7; k+=$9; c+=$11} END{printf "%-10s %-8s %5d frames: visible %3d (%.2f%%: late %d, server %d, no link %d); still tails %d\n", n, t, f, l+s+k, 100*(l+s+k)/f, l, s, k, c}'
@@ -37,6 +37,6 @@ for spec in "$@"; do
 done
 for spec in "$@"; do
 	name=${spec%%:*}; O=$S/refreshes_$TAG-$name.txt; : > "$O"
-	for t in home settings; do python3 -I tools/analysis/ios-refreshes.py $t "$S"/prof_$TAG-$name-c*-$t.txt >> "$O"; done
+	for t in home settings switcher hcr; do python3 -I tools/analysis/ios-refreshes.py $t "$S"/prof_$TAG-$name-c*-$t.txt >> "$O"; done
 	echo "== $name"; python3 -I tools/analysis/frames.py refreshes "$O" | grep -v "first 0.6"
 done

@@ -12,7 +12,7 @@ if surf:
     open("/tmp/claude_ids", "w").write(surf)
     subprocess.run([sys.executable, os.path.join(HERE, "push_file.py"), "/tmp/claude_ids", "/tmp/screencap_ids", "0644"],
                    check=True, stdout=subprocess.DEVNULL)
-subprocess.run([sys.executable, os.path.join(HERE, "push_file.py"), os.environ.get("SCREENCAP", "/home/marnov/xmiphones/davinci-ios/gpu/userland/metal/screencap"), "/tmp/screencap", "0755"],
+subprocess.run([sys.executable, os.path.join(HERE, "push_file.py"), os.environ.get("SCREENCAP", os.path.join(HERE, "..", "out", "userland", "screencap")), "/tmp/screencap", "0755"],
                check=True, stdout=subprocess.DEVNULL)
 data = b""
 for _ in range(30):                     # it runs on its own once pushed; wait for the renamed file
