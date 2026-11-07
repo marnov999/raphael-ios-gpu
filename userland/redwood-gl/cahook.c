@@ -56,10 +56,27 @@ static struct ch_event ch_ring[CH_RING];
 static volatile uint32_t ch_head, ch_tail;
 static int (*ch_pid_of)(void *context);
 
-void ch_log(long id, uint64_t x0, uint64_t x1, double d0, double d1, double d2);
+/*
+ * (2026-11-07) The frame rates SpringBoard's animations ask for, scaled by ch_fps_scale (the panel's rate over 60:
+ * 1.35 at 81 Hz; /usr/local/gltest/gl_sb_fps, 0 = as asked). CoreAnimation runs a display link at the panel's rate
+ * over a whole number: a "30 fps" animation is every 2nd refresh at 60 Hz, but at 81 Hz the 40.5 is over its 30,
+ * so it got 27 -- every 3rd refresh, a frame up 37 ms. Scaled, every request picks the divisor a 60 Hz iPhone
+ * would (30 -> 40.5, 60 or 48..120 -> 81).
+ */
+static float ch_fps_scale;
+
+void ch_log(long id, uint64_t x0, uint64_t x1, double d0, double d1, double d2, double *saved);
 void
-ch_log(long id, uint64_t x0, uint64_t x1, double d0, double d1, double d2)
+ch_log(long id, uint64_t x0, uint64_t x1, double d0, double d1, double d2, double *saved)
 {
+	if ((id == 10 || id == 11) && ch_fps_scale > 0 && saved != NULL) {
+		for (int k = 0; k < 3; k++) {           /* s0..s2: the low halves of the saved d0..d2 */
+			float f;
+			memcpy(&f, &saved[k], 4);
+			f *= ch_fps_scale;
+			memcpy(&saved[k], &f, 4);
+		}
+	}
 	uint32_t i = __atomic_fetch_add(&ch_head, 1u, __ATOMIC_RELAXED);
 	struct ch_event *e = &ch_ring[i % CH_RING];
 	e->t = mach_absolute_time();
@@ -222,6 +239,14 @@ ch_standalone(void)
 		return;
 	}
 	close(fd);
+	fd = open("/usr/local/gltest/gl_sb_fps", O_RDONLY);
+	if (fd >= 0) {
+		char b[16] = { 0 };
+		if (read(fd, b, sizeof(b) - 1) > 0) {
+			ch_fps_scale = strtof(b, NULL);
+		}
+		close(fd);
+	}
 	snprintf(ch_name, sizeof(ch_name), "%s", getprogname());
 	ch_sock = socket(AF_INET, SOCK_DGRAM, 0);
 	if (ch_sock >= 0) {
@@ -235,6 +260,7 @@ ch_standalone(void)
 			ch_sock = -1;
 		}
 	}
+	ch_say("cahook: frame rate requests scaled by %g (gl_sb_fps)\n", (double)ch_fps_scale);
 	if (ch_install(ch_say, 1) > 0) {
 		pthread_t t;
 		pthread_create(&t, NULL, ch_dumper, NULL);

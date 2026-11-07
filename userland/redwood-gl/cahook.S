@@ -52,6 +52,7 @@ _ch_stub_\n:
 	mov	x2, x1
 	mov	x1, x0
 	mov	x0, #\n
+	add	x3, sp, #0x50           /* the saved d0..d7: ch_log may change them (the frame rate range) */
 	bl	_ch_log
 	ldp	x0, x1, [sp, #0x00]
 	ldp	x2, x3, [sp, #0x10]

@@ -499,3 +499,17 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   first 0.6 s 2.74%); iOS home 0.86% / Settings 3.20% (skips.py), all-repeat metric iOS 6.66% / 16.48%.
   iOS p99 37 ms (3-refresh holds) on home; MIUI home p99 17.9 ms. MIUI clocks: schedutil, GPU 257 MHz 91% of the
   home test (max 427), Settings GPU mean 343 (max 499), prime 825 MHz 73% of Settings; iOS fixed at max.
+- **Frames held 3 refreshes (37 ms) on iOS home swipes: cause + fix (2026-11-07).** Not the vsync: CA turns vsync
+  notifications off/on ~4500x a bench, but xnu 0150 (sweetfb_vsynckeep / kern.sweet_fb_vsync_keep, default 0) keeping
+  them on changed nothing (CA ignores vsyncs it disabled). SpringBoard commits 2 or 3 refreshes apart (194/230 vs 874
+  one apart): its animations ask 20-30/32 fps; CA uses panel/N, and at 81 Hz "30" gets 27 (every 3rd refresh) where a
+  60 Hz iPhone gives 30 (every 2nd). libcahook now scales SpringBoard's set_preferred_fps_range requests by
+  /usr/local/gltest/gl_sb_fps (1.35 = 81/60; the hook rewrites the saved s0-s2). A/B same boot (u36, 3 cycles):
+  home 3-refresh holds 33 -> 3, p99 37.0 -> 25.1 ms, 1% low 27 -> 39.8 fps, repeats 6.34 -> 6.28%; Settings unchanged
+  (3+ holds = server late at app launch). Set on the phone (gl_sb_fps=1.35); tools/build-cahook.sh; bench81-ab.sh
+  takes "/path=value" items (file + SpringBoard restart) and prints frames.py tables.
+- CI: macos-14 runners retired -> workflow on macos-15 (run 42413404597 green, guard + board macro OK). `gh` is
+  /home/marnov/xmiphones/devtools/gh/bin/gh. main had lost its upstream: earlier "pushed" commits were local until now.
+- MIUI DVFS spec (local, research/ is gitignored): research/miui-dvfs.md (gesture-timed floors over schedutil/msm-adreno-tz; our GPU level stall is
+  likely our gpu_set_level's fence wait under gpu_lock, KGSL changes levels without idling).
+- Open: two power presses to wake the screen (probably 0138's key debounce dropping short presses).
