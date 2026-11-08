@@ -61,7 +61,8 @@ static int (*ch_pid_of)(void *context);
  * 1.35 at 81 Hz; /usr/local/gltest/gl_sb_fps, 0 = as asked). CoreAnimation runs a display link at the panel's rate
  * over a whole number: a "30 fps" animation is every 2nd refresh at 60 Hz, but at 81 Hz the 40.5 is over its 30,
  * so it got 27 -- every 3rd refresh, a frame up 37 ms. Scaled, every request picks the divisor a 60 Hz iPhone
- * would (30 -> 40.5, 60 or 48..120 -> 81).
+ * would (30 -> 40.5, 60 or 48..120 -> 81). A value of 10 or more is a rate instead: every range asked set to it
+ * (gl_sb_fps 81: all of SpringBoard's animations at the panel's full rate, as Android draws them).
  */
 static float ch_fps_scale;
 
@@ -70,11 +71,23 @@ void
 ch_log(long id, uint64_t x0, uint64_t x1, double d0, double d1, double d2, double *saved)
 {
 	if ((id == 10 || id == 11) && ch_fps_scale > 0 && saved != NULL) {
+		float r[3];
 		for (int k = 0; k < 3; k++) {           /* s0..s2: the low halves of the saved d0..d2 */
-			float f;
-			memcpy(&f, &saved[k], 4);
-			f *= ch_fps_scale;
-			memcpy(&saved[k], &f, 4);
+			memcpy(&r[k], &saved[k], 4);
+		}
+		if (ch_fps_scale >= 10.0f) {
+			/* a rate (gl_sb_fps 81): every animation that asks a range at the panel's full rate, as Android
+			 * draws all of them -- the default range (all 0) is left, it is the full rate already */
+			if (r[0] != 0.0f || r[1] != 0.0f || r[2] != 0.0f) {
+				r[0] = r[1] = r[2] = ch_fps_scale;
+			}
+		} else {
+			for (int k = 0; k < 3; k++) {
+				r[k] *= ch_fps_scale;
+			}
+		}
+		for (int k = 0; k < 3; k++) {
+			memcpy(&saved[k], &r[k], 4);
 		}
 	}
 	uint32_t i = __atomic_fetch_add(&ch_head, 1u, __ATOMIC_RELAXED);

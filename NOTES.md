@@ -522,3 +522,15 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
 - full1 (u36, gl_sb_fps 1.35, 3 rounds, frames.py): home 6.38% repeats (3+ holds 10), Settings 5.53%, switcher
   8.43% (2x 23, 3x+ 10: worst now), hcr 3.23% (all 1x) but at START: one 123 ms freeze (r1), ~2.5 s at every 2nd
   refresh (r3). Game frames only seen through backboardd's flips (TL caps at 600 swaps = ~7.5 s).
+- **2026-11-08 full-rate SpringBoard + hold tracing.** gl_sb_fps >= 10 = a rate: every explicit range SpringBoard asks
+  set to it (0/0/0 default left). A/B same boot (u36, 3 cycles) x1.35 vs 81: home repeats 6.67 -> 2.03% (avg 75.6 ->
+  79.4 fps, 2-refresh 88 -> 32, 4+ 7 -> 1), Settings 5.86 -> 4.00% (4+ 16 -> 6), switcher ~9.4% both. Phone now
+  gl_sb_fps=81. The "10 4+ holds on every test" were mostly frame #1 of a burst (first frame after a still screen:
+  SpringBoard's link at half rate + CA's vsync re-enable) and fixed points in Settings (~650 ms, ~1.7 s in: backboardd
+  idle-waiting 40 ms, then an 8 ms GPU frame). During 3+ holds backboardd's render thread is mostly in mach_msg
+  (waiting), not drawing. Switcher: vsync keep 1 vs 0: 8.69 vs 9.40% (server 22 vs 35; keep on for now via sysctl);
+  SpringBoard's main thread in the switcher: UIKit/SBFluidSwitcher layout + ~12% CPU ASTC decode of app snapshots
+  (ImageIO ATXReadPlugin DecodeASTC_RGBA_vec) -- the GPU could sample ASTC (a640 has it) if iOS were told.
+  Tools (scratchpad e8d37b2e): holdtrace.py (events around holds), holdsamp.py (render thread during holds),
+  topfn.py (a thread's hottest functions; ipsw a2s top-N, 8 parallel). Slides: backboardd/SpringBoard print
+  "cahook: slide" at start. Phone was found in fastboot 11-08 (log ends 23:04 11-07; cause unknown).
