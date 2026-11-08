@@ -1,0 +1,760 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 658c097..39ed765 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -4246,6 +4246,12 @@ drm_do_read_panel(user_addr_t ubuf, uint32_t gw, uint32_t gh)
+ #define MSM_INFO_IOS_GPU_LEVEL 0x87u   /* private: value = GPU perf level 0 (825 MHz) .. 7 (180 MHz); out: DCVS return */
+ static int gpu_set_level(uint32_t level, uint64_t *out);
+ static int g_level_quiet;       /* (the clock governor's changes: no measuring, no line) */
++/*
++ * (0151) The MIUI-like governor's changes do not wait for the GPU to finish first: KGSL changes the level with work
++ * in flight (kgsl_pwrctrl_pwrlevel_change -> gmu_dcvs_set, the GMU acks in 0.3-1.7 ms), and the wait drained the ring
++ * while new submissions waited for the lock -- a stall at every change.
++ */
++static int g_level_nowait;
+ #define MSM_INFO_IOS_REBOOT 0x86u      /* private: value 0 = set the PMIC reboot reason "bootloader" and
+                                          * report; 1 = set it and reset (-> fastboot) */
+ extern int sweet_reboot_fastboot(uint32_t mode);       /* bsd/dev/sweet_reboot.c */
+@@ -4558,7 +4564,9 @@ gpu_set_level(uint32_t level, uint64_t *out)
+ 	if (level >= g_gpu_nlevels) {
+ 		level = g_gpu_nlevels - 1u;
+ 	}
+-	(void)gpu_fence_wait(gpu_last(), 1000u);
++	if (!g_level_nowait) {
++		(void)gpu_fence_wait(gpu_last(), 1000u);
++	}
+ 	vote[2] = (uint32_t)GPU_LEVELS - 1u - level;
+ 	vote[3] = gpu_ddr_vote() ? 0u : 0xffu;
+ 	if (!hfi_send("a speed", HFI_GX_BW_PERF_VOTE, vote, 4)) {
+@@ -4612,6 +4620,9 @@ osm_measured_mhz(vm_offset_t base, unsigned n)
+ static vm_offset_t g_osm_base[OSM_CLUSTERS];
+ static uint32_t    g_osm_top[OSM_CLUSTERS];
+ static bool        g_osm_per_core[OSM_CLUSTERS];
++#define OSM_ROWS_MAX 40u
++static uint32_t    g_osm_mhz[OSM_CLUSTERS][OSM_ROWS_MAX];      /* (0151) each row's MHz, for the governor */
++static volatile uint32_t g_osm_row[OSM_CLUSTERS];              /* (0151) the row last asked */
+ 
+ static void
+ osm_set(unsigned c, uint32_t row)
+@@ -4627,6 +4638,7 @@ osm_set(unsigned c, uint32_t row)
+ 		gpu_wr(base, OSM_PERF_STATE(n), row);
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	g_osm_row[c] = row;
+ }
+ 
+ /* Every cluster's table read and printed, and its top row asked for. */
+@@ -4649,6 +4661,7 @@ sweet_cpufreq(void)
+ 			}
+ 			top = r;
+ 			top_khz = khz;
++			g_osm_mhz[c][r] = khz / 1000u;
+ 			if (at < (int)sizeof(line) - 8) {
+ 				at += snprintf(line + at, sizeof(line) - (size_t)at, " %u", khz / 1000u);
+ 			}
+@@ -4684,12 +4697,562 @@ struct sweet_clocks {
+ 	uint32_t gpu;
+ 	int autoidle;
+ 	int boost;
++	int gov;                                /* (0151) 0 the rows as asked; 1 MIUI's governor, 2 the tuned one */
+ };
+ static struct sweet_clocks g_clocks = { { 99, 99, 99, 99 }, 2, 1, 1 };
+ static const struct sweet_clocks g_clocks_idle = { { 3, 3, 2, 2 }, 99, 1, 0 };
+ static const struct sweet_clocks g_clocks_dark = { { 0, 0, 0, 0 }, 99, 0, 0 };   /* the display off: all lowest */
+ extern int sweet_panel_off(void);               /* bsd/dev/sweet_panel.c */
+ 
++/*
++ * (0151) The MIUI-like governor: clocks/gov=1 MIUI's own numbers (research/miui-dvfs.md: schedutil 80% target load
++ * and hispeed jumps on 10 ms windows; the perf HAL's gesture floors -- touch-down 80 ms, finger down, 800 ms after a
++ * swipe's lift, all at their top for 400 ms for an app's opening or closing; the GPU from its slowest level, one
++ * level up a sample while busy, back a level after 80 / 500 ms of little work), gov=2 the same rules with this
++ * port's own numbers (/usr/local/gltest/gov, key=value or key=L3,silver,gold,prime). gov=0: the clocks as asked,
++ * as before. The load: each CPU's idle time from the scheduler's accounting (sweet_cpu_idle_mach, sched_prim.c),
++ * the GPU's from its own cycle counts per submission (gpu_times).
++ */
++#define GOV_TICK_MS 10u
++enum { GOV_L3, GOV_S, GOV_G, GOV_P, GOV_CL };
++struct gov_prof {
++	uint32_t tl, hs_load, hs[GOV_CL], base[GOV_CL], down_ticks;
++	uint32_t in_s, in_ms;
++	uint32_t pf[GOV_CL], pf_ms;
++	uint32_t dr[GOV_CL];
++	uint32_t fl[GOV_CL], fl_ms;
++	uint32_t tr[GOV_CL], tr_ms, tr_gpu;
++	uint32_t gpu_base, gpu_up, gpu_up2, gpu_dn, gpu_dn_ms, gpu_mid, gpu_mid_ms;
++	uint32_t l3_pct;
++};
++#define GOV_TOP 9999u
++static const struct gov_prof g_gov_miui = {
++	.tl = 80, .hs_load = 90, .hs = { 0, 1209, 1612, 1612 }, .base = { 300, 576, 710, 825 }, .down_ticks = 2,
++	.in_s = 1382, .in_ms = 120,
++	.pf = { 806, 1555, 1612, 1612 }, .pf_ms = 80,
++	.dr = { 806, 1036, 1056, 1056 },
++	.fl = { 806, 1555, 1612, 1612 }, .fl_ms = 800,
++	.tr = { GOV_TOP, GOV_TOP, GOV_TOP, GOV_TOP }, .tr_ms = 400, .tr_gpu = 499,
++	.gpu_base = 257, .gpu_up = 85, .gpu_up2 = 95, .gpu_dn = 50, .gpu_dn_ms = 80, .gpu_mid = 70, .gpu_mid_ms = 500,
++	.l3_pct = 100,
++};
++static const struct gov_prof g_gov_tuned0 = {
++	.tl = 60, .hs_load = 75, .hs = { 0, 1209, 1804, 2016 }, .base = { 300, 576, 710, 825 }, .down_ticks = 4,
++	.in_s = 1382, .in_ms = 150,
++	.pf = { 1344, 1555, 2016, 2419 }, .pf_ms = 120,
++	.dr = { 1036, 1209, 1612, 1804 },
++	.fl = { 1344, 1555, 2016, 2419 }, .fl_ms = 1000,
++	.tr = { GOV_TOP, GOV_TOP, GOV_TOP, GOV_TOP }, .tr_ms = 600, .tr_gpu = 499,
++	.gpu_base = 345, .gpu_up = 75, .gpu_up2 = 90, .gpu_dn = 40, .gpu_dn_ms = 100, .gpu_mid = 60, .gpu_mid_ms = 500,
++	.l3_pct = 125,
++};
++static struct gov_prof g_gov_tuned;
++static bool g_gov_tuned_set;
++
++/* /usr/local/gltest/gov: "name=V" or "name=L3,S,G,P" pairs, whitespace apart, onto the tuned profile */
++static const struct { const char *name; size_t off; unsigned n; } g_gov_keys[] = {
++#define GK(f, n) { #f, __builtin_offsetof(struct gov_prof, f), n }
++	GK(tl, 1), GK(hs_load, 1), GK(hs, 4), GK(base, 4), GK(down_ticks, 1), GK(in_s, 1), GK(in_ms, 1),
++	GK(pf, 4), GK(pf_ms, 1), GK(dr, 4), GK(fl, 4), GK(fl_ms, 1), GK(tr, 4), GK(tr_ms, 1), GK(tr_gpu, 1),
++	GK(gpu_base, 1), GK(gpu_up, 1), GK(gpu_up2, 1), GK(gpu_dn, 1), GK(gpu_dn_ms, 1), GK(gpu_mid, 1),
++	GK(gpu_mid_ms, 1), GK(l3_pct, 1),
++#undef GK
++};
++
++static void
++gov_file(void)
++{
++	char text[768];
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx;
++	int resid = 0;
++	struct gov_prof p = g_gov_tuned0;
++	if (rootvnode == NULLVP) {
++		return;
++	}
++	ctx = vfs_context_kernel();
++	if (vnode_lookup("/usr/local/gltest/gov", 0, &vp, ctx) == 0) {
++		bzero(text, sizeof(text));
++		(void)vn_rdwr(UIO_READ, vp, (caddr_t)text, sizeof(text) - 1, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx),
++		    &resid, vfs_context_proc(ctx));
++		vnode_put(vp);
++		for (char *at = text; *at != '\0';) {
++			char *name = at, *eq;
++			while (*at != '\0' && *at != ' ' && *at != '\n' && *at != '\t') {
++				at++;
++			}
++			if (*at != '\0') {
++				*at++ = '\0';
++			}
++			if ((eq = strchr(name, '=')) == NULL) {
++				continue;
++			}
++			*eq++ = '\0';
++			for (unsigned k = 0; k < sizeof(g_gov_keys) / sizeof(g_gov_keys[0]); k++) {
++				uint32_t *f = (uint32_t *)((char *)&p + g_gov_keys[k].off);
++				if (strcmp(name, g_gov_keys[k].name) != 0) {
++					continue;
++				}
++				for (unsigned i = 0; i < g_gov_keys[k].n && *eq >= '0' && *eq <= '9'; i++) {
++					uint32_t v = 0;
++					while (*eq >= '0' && *eq <= '9') {
++						v = v * 10u + (uint32_t)(*eq++ - '0');
++					}
++					f[i] = v;
++					if (*eq == ',') {
++						eq++;
++					}
++				}
++			}
++		}
++	}
++	if (!g_gov_tuned_set || memcmp(&p, &g_gov_tuned, sizeof(p)) != 0) {
++		g_gov_tuned = p;
++		g_gov_tuned_set = true;
++		printf("SWEET GOV: tuned profile: tl %u hs_load %u hs %u/%u/%u pf %u/%u/%u/%u dr %u/%u/%u/%u fl %u/%u/%u/%u "
++		    "%u ms tr %u ms GPU>=%u base GPU %u up %u/%u dn %u@%u mid %u@%u l3 %u%%\n",
++		    p.tl, p.hs_load, p.hs[1], p.hs[2], p.hs[3], p.pf[0], p.pf[1], p.pf[2], p.pf[3], p.dr[0], p.dr[1], p.dr[2],
++		    p.dr[3], p.fl[0], p.fl[1], p.fl[2], p.fl[3], p.fl_ms, p.tr_ms, p.tr_gpu, p.gpu_base, p.gpu_up, p.gpu_up2,
++		    p.gpu_dn, p.gpu_dn_ms, p.gpu_mid, p.gpu_mid_ms, p.l3_pct);
++	}
++}
++
++/* The touches: from the panel's digitizer (SweetHID.cpp sweet_hid_touch) and from hidtouch (kern.sweet_dvfs_kick) */
++static volatile uint64_t g_t_down_at, g_t_input_until, g_t_fling_until, g_t_tr_until;
++static volatile int g_t_down, g_t_x0, g_t_y0, g_t_travel, g_t_edge;
++static volatile uint32_t g_t_taps, g_t_swipes;
++#define GOV_PANEL_H 2340
++#define GOV_EDGE_PX 60
++#define GOV_TAP_PX 60
++
++static uint64_t
++gov_ms(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++static const struct gov_prof *
++gov_prof(void)
++{
++	return g_clocks.gov == 1 ? &g_gov_miui : &g_gov_tuned;
++}
++
++void sweet_dvfs_touch(int down, int x, int y);
++void
++sweet_dvfs_touch(int down, int x, int y)
++{
++	const struct gov_prof *p = gov_prof();
++	uint64_t now = mach_absolute_time();
++	if (down && !g_t_down) {
++		g_t_down = 1;
++		g_t_down_at = now;
++		g_t_x0 = x;
++		g_t_y0 = y;
++		g_t_travel = 0;
++		g_t_edge = y >= GOV_PANEL_H - GOV_EDGE_PX;
++		g_t_fling_until = 0;            /* (MIUI lets the fling's floor go at the next touch-down) */
++	} else if (down) {
++		int d = (x > g_t_x0 ? x - g_t_x0 : g_t_x0 - x) + (y > g_t_y0 ? y - g_t_y0 : g_t_y0 - y);
++		if (d > g_t_travel) {
++			g_t_travel = d;
++		}
++	} else if (g_t_down) {
++		uint64_t held = now - g_t_down_at;
++		int d = (x > g_t_x0 ? x - g_t_x0 : g_t_x0 - x) + (y > g_t_y0 ? y - g_t_y0 : g_t_y0 - y);
++		if (d > g_t_travel) {
++			g_t_travel = d;
++		}
++		g_t_down = 0;
++		if (g_t_travel < GOV_TAP_PX && held < gov_ms(350)) {
++			g_t_tr_until = now + gov_ms(p->tr_ms);      /* a tap: an app may open (MIUI: the resume boost) */
++			g_t_taps++;
++		} else {
++			g_t_fling_until = now + gov_ms(p->fl_ms);
++			if (g_t_edge) {
++				g_t_tr_until = now + gov_ms(p->tr_ms);  /* from the bottom edge: an app closes, the switcher */
++			}
++			g_t_swipes++;
++		}
++	}
++	g_t_input_until = now + gov_ms(p->in_ms);
++	if (g_dvfs_on && g_clocks.gov != 0) {
++		thread_wakeup((event_t)&g_dvfs_chan);
++	}
++}
++
++extern uint64_t sweet_cpu_idle_mach(int cpu);   /* osfmk/kern/sched_prim.c */
++static const struct { int first, n; } g_gov_cpus[GOV_CL] = { { 0, 0 }, { 0, 4 }, { 4, 3 }, { 7, 1 } };
++
++static uint32_t
++gov_row(unsigned c, uint32_t mhz)
++{
++	for (uint32_t r = 0; r <= g_osm_top[c]; r++) {
++		if (g_osm_mhz[c][r] >= mhz) {
++			return r;
++		}
++	}
++	return g_osm_top[c];
++}
++
++/* memlat's tables (stock DTB): a cluster's busy-weighted MHz -> L3 MHz */
++static uint32_t
++gov_l3_vote(unsigned c, uint32_t eff)
++{
++	static const uint16_t s_in[] = { 300, 499, 576, 672, 768, 940, 1036, 1113, 1209, 1305, 1382, 1478, 1632 },
++	    s_out[] = { 300, 403, 499, 614, 710, 806, 902, 998, 1075, 1171, 1267, 1344, 1536, 1612 };
++	static const uint16_t g_in[] = { 300, 825, 1171, 1401, 1708, 2016, 2419 },
++	    g_out[] = { 300, 614, 806, 998, 1267, 1344, 1536, 1612 };
++	const uint16_t *in = c == GOV_S ? s_in : g_in, *out = c == GOV_S ? s_out : g_out;
++	unsigned n = c == GOV_S ? sizeof(s_in) / sizeof(s_in[0]) : sizeof(g_in) / sizeof(g_in[0]);
++	if (eff == 0) {
++		return 0;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		if (eff <= in[i]) {
++			return out[i];
++		}
++	}
++	return out[n];
++}
++
++static uint64_t g_gov_idle_was[8], g_gov_was_at;
++static uint32_t g_gov_down_n[GOV_CL], g_gov_full_n[GOV_CL];
++static uint64_t g_gov_gpu_was_ticks, g_gov_gpu_busy_us, g_gov_gpu_tot_us, g_gov_gpu_changed_at;
++static volatile uint32_t g_gov_busy[GOV_CL];    /* the last tick's busiest CPU of each cluster, permille */
++static volatile uint32_t g_gov_gpu_busy;        /* the GPU's, percent, over the last window */
++
++static void
++gov_tick(uint64_t now)
++{
++	const struct gov_prof *p = gov_prof();
++	uint32_t floor[GOV_CL], busy[GOV_CL] = { 0 }, eff[GOV_CL] = { 0 }, want[GOV_CL];
++	uint64_t dt = g_gov_was_at ? now - g_gov_was_at : 0, dt_ns = 0;
++	bool touching = g_t_down != 0, tr = now < g_t_tr_until;
++	absolutetime_to_nanoseconds(dt, &dt_ns);
++	bool sample = g_gov_was_at == 0 || dt_ns >= 5u * NSEC_PER_MSEC;     /* (a touch's wake: the floors only) */
++	/* the floors of the gesture now */
++	for (unsigned c = 0; c < GOV_CL; c++) {
++		floor[c] = p->base[c];
++#define GOV_MAX(a, b) ((a) > (b) ? (a) : (b))
++		if (touching) {
++			floor[c] = GOV_MAX(floor[c], now - g_t_down_at < gov_ms(p->pf_ms) ? p->pf[c] : p->dr[c]);
++		}
++		if (now < g_t_fling_until) {
++			floor[c] = GOV_MAX(floor[c], p->fl[c]);
++		}
++		if (tr) {
++			floor[c] = GOV_MAX(floor[c], p->tr[c]);
++		}
++	}
++	if (now < g_t_input_until) {
++		floor[GOV_S] = GOV_MAX(floor[GOV_S], p->in_s);
++	}
++	if (!sample) {
++		for (unsigned c = 0; c < GOV_CL; c++) {
++			uint32_t row = gov_row(c, floor[c]);
++			if (row > g_osm_row[c]) {
++				osm_set(c, row);
++				g_gov_down_n[c] = 0;
++			}
++		}
++		if (tr && g_kgsl_ready && g_gpu_nlevels != 0) {
++			uint32_t f = g_gpu_level;
++			for (uint32_t i = g_gpu_nlevels; i-- > 0;) {
++				if (g_gpu_mhz[i] >= p->tr_gpu) {
++					f = i;                  /* the slowest level at or above tr_gpu */
++					break;
++				}
++			}
++			if (f < g_gpu_level) {
++				uint64_t o = 0;
++				gpu_lock();
++				g_level_quiet = 1;
++				g_level_nowait = 1;
++				(void)gpu_set_level(f, &o);
++				g_level_nowait = 0;
++				g_level_quiet = 0;
++				gpu_unlock();
++				g_gov_gpu_changed_at = now;
++			}
++		}
++		return;
++	}
++	/* each cluster's load */
++	for (int cpu = 0; cpu < 8; cpu++) {
++		uint64_t idle = sweet_cpu_idle_mach(cpu), d;
++		uint32_t b = 0;
++		if (idle == UINT64_MAX) {
++			continue;
++		}
++		if (dt != 0 && g_gov_idle_was[cpu] != 0) {
++			d = idle > g_gov_idle_was[cpu] ? idle - g_gov_idle_was[cpu] : 0;
++			b = d >= dt ? 0 : (uint32_t)(1000u - d * 1000u / dt);
++		}
++		g_gov_idle_was[cpu] = idle;
++		for (unsigned c = GOV_S; c < GOV_CL; c++) {
++			if (cpu >= g_gov_cpus[c].first && cpu < g_gov_cpus[c].first + g_gov_cpus[c].n && b > busy[c]) {
++				busy[c] = b;
++			}
++		}
++	}
++	g_gov_was_at = now;
++	for (unsigned c = GOV_S; c < GOV_CL; c++) {
++		uint32_t cur = g_osm_mhz[c][g_osm_row[c]], util = busy[c] * cur / 1000u, w = util * 100u / (p->tl ? p->tl : 80u);
++		eff[c] = util;
++		g_gov_busy[c] = busy[c];
++		if (busy[c] * 100u >= p->hs_load * 1000u) {
++			w = GOV_MAX(w, p->hs[c]);
++		}
++		g_gov_full_n[c] = busy[c] >= 980u ? g_gov_full_n[c] + 1u : 0;
++		if (g_gov_full_n[c] >= 2u) {
++			w = GOV_TOP;                    /* (schedutil: a cluster that stays full goes to its top) */
++		}
++		want[c] = GOV_MAX(w, floor[c]);
++	}
++	{
++		uint32_t l3 = GOV_MAX(gov_l3_vote(GOV_S, eff[GOV_S]), GOV_MAX(gov_l3_vote(GOV_G, eff[GOV_G]), gov_l3_vote(GOV_P, eff[GOV_P])));
++		want[GOV_L3] = GOV_MAX(l3 * p->l3_pct / 100u, floor[GOV_L3]);
++	}
++	for (unsigned c = 0; c < GOV_CL; c++) {
++		uint32_t row = gov_row(c, want[c]);
++		if (row > g_osm_row[c]) {
++			osm_set(c, row);
++			g_gov_down_n[c] = 0;
++		} else if (row < g_osm_row[c]) {
++			if (++g_gov_down_n[c] >= GOV_MAX(p->down_ticks, 1u)) {
++				osm_set(c, row);
++				g_gov_down_n[c] = 0;
++			}
++		} else {
++			g_gov_down_n[c] = 0;
++		}
++	}
++	/* the GPU */
++	if (g_kgsl_ready && g_gpu_nlevels != 0) {
++		uint32_t lvl = g_gpu_level < g_gpu_nlevels ? g_gpu_level : g_gpu_nlevels - 1u, mhz = g_gpu_mhz[lvl], slowest = 0,
++		    fastest_floor = g_gpu_nlevels - 1u;
++		uint64_t ticks, held_ns = 0;
++		gpu_lock();
++		gpu_times();
++		ticks = g_gpu_busy_ticks;
++		gpu_unlock();
++		if (g_gov_gpu_was_ticks != 0 && mhz != 0) {
++			g_gov_gpu_busy_us += (ticks - g_gov_gpu_was_ticks) / mhz;
++			g_gov_gpu_tot_us += dt_ns / 1000u;
++		}
++		g_gov_gpu_was_ticks = ticks;
++		for (uint32_t i = 0; i < g_gpu_nlevels; i++) {
++			if (g_gpu_mhz[i] >= p->gpu_base) {
++				slowest = i;            /* the slowest level at or above the floor at rest */
++			}
++			if (tr && g_gpu_mhz[i] >= p->tr_gpu) {
++				fastest_floor = i;
++			}
++		}
++		absolutetime_to_nanoseconds(now - g_gov_gpu_changed_at, &held_ns);
++		if (g_gov_gpu_tot_us >= 10000u) {
++			uint32_t b = (uint32_t)(g_gov_gpu_busy_us * 100u / g_gov_gpu_tot_us), held_ms = (uint32_t)(held_ns / NSEC_PER_MSEC);
++			g_gov_gpu_busy = b;
++			if (b > p->gpu_up2 && lvl >= 2u) {
++				lvl -= 2u;
++			} else if (b > p->gpu_up && lvl >= 1u) {
++				lvl -= 1u;
++			} else if (b < p->gpu_dn && held_ms >= p->gpu_dn_ms) {
++				lvl += 1u;
++			} else if (b < p->gpu_mid && held_ms >= p->gpu_mid_ms) {
++				lvl += 1u;
++			}
++			g_gov_gpu_busy_us = g_gov_gpu_tot_us = 0;
++		}
++		if (lvl > slowest) {
++			lvl = slowest;
++		}
++		if (tr && lvl > fastest_floor) {
++			lvl = fastest_floor;
++		}
++		if (lvl != g_gpu_level) {
++			uint64_t o = 0;
++			gpu_lock();
++			g_level_quiet = 1;
++			g_level_nowait = 1;
++			(void)gpu_set_level(lvl, &o);
++			g_level_nowait = 0;
++			g_level_quiet = 0;
++			gpu_unlock();
++			g_gov_gpu_changed_at = now;
++		}
++	}
++}
++
++/*
++ * What the clocks were, for the bench (both governors): kern.sweet_dvfs_stats, running sums since the boot -- ms, then
++ * for L3, silver, gold, prime and the GPU the MHz asked times ms (the average: its difference over the ms'), the touches
++ * seen, and the governor's last view (busiest CPU per cluster permille, GPU busy %, rows, GPU level).
++ */
++static uint64_t g_st_ms_x1000, g_st_mhzms[GOV_CL + 1], g_st_at;
++static void
++stats_add(uint64_t now)
++{
++	uint64_t ns = 0;
++	if (g_st_at != 0) {
++		absolutetime_to_nanoseconds(now - g_st_at, &ns);
++		uint64_t us = ns / 1000u;
++		g_st_ms_x1000 += us;
++		for (unsigned c = 0; c < GOV_CL; c++) {
++			g_st_mhzms[c] += (uint64_t)(g_osm_base[c] ? g_osm_mhz[c][g_osm_row[c]] : 0) * us / 1000u;
++		}
++		if (g_gpu_nlevels != 0) {
++			g_st_mhzms[GOV_CL] += (uint64_t)g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : 0] * us / 1000u;
++		}
++	}
++	g_st_at = now;
++}
++
++static int
++sysctl_sweet_dvfs_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[400];
++	snprintf(s, sizeof(s), "ms %llu l3 %llu silver %llu gold %llu prime %llu gpu %llu gov %d taps %u swipes %u "
++	    "busy %u/%u/%u gpu%% %u rows %u/%u/%u/%u lvl %u",
++	    g_st_ms_x1000 / 1000u, g_st_mhzms[0], g_st_mhzms[1], g_st_mhzms[2], g_st_mhzms[3], g_st_mhzms[4], g_clocks.gov,
++	    g_t_taps, g_t_swipes, g_gov_busy[1], g_gov_busy[2], g_gov_busy[3], g_gov_gpu_busy, g_osm_row[0], g_osm_row[1],
++	    g_osm_row[2], g_osm_row[3], g_gpu_level);
++	return SYSCTL_OUT(req, s, strlen(s) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_dvfs_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_dvfs_stats, "A", "clock residency sums (MHz*ms) since the boot, for the bench");
++
++/*
++ * The battery's current and voltage every 100 ms (the PM8150B fuel gauge's live mirrors, fg-batt-info 0x41A2/0x41A0,
++ * their latched copies at +6 to reject torn reads; read only, as SweetBattery.cpp): kern.sweet_power -- running sums
++ * of mA*ms and mW*ms (drawn from the battery positive), the samples, the last mA and mV.
++ */
++extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++static int64_t g_pw_mams, g_pw_mwms;
++static uint64_t g_pw_ms, g_pw_at;
++static uint32_t g_pw_n;
++static int g_pw_ma;
++static uint32_t g_pw_mv;
++
++static bool
++pw_word(unsigned addr, uint16_t *v)
++{
++	for (unsigned attempt = 0; attempt < 4u; attempt++) {
++		uint8_t a0, a1, b0, b1;
++		if (sweet_spmi_read(2, addr, &a0) || sweet_spmi_read(2, addr + 1u, &a1) || sweet_spmi_read(2, addr + 6u, &b0) ||
++		    sweet_spmi_read(2, addr + 7u, &b1)) {
++			return false;
++		}
++		if (a0 == b0 && a1 == b1) {
++			*v = (uint16_t)(a0 | (a1 << 8));
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++pw_sample(uint64_t now)
++{
++	uint16_t vraw, iraw;
++	uint64_t ns = 0;
++	if (!pw_word(0x41A0u, &vraw) || !pw_word(0x41A2u, &iraw)) {
++		g_pw_at = 0;
++		return;
++	}
++	int sraw = (iraw & 0x8000u) ? (int)iraw - 65536 : (int)iraw;
++	int ma = (int)((int64_t)sraw * 488281 / 1000000);           /* positive: drawn from the battery */
++	uint32_t mv = (uint32_t)(((uint64_t)vraw * 122070u) / 1000000u);
++	if (g_pw_at != 0) {
++		absolutetime_to_nanoseconds(now - g_pw_at, &ns);
++		uint64_t ms = ns / NSEC_PER_MSEC;
++		g_pw_mams += (int64_t)ma * (int64_t)ms;
++		g_pw_mwms += (int64_t)ma * (int64_t)mv / 1000 * (int64_t)ms;
++		g_pw_ms += ms;
++	}
++	g_pw_at = now;
++	g_pw_ma = ma;
++	g_pw_mv = mv;
++	g_pw_n++;
++}
++
++static int
++sysctl_sweet_power SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[200];
++	snprintf(s, sizeof(s), "ms %llu mAms %lld mWms %lld n %u ma %d mv %u", g_pw_ms, g_pw_mams, g_pw_mwms, g_pw_n, g_pw_ma, g_pw_mv);
++	return SYSCTL_OUT(req, s, strlen(s) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_power, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_power, "A", "battery current and power sums (mA*ms, mW*ms, drawn positive) every 100 ms");
++
++/*
++ * The SoC's temperatures (TSENS, stock DTB tsens@c222000 / @c223000, their TM blocks at 0xc263000 / 0xc265000; a
++ * sensor's word at 0xa0 + 4n: bits 11:0 tenths of a degree, signed, bit 21 valid), read every 100 ms with the power:
++ * kern.sweet_temps -- now and the highest since the last read (which starts it again), silver / big / GPU / DDR, tenths.
++ */
++static vm_offset_t g_ts[2];
++static int g_ts_now[4], g_ts_peak[4];
++static bool g_ts_tried;
++
++static int
++ts_read(unsigned blk, unsigned n)
++{
++	uint32_t w = gpu_rd(g_ts[blk], 0xa0u + 4u * n);
++	int t = (int)(w & 0xfffu);
++	if (!(w & (1u << 21))) {
++		return -9999;
++	}
++	return t & 0x800 ? t - 0x1000 : t;
++}
++
++static void
++ts_sample(void)
++{
++	/* tsens0 1-4 cpu-0-x (silver), 7-14 cpu-1-x (gold, prime), 15 gpuss-0; tsens1 11 gpuss-1, 3 ddr */
++	int v[4] = { -9999, -9999, -9999, -9999 };
++	if (!g_ts_tried) {
++		g_ts_tried = true;
++		g_ts[0] = ml_io_map(0xc263000u, 0x1000u);
++		g_ts[1] = ml_io_map(0xc265000u, 0x1000u);
++	}
++	if (!g_ts[0] || !g_ts[1]) {
++		return;
++	}
++	for (unsigned n = 1; n <= 4u; n++) {
++		v[0] = GOV_MAX(v[0], ts_read(0, n));
++	}
++	for (unsigned n = 7; n <= 14u; n++) {
++		v[1] = GOV_MAX(v[1], ts_read(0, n));
++	}
++	v[2] = GOV_MAX(ts_read(0, 15), ts_read(1, 11));
++	v[3] = ts_read(1, 3);
++	for (unsigned i = 0; i < 4u; i++) {
++		g_ts_now[i] = v[i];
++		g_ts_peak[i] = GOV_MAX(g_ts_peak[i], v[i]);
++	}
++}
++
++static int
++sysctl_sweet_temps SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char s[160];
++	snprintf(s, sizeof(s), "silver %d big %d gpu %d ddr %d peak %d %d %d %d", g_ts_now[0], g_ts_now[1], g_ts_now[2],
++	    g_ts_now[3], g_ts_peak[0], g_ts_peak[1], g_ts_peak[2], g_ts_peak[3]);
++	for (unsigned i = 0; i < 4u; i++) {
++		g_ts_peak[i] = g_ts_now[i];
++	}
++	return SYSCTL_OUT(req, s, strlen(s) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_temps, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_temps, "A", "SoC temperatures (tenths of a degree): silver big GPU DDR, now and peak since the last read");
++
++
+ void
+ sweet_dvfs_kick(void)
+ {
+@@ -4711,6 +5274,10 @@ sysctl_sweet_dvfs_kick SYSCTL_HANDLER_ARGS
+ 	int v = 0, error = SYSCTL_IN(req, &v, sizeof(v));
+ 	if (error == 0 && req->newptr != USER_ADDR_NULL) {
+ 		sweet_dvfs_kick();
++		if (v & 0x40000000) {
++			/* (0151) hidtouch's touches for the governor: 0x40000000 | down << 27 | x << 12 | y */
++			sweet_dvfs_touch((v >> 27) & 1, (v >> 12) & 0x7ff, v & 0xfff);
++		}
+ 	}
+ 	return error;
+ }
+@@ -4752,7 +5319,7 @@ clocks_apply(const struct sweet_clocks *k, const char *why)
+ static bool
+ clocks_file(struct sweet_clocks *k)
+ {
+-	static const char *keys[7] = { "l3=", "little=", "big=", "prime=", "gpu=", "auto=", "boost=" };
++	static const char *keys[8] = { "l3=", "little=", "big=", "prime=", "gpu=", "auto=", "boost=", "gov=" };
+ 	char text[128];
+ 	vnode_t vp = NULLVP;
+ 	vfs_context_t ctx;
+@@ -4768,7 +5335,7 @@ clocks_file(struct sweet_clocks *k)
+ 	(void)vn_rdwr(UIO_READ, vp, (caddr_t)text, sizeof(text) - 1, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
+ 	    vfs_context_proc(ctx));
+ 	vnode_put(vp);
+-	for (unsigned i = 0; i < 7u; i++) {
++	for (unsigned i = 0; i < 8u; i++) {
+ 		const char *at = strnstr(text, keys[i], sizeof(text));
+ 		uint32_t v = 0;
+ 		bool any = false;
+@@ -4788,8 +5355,10 @@ clocks_file(struct sweet_clocks *k)
+ 			k->gpu = v;
+ 		} else if (i == 5u) {
+ 			k->autoidle = v != 0;
+-		} else {
++		} else if (i == 6u) {
+ 			k->boost = v != 0;
++		} else {
++			k->gov = v <= 2u ? (int)v : 0;
+ 		}
+ 	}
+ 	return true;
+@@ -4798,23 +5367,51 @@ clocks_file(struct sweet_clocks *k)
+ static void
+ dvfs_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t idle_after, was_ticks = 0, was_at = 0;
++	uint64_t idle_after, was_ticks = 0, was_at = 0, file_at = 0, pw_at = 0, half, tenth;
+ 	uint32_t boosted = 99u, calm = 0;
+ 	struct sweet_clocks applied;
+ 	bool first = true;
+ 	nanoseconds_to_absolutetime(1500ull * NSEC_PER_MSEC, &idle_after);
++	nanoseconds_to_absolutetime(500ull * NSEC_PER_MSEC, &half);
++	nanoseconds_to_absolutetime(100ull * NSEC_PER_MSEC, &tenth);
+ 	bzero(&applied, sizeof(applied));
+ 	for (unsigned tick = 0;; tick++) {
+ 		struct sweet_clocks want;
+ 		bool idle, dark = sweet_panel_off() != 0;
+-		assert_wait_timeout((event_t)&g_dvfs_chan, THREAD_UNINT, 100, NSEC_PER_MSEC);
++		uint64_t now;
++		assert_wait_timeout((event_t)&g_dvfs_chan, THREAD_UNINT, g_clocks.gov != 0 && !dark ? GOV_TICK_MS : 100u,
++		    NSEC_PER_MSEC);
+ 		(void)thread_block(THREAD_CONTINUE_NULL);
+-		if (tick % 5u == 0) {
++		now = mach_absolute_time();
++		if (now - file_at >= half) {
+ 			struct sweet_clocks k = g_clocks;
++			file_at = now;
+ 			if (clocks_file(&k) && memcmp(&k, &g_clocks, sizeof(k)) != 0) {
++				if (k.gov != g_clocks.gov) {
++					printf("SWEET GOV: governor %d (%s)\n", k.gov, k.gov == 1 ? "MIUI's" : k.gov == 2 ? "tuned" :
++					    "the clocks as asked");
++				}
+ 				g_clocks = k;
+ 			}
++			if (g_clocks.gov == 2 || !g_gov_tuned_set) {
++				gov_file();
++			}
++		}
++		stats_add(now);
++		if (now - pw_at >= tenth) {
++			pw_at = now;
++			pw_sample(now);
++			ts_sample();
++		}
++		dark = sweet_panel_off() != 0;
++		if (g_clocks.gov != 0 && !dark) {
++			g_dvfs_idle = 0;                /* (GPU submissions' kicks do not wake the governor) */
++			gov_tick(now);
++			first = true;                   /* (back to gov=0: its clocks set again) */
++			continue;
+ 		}
++		g_gov_was_at = 0;                       /* (back to a governor: its first tick only measures) */
++		g_gov_gpu_was_ticks = 0;
+ 		idle = g_clocks.autoidle && mach_absolute_time() - g_dvfs_active > idle_after;
+ 		g_dvfs_idle = idle;
+ 		want = dark ? g_clocks_dark : idle ? g_clocks_idle : g_clocks;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 43459c9..b538fa9 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -589,10 +589,13 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++extern "C" void sweet_dvfs_touch(int down, int x, int y);     /* sweet_gpu.c (0151): the governor's gesture boosts */
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+ 	sweet_dvfs_kick();              /* (a touch after an idle while: the frames it brings are drawn at speed) */
++	sweet_dvfs_touch(down, x, y);   /* (any finger: a second one is rare, and only ever extends a boost) */
+ 	if (gSweetTouch) {
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 7a0c0e2..a4f2406 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5037,6 +5037,24 @@ task_t sweet_window_server_task;        /* backboardd, once it opens the display
+  */
+ task_t sweet_ui_server_task;
+ uint32_t sweet_big_sb = 1;              /* (kern.sweet_big_sb, bsd/kern/sweet_amfi.c) */
++
++/*
++ * The clock governor's measure of load (bsd/dev/sweet_gpu.c, xnu 0151): how long CPU n has been idle so far, in
++ * mach time (recount's, up to now if it idles at the moment); UINT64_MAX for no such CPU.
++ */
++uint64_t sweet_cpu_idle_mach(int cpu);
++uint64_t
++sweet_cpu_idle_mach(int cpu)
++{
++	processor_t p;
++	struct recount_usage usage;
++	uint64_t idle = 0;
++	if (cpu < 0 || cpu >= MAX_SCHED_CPUS || (p = processor_array[cpu]) == PROCESSOR_NULL) {
++		return UINT64_MAX;
++	}
++	recount_processor_usage(&p->pr_recount, &usage, &idle);
++	return idle;
++}
+ #endif
+ 
+ processor_t

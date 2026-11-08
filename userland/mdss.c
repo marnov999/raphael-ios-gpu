@@ -12,6 +12,7 @@
  *   mdss key N                   a button pressed and let go (0 power, 1 volume up, 2 volume down)
  *   mdss sysctlw NAME VALUE      a 32-bit sysctl set
  *   mdss sysctl NAME [N [MS]]    a 32-bit sysctl, N times MS apart
+ *   mdss sysctls NAME..          string sysctls (kern.sweet_dvfs_stats, kern.sweet_power, kern.sweet_temps)
  *   mdss line [MS]               the tear check's read pointer every 0.1 ms for MS (20): line, us
  */
 #include <stdio.h>
@@ -305,6 +306,19 @@ main(int argc, char **argv)
 			return 1;
 		}
 		printf("%s: %u -> %u\n", argv[2], old, v);
+		return 0;
+	}
+	if (strcmp(argv[1], "sysctls") == 0 && argc >= 3) {   /* sysctls NAME..: string sysctls, one line each */
+		for (int i = 2; i < argc; i++) {
+			char s[1024];
+			size_t len = sizeof(s) - 1;
+			memset(s, 0, sizeof(s));
+			if (sysctlbyname(argv[i], s, &len, NULL, 0) != 0) {
+				perror(argv[i]);
+				return 1;
+			}
+			printf("%s: %s\n", argv[i], s);
+		}
 		return 0;
 	}
 	if (strcmp(argv[1], "sysctl") == 0 && argc >= 3) {    /* sysctl NAME [COUNT [MS]]: a 32-bit sysctl, COUNT times MS apart */

@@ -94,20 +94,23 @@ static uint32_t edge;               /* the contact began at a panel edge: the bi
 #define PANEL_H 2340.0
 
 
-/* the clocks up first, as a touch of the panel's own does (xnu 0139 kern.sweet_dvfs_kick) */
+/*
+ * the clocks up first, as a touch of the panel's own does (xnu 0139 kern.sweet_dvfs_kick), with where the finger is
+ * and whether it is down for the governor's gesture boosts (0151: 0x40000000 | down << 27 | x << 12 | y; older
+ * kernels only kick)
+ */
 static void
-kick(void)
+kick(double px, double py, int touching)
 {
-	int v = 1;
+	int x = px < 0 ? 0 : px > 2047 ? 2047 : (int)px, y = py < 0 ? 0 : py > 4095 ? 4095 : (int)py;
+	int v = 0x40000000 | (touching ? 1 << 27 : 0) | x << 12 | y;
 	(void)sysctlbyname("kern.sweet_dvfs_kick", NULL, NULL, &v, sizeof(v));
 }
 
 static void
 send(double px, double py, uint32_t mask, int touching)
 {
-	if (mask & kEventTouch) {
-		kick();
-	}
+	kick(px, py, touching);
 	mask |= edge;
 	uint64_t now = mach_absolute_time();
 	double x = px / PANEL_W, y = py / PANEL_H;         /* the digitizer speaks in 0..1 */
