@@ -2,11 +2,11 @@
 # measure.sh NAME SECS PROCESS -- TOUCH LINES... (Mi 9T Pro copy of devtools/measure.sh): start the kernel's
 # profile (+ frame timeline) of PROCESS for SECS, wait until the kernel says it began, inject the touches
 # (tools/touch.sh); when it is done, print the frame statistics (inside animations) and thread times.
-# LOG= the USB log file tools/usblog.py writes (default out/logs/u4-usb.log).
+# LOG= the USB log file tools/usblog.py writes (default: the newest out/logs/*-usb.log).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 NAME=$1; SECS=$2; PROC=$3; shift 4
-LOG=${LOG:-out/logs/u4-usb.log}
+LOG=${LOG:-$(ls -t out/logs/*-usb.log 2>/dev/null | head -1)}   # the newest usblog.py file (the live one)
 S=/tmp/claude-1000/-home-marnov-xmiphones/9c49bc3f-61eb-47a2-b259-56d8036445a1/scratchpad
 M=$(wc -c < "$LOG")
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT

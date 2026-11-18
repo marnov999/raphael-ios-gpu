@@ -534,3 +534,16 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   Tools (scratchpad e8d37b2e): holdtrace.py (events around holds), holdsamp.py (render thread during holds),
   topfn.py (a thread's hottest functions; ipsw a2s top-N, 8 parallel). Slides: backboardd/SpringBoard print
   "cahook: slide" at start. Phone was found in fastboot 11-08 (log ends 23:04 11-07; cause unknown).
+- **2026-11-09 xnu 0151 clock governor (u37, kernel 42527491204).** /usr/local/gltest/clocks "gov=" 0 = fixed max
+  (old), 1 = MIUI's own values, 2 = tuned; /usr/local/gltest/gov ("key=V" / "key=L3,S,G,P", re-read every 0.5 s,
+  each read starts from the built-in tuned profile) overrides tuned. 10 ms ticks, per-CPU busy from recount idle,
+  MIUI-style touch/drag/fling/transition floors (hidtouch kicks kern.sweet_dvfs_kick), GPU level changes without
+  the fence wait. New sysctls: kern.sweet_dvfs_stats (MHz*ms residency), kern.sweet_power (fg-gen4 IBATT/VBATT
+  shadow, 100 ms; USB charging hides part of light-load draw), kern.sweet_temps (TSENS, peaks reset on read).
+  Bench: bench81-ab.sh snapshots them per section, tools/analysis/govstats.py prints the table.
+  **LOG= must name the live usblog file** (this boot: LOG=out/logs/i4-usb.log); default u4 = empty frame profiles.
+  gv2 (3 rounds same boot): tuned matches max on home/Settings at -12..-23% power, switcher 9.0 vs 8.4% repeats,
+  hcr 6.3% vs 0% repeats (GPU avg 357: 10 ms GPU busy windows < one frame -> spurious step-downs); MIUI -23..-31%
+  power, switcher 12% repeats. gv3 tuned2 (gpu_up 60/80, dn 15@300, mid off, dr = pf): switcher better than max
+  (8.4 vs 10.3%) but hcr 7.6% vs 3.1% and power only -10..-14%. Run-to-run noise ~1-2 points of repeat %.
+  23:44 11-08: the davinci WiFi session's fbreboot to 192.168.9.2 rebooted raphael (both phones can hold .9.2).

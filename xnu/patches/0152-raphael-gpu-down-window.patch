@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 39ed765..afb89c8 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -4723,6 +4723,7 @@ struct gov_prof {
+ 	uint32_t fl[GOV_CL], fl_ms;
+ 	uint32_t tr[GOV_CL], tr_ms, tr_gpu;
+ 	uint32_t gpu_base, gpu_up, gpu_up2, gpu_dn, gpu_dn_ms, gpu_mid, gpu_mid_ms;
++	uint32_t gpu_win;               /* ms: step-downs judged on this long an average (0 = one 10 ms window) */
+ 	uint32_t l3_pct;
+ };
+ #define GOV_TOP 9999u
+@@ -4734,6 +4735,7 @@ static const struct gov_prof g_gov_miui = {
+ 	.fl = { 806, 1555, 1612, 1612 }, .fl_ms = 800,
+ 	.tr = { GOV_TOP, GOV_TOP, GOV_TOP, GOV_TOP }, .tr_ms = 400, .tr_gpu = 499,
+ 	.gpu_base = 257, .gpu_up = 85, .gpu_up2 = 95, .gpu_dn = 50, .gpu_dn_ms = 80, .gpu_mid = 70, .gpu_mid_ms = 500,
++	.gpu_win = 0,
+ 	.l3_pct = 100,
+ };
+ static const struct gov_prof g_gov_tuned0 = {
+@@ -4744,6 +4746,7 @@ static const struct gov_prof g_gov_tuned0 = {
+ 	.fl = { 1344, 1555, 2016, 2419 }, .fl_ms = 1000,
+ 	.tr = { GOV_TOP, GOV_TOP, GOV_TOP, GOV_TOP }, .tr_ms = 600, .tr_gpu = 499,
+ 	.gpu_base = 345, .gpu_up = 75, .gpu_up2 = 90, .gpu_dn = 40, .gpu_dn_ms = 100, .gpu_mid = 60, .gpu_mid_ms = 500,
++	.gpu_win = 50,
+ 	.l3_pct = 125,
+ };
+ static struct gov_prof g_gov_tuned;
+@@ -4755,7 +4758,7 @@ static const struct { const char *name; size_t off; unsigned n; } g_gov_keys[] =
+ 	GK(tl, 1), GK(hs_load, 1), GK(hs, 4), GK(base, 4), GK(down_ticks, 1), GK(in_s, 1), GK(in_ms, 1),
+ 	GK(pf, 4), GK(pf_ms, 1), GK(dr, 4), GK(fl, 4), GK(fl_ms, 1), GK(tr, 4), GK(tr_ms, 1), GK(tr_gpu, 1),
+ 	GK(gpu_base, 1), GK(gpu_up, 1), GK(gpu_up2, 1), GK(gpu_dn, 1), GK(gpu_dn_ms, 1), GK(gpu_mid, 1),
+-	GK(gpu_mid_ms, 1), GK(l3_pct, 1),
++	GK(gpu_mid_ms, 1), GK(gpu_win, 1), GK(l3_pct, 1),
+ #undef GK
+ };
+ 
+@@ -4810,10 +4813,10 @@ gov_file(void)
+ 		g_gov_tuned = p;
+ 		g_gov_tuned_set = true;
+ 		printf("SWEET GOV: tuned profile: tl %u hs_load %u hs %u/%u/%u pf %u/%u/%u/%u dr %u/%u/%u/%u fl %u/%u/%u/%u "
+-		    "%u ms tr %u ms GPU>=%u base GPU %u up %u/%u dn %u@%u mid %u@%u l3 %u%%\n",
++		    "%u ms tr %u ms GPU>=%u base GPU %u up %u/%u dn %u@%u mid %u@%u win %u l3 %u%%\n",
+ 		    p.tl, p.hs_load, p.hs[1], p.hs[2], p.hs[3], p.pf[0], p.pf[1], p.pf[2], p.pf[3], p.dr[0], p.dr[1], p.dr[2],
+ 		    p.dr[3], p.fl[0], p.fl[1], p.fl[2], p.fl[3], p.fl_ms, p.tr_ms, p.tr_gpu, p.gpu_base, p.gpu_up, p.gpu_up2,
+-		    p.gpu_dn, p.gpu_dn_ms, p.gpu_mid, p.gpu_mid_ms, p.l3_pct);
++		    p.gpu_dn, p.gpu_dn_ms, p.gpu_mid, p.gpu_mid_ms, p.gpu_win, p.l3_pct);
+ 	}
+ }
+ 
+@@ -4920,6 +4923,7 @@ gov_l3_vote(unsigned c, uint32_t eff)
+ static uint64_t g_gov_idle_was[8], g_gov_was_at;
+ static uint32_t g_gov_down_n[GOV_CL], g_gov_full_n[GOV_CL];
+ static uint64_t g_gov_gpu_was_ticks, g_gov_gpu_busy_us, g_gov_gpu_tot_us, g_gov_gpu_changed_at;
++static uint64_t g_gov_gpu_lbusy_us, g_gov_gpu_ltot_us; /* the step-down window (gpu_win) */
+ static volatile uint32_t g_gov_busy[GOV_CL];    /* the last tick's busiest CPU of each cluster, permille */
+ static volatile uint32_t g_gov_gpu_busy;        /* the GPU's, percent, over the last window */
+ 
+@@ -5041,6 +5045,8 @@ gov_tick(uint64_t now)
+ 		if (g_gov_gpu_was_ticks != 0 && mhz != 0) {
+ 			g_gov_gpu_busy_us += (ticks - g_gov_gpu_was_ticks) / mhz;
+ 			g_gov_gpu_tot_us += dt_ns / 1000u;
++			g_gov_gpu_lbusy_us += (ticks - g_gov_gpu_was_ticks) / mhz;
++			g_gov_gpu_ltot_us += dt_ns / 1000u;
+ 		}
+ 		g_gov_gpu_was_ticks = ticks;
+ 		for (uint32_t i = 0; i < g_gpu_nlevels; i++) {
+@@ -5055,14 +5061,23 @@ gov_tick(uint64_t now)
+ 		if (g_gov_gpu_tot_us >= 10000u) {
+ 			uint32_t b = (uint32_t)(g_gov_gpu_busy_us * 100u / g_gov_gpu_tot_us), held_ms = (uint32_t)(held_ns / NSEC_PER_MSEC);
+ 			g_gov_gpu_busy = b;
++			/*
++			 * Up on one 10 ms window, down only on gpu_win's average: a frame (12.3 ms at 81 Hz) is longer than
++			 * the window, so one quiet window inside a busy run of frames stepped the clock down (gv2: hcr 6%
++			 * repeats at GPU avg 357 MHz).
++			 */
+ 			if (b > p->gpu_up2 && lvl >= 2u) {
+ 				lvl -= 2u;
+ 			} else if (b > p->gpu_up && lvl >= 1u) {
+ 				lvl -= 1u;
+-			} else if (b < p->gpu_dn && held_ms >= p->gpu_dn_ms) {
+-				lvl += 1u;
+-			} else if (b < p->gpu_mid && held_ms >= p->gpu_mid_ms) {
+-				lvl += 1u;
++			} else if (p->gpu_win == 0 || g_gov_gpu_ltot_us >= p->gpu_win * 1000ull) {
++				uint32_t lb = p->gpu_win == 0 ? b : (uint32_t)(g_gov_gpu_lbusy_us * 100u / g_gov_gpu_ltot_us);
++				if (lb < p->gpu_dn && held_ms >= p->gpu_dn_ms) {
++					lvl += 1u;
++				} else if (lb < p->gpu_mid && held_ms >= p->gpu_mid_ms) {
++					lvl += 1u;
++				}
++				g_gov_gpu_lbusy_us = g_gov_gpu_ltot_us = 0;
+ 			}
+ 			g_gov_gpu_busy_us = g_gov_gpu_tot_us = 0;
+ 		}
+@@ -5082,6 +5097,7 @@ gov_tick(uint64_t now)
+ 			g_level_quiet = 0;
+ 			gpu_unlock();
+ 			g_gov_gpu_changed_at = now;
++			g_gov_gpu_lbusy_us = g_gov_gpu_ltot_us = 0;    /* (busy % at the old clock) */
+ 		}
+ 	}
+ }
+@@ -5412,6 +5428,7 @@ dvfs_thread(__unused void *arg, __unused wait_result_t wr)
+ 		}
+ 		g_gov_was_at = 0;                       /* (back to a governor: its first tick only measures) */
+ 		g_gov_gpu_was_ticks = 0;
++		g_gov_gpu_lbusy_us = g_gov_gpu_ltot_us = 0;
+ 		idle = g_clocks.autoidle && mach_absolute_time() - g_dvfs_active > idle_after;
+ 		g_dvfs_idle = idle;
+ 		want = dark ? g_clocks_dark : idle ? g_clocks_idle : g_clocks;
