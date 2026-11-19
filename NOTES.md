@@ -584,3 +584,15 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   the CPU: claiming ASTC (metal_profile / supportsFamily) is the next speed-up. Real Racing 3: PVRTC needs a
   software decode. **Battery**: the 7 h unattended run drained it to 2% (3.42 V); iOS here barely charges
   (~0-130 mA net at idle, ~500 mA draw under game load). Phone left in MIUI (tomiui RAM boot) charging, screen off.
+- **Minecraft Play screen (white), 2026-11-19 investigation.** Fixed on the way: uniform ARRAYS in reflection
+  (Apple's struct_type_info gives an array member ONE element's size; the driver infers the length from the gap to
+  the next member: Data_VS @400, next @2448 = 128 x float4). Ruled out: GPU path (Gameface renders the Play page
+  ONCE -- a full-screen clear + one quad with 1x1 placeholder textures -- into its 2436x1125 UI texture, which the
+  UIBlit composite then shows: a blank white page; driver logs no refusal), network (nettest: DNS/connect fail
+  at once like airplane mode; pathtest: NWPathMonitor reports unsatisfied at once), keychain (all 0/-25300 now),
+  free-storage queries (disktest: instant), slow load (white for 8 min). Profile (kernel PRF via /tmp/prof_go,
+  scratchpad topfn.py, shared-cache slide from "slide 0x..." in the kernel log): main thread asleep 96%, waiting on
+  mutex/condvar; 4 job-system workers spin in sched_yield (the 220% CPU). Settings and the Dressing Room (3D
+  characters) render fine. So the page's data never arrives: game logic, stripped binary. Content Log File enabled
+  in Creator settings (stays empty). Next idea: the OreUI page may wait on Xbox/XAL sign-in state or Realms data;
+  try with network via NAT on the host (needs sudo, user's call), or RE the world-list data source.

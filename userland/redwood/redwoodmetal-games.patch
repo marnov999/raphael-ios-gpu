@@ -1,5 +1,5 @@
 --- metal/redwood/redwoodmetal.m.bak-20261119	2026-11-19 00:24:28.063974172 +0100
-+++ metal/redwood/redwoodmetal.m	2026-11-19 11:11:32.850898841 +0100
++++ metal/redwood/redwoodmetal.m	2026-11-19 12:08:43.462207288 +0100
 @@ -93,6 +93,8 @@
  #import <Metal/Metal.h>          /* for MTLSize and the public enumerations, nothing private */
  #import <objc/message.h>
@@ -160,7 +160,7 @@
  @end
  
  @interface RedwoodMetalTexture : _MTLResource {
-@@ -1421,6 +1515,281 @@
+@@ -1421,6 +1515,285 @@
  	}
  }
  
@@ -421,7 +421,11 @@
 +		[r release];
 +	}
 +	pthread_mutex_unlock(&lock);
-+	if (rw_trace_bind_on()) {
++	static int reflect_log = -1;   /* /usr/local/gltest/rw_trace_reflect exists: every reflection, no budget */
++	if (reflect_log == -1) {
++		reflect_log = access("/usr/local/gltest/rw_trace_reflect", F_OK) == 0;
++	}
++	if (reflect_log || rw_trace_bind_on()) {
 +		for (unsigned i = 0; i < n; i++) {
 +			for (unsigned k = 0; k < args[i].member_count; k++) {
 +				rw_print("REFLECT %s: %s member %s '%s' offset %u size %u -> MTLDataType %lu\n",
@@ -442,7 +446,7 @@
  @implementation RedwoodMetalDevice
  
  + (void)load
-@@ -1541,9 +1910,9 @@
+@@ -1541,9 +1914,9 @@
  			setenv("FD_MESA_DEBUG", access("/usr/local/gltest/metal_noubwc", F_OK) == 0 ? "sysmem,noubwc,notile" : "sysmem", 0);
  			rw_print("FD_MESA_DEBUG=%s (metal_nogmem)\n", getenv("FD_MESA_DEBUG"));
  		}
@@ -454,7 +458,7 @@
  	}
  
  	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
-@@ -1576,7 +1945,7 @@
+@@ -1576,7 +1949,7 @@
  - (void)dealloc
  {
  	if (_mesa != NULL) {
@@ -463,7 +467,7 @@
  	}
  	if (_gpu != IO_OBJECT_NULL) {
  		IOServiceClose(_gpu);
-@@ -1628,6 +1997,27 @@
+@@ -1628,6 +2001,27 @@
  		    (at = strstr(args, "metal_profile=")) != NULL && (at == args || at[-1] == ' ')) {
  			profile = (NSUInteger)strtoul(at + strlen("metal_profile="), NULL, 10);
  		}
@@ -491,7 +495,7 @@
  		rw_print("feature profile %lu, which is what Metal reads this device's "
  		         "whole capability surface out of (metal_profile= to change it; 0 claims Apple1 "
  		         "alone, 1 adds Apple2, which is the lowest rung MPS asks about)\n",
-@@ -1887,12 +2277,12 @@
+@@ -1887,12 +2281,12 @@
  
  	char why[512] = { 0 };
  	struct rwa_render_info info = { 0 };
@@ -506,7 +510,7 @@
  
  	if (render == NULL) {
  		/* PRINTED as well as returned, and RW_AGAIN because the same specification
-@@ -1925,10 +2315,17 @@
+@@ -1925,10 +2319,17 @@
  				     error:(NSError **)error
  {
  	(void)options;
@@ -526,7 +530,7 @@
  }
  
  /*
-@@ -2160,7 +2557,7 @@
+@@ -2160,15 +2561,28 @@
  	if (nort && shape.pixel_format == 70 && strcmp(getprogname(), "backboardd") != 0) {
  		shape.usage &= ~(unsigned)MTLTextureUsageRenderTarget;
  	}
@@ -535,7 +539,31 @@
  
  	if (texture == NULL) {
  		rw_print("%s\n", why);
-@@ -2205,7 +2602,7 @@
+ 		return nil;
+ 	}
+-	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
+-							 texture:texture
+-							   shape:&shape];
++	id made = [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
++							      texture:texture
++								shape:&shape];
++	/* a big texture: its pointer and what it holds before anyone writes it (Minecraft's UI texture was
++	 * white on the GPU though the only upload seen into a texture that size was zeros) */
++	if ((size_t)shape.width * shape.height >= 1000000 && shape.sample_count <= 1 && shape.pixel_format == 70) {
++		static unsigned said;
++		if (said++ < 40) {
++			uint8_t px[16] = { 0 };
++			[made getBytes:px bytesPerRow:16 fromRegion:MTLRegionMake2D(shape.width / 2, shape.height / 2, 1, 1)
++			   mipmapLevel:0];
++			rw_print("BIG TEX %p %ux%u usage %#x: centre before any write %02x%02x%02x%02x\n", made, shape.width,
++			    shape.height, shape.usage, px[0], px[1], px[2], px[3]);
++		}
++	}
++	return made;
+ }
+ 
+ /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest
+@@ -2205,7 +2619,7 @@
  		.lod_min = [descriptor lodMinClamp],
  		.lod_max = [descriptor lodMaxClamp],
  	};
@@ -544,7 +572,7 @@
  
  	if (sampler == NULL) {
  		rw_print("%s\n", why);
-@@ -2285,8 +2682,8 @@
+@@ -2285,8 +2699,8 @@
  		};
  	}
  
@@ -555,7 +583,7 @@
  
  	if (made == NULL) {
  		rw_print("%s\n", why);
-@@ -2438,10 +2835,10 @@
+@@ -2438,10 +2852,10 @@
  	struct rwa_argbuf_layout sets[8];
  	unsigned count = 0;
  
@@ -568,7 +596,7 @@
  		/* the frontend's own sentence, passed through: it names what it refused */
  		rw_print("%s\n", why);
  		return nil;
-@@ -2592,9 +2989,9 @@
+@@ -2592,9 +3006,9 @@
  
  	char why[512] = { 0 };
  	struct rwa_compute_info info = { 0 };
@@ -580,7 +608,7 @@
  	if (compute == NULL) {
  		/* The front end's own sentence, passed through rather than replaced: it says
  		 * which construct it refused, and an application can act on that. */
-@@ -3045,7 +3442,7 @@
+@@ -3045,7 +3459,7 @@
  	if (mesa_available() && [device mesaDevice] != NULL) {
  		char why[256] = { 0 };
  
@@ -589,7 +617,7 @@
  		if (_mesa == NULL) {
  			rw_print("Mesa would not allocate %lu bytes: %s\n",
  			         (unsigned long)length, why);
-@@ -3054,7 +3451,7 @@
+@@ -3054,7 +3468,7 @@
  		}
  		_owner = device;
  		_length = length;
@@ -598,7 +626,7 @@
  		return self;
  	}
  	if (gpu == IO_OBJECT_NULL || length == 0) {
-@@ -3105,7 +3502,7 @@
+@@ -3105,7 +3519,7 @@
  - (void)dealloc
  {
  	if (_mesa != NULL) {
@@ -607,7 +635,7 @@
  		[super dealloc];
  		return;
  	}
-@@ -3251,7 +3648,7 @@
+@@ -3251,7 +3665,7 @@
  {
  	self = [super init];
  	if (self == nil) {
@@ -616,7 +644,7 @@
  		return nil;
  	}
  	_owner = device;
-@@ -3263,7 +3660,7 @@
+@@ -3263,7 +3677,7 @@
  - (void)dealloc
  {
  	if (_texture != NULL) {
@@ -625,7 +653,7 @@
  	}
  	if (_iosurface != NULL) {
  		CFRelease(_iosurface);
-@@ -3344,12 +3741,38 @@
+@@ -3344,12 +3758,39 @@
  
  	(void)image;
  	rw_n_replace++;
@@ -633,8 +661,9 @@
 -			       stride, why, sizeof(why)) != 0) {
 +	if ((size_t)size[0] * size[1] >= 1000000) {
 +		static uint64_t last;
++		static unsigned big_said;
 +		uint64_t now = mach_absolute_time();
-+		if (now - last > 48000000ull) {   /* 2 s of the 24 MHz timebase */
++		if (now - last > 48000000ull || big_said++ < 30) {   /* the first 30, then one per 2 s */
 +			last = now;
 +			rw_print("BIG UPLOAD %p %ux%u at %u,%u level %lu stride %lu (upload %lu)\n", self, size[0], size[1],
 +			    origin[0], origin[1], (unsigned long)level, (unsigned long)stride, rw_n_replace);
@@ -667,7 +696,7 @@
  	    strcmp(getprogname(), "backboardd") != 0) {
  		rgba_said++;
  		/* the middle texel of what was written, as given and as read back */
-@@ -3390,8 +3813,8 @@
+@@ -3390,8 +3831,8 @@
  			     (unsigned)region.size.depth };
  
  	(void)image;
@@ -678,7 +707,7 @@
  		rw_print("reading texels: %s\n", why);
  	}
  }
-@@ -3420,8 +3843,8 @@
+@@ -3420,8 +3861,8 @@
  		         "older than this driver and cannot say what a depth buffer holds\n");
  		return NO;
  	}
@@ -689,7 +718,7 @@
  		rw_print("reading the depth of a texture: %s\n", why);
  		return NO;
  	}
-@@ -3572,7 +3995,7 @@
+@@ -3572,7 +4013,7 @@
  	 * nil to one of these */
  	self = [super initWithDevice:device samplerDescriptor:descriptor];
  	if (self == nil) {
@@ -698,7 +727,7 @@
  		return nil;
  	}
  	_sampler = sampler;
-@@ -3582,7 +4005,7 @@
+@@ -3582,7 +4023,7 @@
  - (void)dealloc
  {
  	if (_sampler != NULL) {
@@ -707,7 +736,7 @@
  	}
  	[super dealloc];
  }
-@@ -3603,7 +4026,7 @@
+@@ -3603,7 +4044,7 @@
  	 * there is reported by Apple's own validation. */
  	self = [super initWithDevice:device depthStencilDescriptor:descriptor];
  	if (self == nil) {
@@ -716,7 +745,7 @@
  		return nil;
  	}
  	_state = state;
-@@ -3647,7 +4070,7 @@
+@@ -3647,7 +4088,7 @@
  - (void)dealloc
  {
  	if (_state != NULL) {
@@ -725,7 +754,7 @@
  	}
  	[super dealloc];
  }
-@@ -3674,7 +4097,7 @@
+@@ -3674,7 +4115,7 @@
  	 * by it. */
  	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
  	if (self == nil) {
@@ -734,7 +763,7 @@
  		return nil;
  	}
  	_owner = device;
-@@ -3692,7 +4115,7 @@
+@@ -3692,7 +4133,7 @@
  - (void)dealloc
  {
  	if (_compute != NULL) {
@@ -743,7 +772,7 @@
  	}
  	[super dealloc];
  }
-@@ -3723,7 +4146,7 @@
+@@ -3723,7 +4164,7 @@
  	 * descriptor, for the reason the compute one learned at its own line 1504 */
  	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
  	if (self == nil) {
@@ -752,7 +781,7 @@
  		return nil;
  	}
  	_owner = device;
-@@ -3751,7 +4174,7 @@
+@@ -3751,7 +4192,7 @@
  - (void)dealloc
  {
  	if (_render != NULL) {
@@ -761,7 +790,7 @@
  	}
  	[super dealloc];
  }
-@@ -3794,7 +4217,50 @@
+@@ -3794,7 +4235,50 @@
  
  @end
  
@@ -813,7 +842,7 @@
  @end
  
  /*
-@@ -4142,6 +4608,7 @@
+@@ -4142,6 +4626,7 @@
  	RW_CB_ERROR        = 5,
  };
  
@@ -821,7 +850,7 @@
  @implementation RedwoodMetalCommandBuffer {
  	RedwoodMetalCommandQueue *_queue;
  	NSMutableArray *_work;
-@@ -4268,6 +4735,9 @@
+@@ -4268,6 +4753,9 @@
  		rw_print("a render pass needs a descriptor\n");
  		return nil;
  	}
@@ -831,7 +860,7 @@
  	return [[[RedwoodMetalRenderEncoder alloc] initWithRedwoodCommandBuffer:self
  								    descriptor:descriptor]
  		   autorelease];
-@@ -4299,6 +4769,7 @@
+@@ -4299,6 +4787,7 @@
  
  - (void)recordWork:(RedwoodMetalWork *)work
  {
@@ -839,7 +868,7 @@
  	[_work addObject:work];
  }
  
-@@ -4307,10 +4778,127 @@
+@@ -4307,10 +4796,151 @@
  /* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
  - (void)commit
  {
@@ -927,6 +956,30 @@
 +			    tx && [tx respondsToSelector:@selector(iosurface)] && [tx iosurface] ? " iosurf" : "");
 +		}
 +		rw_print("%s\n", line);
++		/* a small draw: its vertex streams' first bytes and its texture's centre texel, as the GPU has it */
++		if (w->render != nil && w->vertexCount <= 6) {
++			for (unsigned b = 0; b < w->vertexBufferCount && b < 3; b++) {
++				id vb = w->vertexBuffers[b];
++				if (vb == nil || [vb contents] == NULL) {
++					continue;
++				}
++				const uint8_t *q = (const uint8_t *)[vb contents] + w->vertexBufferOffsets[b];
++				size_t left = [vb length] - MIN([vb length], w->vertexBufferOffsets[b]);
++				char hex[200];
++				int h = 0;
++				for (size_t j = 0; j < 64 && j < left; j++) {
++					h += snprintf(hex + h, sizeof(hex) - (size_t)h, "%02x%s", q[j], (j & 3) == 3 ? " " : "");
++				}
++				rw_print("FD   vb%u +%zu: %s\n", b, w->vertexBufferOffsets[b], hex);
++			}
++			if (w->textureCount > 0 && w->textures[0] != nil) {
++				id tx = w->textures[0];
++				uint8_t px[16] = { 0 };
++				[tx getBytes:px bytesPerRow:16 fromRegion:MTLRegionMake2D([tx width] / 2, [tx height] / 2, 1, 1)
++				 mipmapLevel:0];
++				rw_print("FD   t0 centre %02x%02x%02x%02x\n", px[0], px[1], px[2], px[3]);
++			}
++		}
 +	}
 +}
 +
@@ -967,7 +1020,7 @@
  		if (work->render != nil) {
  			if (![self runDraw:work why:why size:sizeof(why)]) {
  				goto done;
-@@ -4354,11 +4942,11 @@
+@@ -4354,11 +4984,11 @@
  		 * there and every offset is read as zero -- which is what an older library
  		 * did with one in any case, out loud. */
  		int rc = mesa.dispatch_buffers != NULL
@@ -983,7 +1036,7 @@
  		if (rc != 0) {
  			rw_print("the dispatch failed: %s\n", why);
  			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:2
-@@ -4401,9 +4989,26 @@
+@@ -4401,9 +5031,26 @@
  	 * included: a buffer that errored is as finished as one that drew, and a slot kept
  	 * because of an error would turn one bad draw into a queue that blocks for ever. */
  	[self redwoodReturnSlot];
@@ -1013,7 +1066,7 @@
  }
  
  /* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
-@@ -4495,9 +5100,80 @@
+@@ -4495,9 +5142,80 @@
  	for (unsigned i = 0; i < work->textureCount; i++) {
  		fragment_textures[i] = [work->textures[i] mesaTexture];
  	}
@@ -1094,7 +1147,7 @@
  	struct rwa_draw draw = {
  		.color = color,
  		.color_count = work->colorCount,
-@@ -4510,7 +5186,7 @@
+@@ -4510,7 +5228,7 @@
  		.depth = [work->depth mesaTexture],
  		.clear_depth = work->clearsDepth ? &work->clearDepth : NULL,
  		.clear_stencil = work->clearsStencil ? &work->clearStencil : NULL,
@@ -1103,7 +1156,7 @@
  		.stencil_reference = { work->stencilReference[0], work->stencilReference[1] },
  		.depth_range = work->hasDepthRange ? work->depthRange : NULL,
  		.vertex = { .buffers = vertex_buffers, .buffer_count = work->vertexBufferCount },
-@@ -4521,8 +5197,8 @@
+@@ -4521,8 +5239,8 @@
  		.vertex_stream_count = [work->render vertexStreamCount],
  		.fragment = {
  			.buffers = fragment_buffers, .buffer_count = work->count,
@@ -1114,7 +1167,7 @@
  		},
  		.primitive = work->primitive,
  		.vertex_start = work->vertexStart,
-@@ -4549,6 +5225,8 @@
+@@ -4549,6 +5267,8 @@
  		.vertex_buffer_table_count = work->vertexBufferCount,
  		.fragment_buffer_table = fragment_table,
  		.fragment_buffer_table_count = work->count,
@@ -1123,7 +1176,7 @@
  	};
  
  	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
-@@ -4558,7 +5236,7 @@
+@@ -4558,7 +5278,7 @@
  		return NO;
  	}
  
@@ -1132,7 +1185,7 @@
  		/* OpenGL ES on Metal aborts the application on any command buffer in the error state
  		 * (GLDContextRec::flushContextInternal), so for it one draw this library refuses is
  		 * dropped and said, not the whole frame -- unless the GPU itself did not finish. */
-@@ -4590,7 +5268,7 @@
+@@ -4590,7 +5310,7 @@
  	if (_status == RW_CB_ERROR) {
  		return;
  	}
@@ -1141,7 +1194,7 @@
  		rw_print("THE GPU DID NOT FINISH: %s\n", why);
  		_error = [[NSError errorWithDomain:@"RedwoodMetal" code:3
  					  userInfo:@{ NSLocalizedDescriptionKey:
-@@ -4831,6 +5509,11 @@
+@@ -4831,6 +5551,11 @@
  	unsigned _stencilReference[2];
  	float _depthRange[2];
  	BOOL _hasDepthRange;
@@ -1153,7 +1206,7 @@
  	id _vertexBuffers[RW_MAX_BUFFERS];
  	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
  	id _fragmentBuffers[RW_MAX_BUFFERS];
-@@ -4879,12 +5562,12 @@
+@@ -4879,12 +5604,12 @@
  		if (store == MTLStoreActionMultisampleResolve ||
  		    store == MTLStoreActionStoreAndMultisampleResolve ||
  		    [attachment resolveTexture] != nil) {
@@ -1172,7 +1225,7 @@
  		}
  		if (i == 0 && [attachment loadAction] == MTLLoadActionClear) {
  			MTLClearColor c = [attachment clearColor];
-@@ -4951,7 +5634,13 @@
+@@ -4951,7 +5676,13 @@
  
  - (id)device { return [_commandBuffer device]; }
  
@@ -1187,7 +1240,7 @@
  
  /*
   * One table, two meanings, and the offset is no longer thrown away.
-@@ -5009,6 +5698,10 @@
+@@ -5009,6 +5740,10 @@
  - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
  {
  	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
@@ -1198,7 +1251,7 @@
  
  	if (buffer != nil) {
  		[self setVertexBuffer:[buffer autorelease] offset:0 atIndex:index];
-@@ -5018,14 +5711,43 @@
+@@ -5018,14 +5753,43 @@
  - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
  {
  	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
@@ -1242,7 +1295,7 @@
  	if (index >= RW_MAX_BUFFERS) {
  		return;
  	}
-@@ -5037,6 +5759,9 @@
+@@ -5037,6 +5801,9 @@
  
  - (void)setFragmentSamplerState:(id)sampler atIndex:(NSUInteger)index
  {
@@ -1252,7 +1305,7 @@
  	if (index >= RW_MAX_BUFFERS) {
  		return;
  	}
-@@ -5065,20 +5790,25 @@
+@@ -5065,20 +5832,25 @@
  	id first = _colorCount > 0 ? _color[0] : _depth;
  	NSUInteger w = [first width], h = [first height];
  
@@ -1288,7 +1341,7 @@
  - (void)setCullMode:(NSUInteger)mode                  { (void)mode; }
  - (void)setFrontFacingWinding:(NSUInteger)winding     { (void)winding; }
  - (void)setTriangleFillMode:(NSUInteger)mode          { (void)mode; }
-@@ -5192,6 +5922,10 @@
+@@ -5192,6 +5964,10 @@
  	work->depthRange[0] = _depthRange[0];
  	work->depthRange[1] = _depthRange[1];
  	work->hasDepthRange = _hasDepthRange;
@@ -1299,7 +1352,7 @@
  	work->primitive = (unsigned)primitive;
  	work->vertexStart = (unsigned)start;
  	work->vertexCount = (unsigned)count;
-@@ -5212,6 +5946,9 @@
+@@ -5212,6 +5988,9 @@
  		work->bufferOffsets[i] = (size_t)_fragmentBufferOffsets[i];
  	}
  	work->textureCount = _fragmentTextureCount;
@@ -1309,7 +1362,7 @@
  	for (unsigned i = 0; i < _fragmentTextureCount; i++) {
  		work->textures[i] = _fragmentTextures[i];
  	}
-@@ -6257,6 +6994,39 @@
+@@ -6257,6 +7036,39 @@
   */
  - (void)endEncoding
  {
@@ -1349,7 +1402,7 @@
  	[super endEncoding];
  }
  
-@@ -7012,8 +7782,8 @@
+@@ -7012,8 +7824,8 @@
  		         class_getName(object_getClass(buffer)));
  		return;
  	}
@@ -1360,7 +1413,7 @@
  		rw_print("%s\n", why);
  	}
  }
-@@ -7041,8 +7811,8 @@
+@@ -7041,8 +7853,8 @@
  		         class_getName(object_getClass(texture)));
  		return;
  	}
@@ -1371,7 +1424,7 @@
  		rw_print("%s\n", why);
  	}
  }
-@@ -7067,8 +7837,8 @@
+@@ -7067,8 +7879,8 @@
  		         class_getName(object_getClass(sampler)));
  		return;
  	}
