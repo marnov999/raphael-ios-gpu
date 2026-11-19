@@ -547,3 +547,27 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   power, switcher 12% repeats. gv3 tuned2 (gpu_up 60/80, dn 15@300, mid off, dr = pf): switcher better than max
   (8.4 vs 10.3%) but hcr 7.6% vs 3.1% and power only -10..-14%. Run-to-run noise ~1-2 points of repeat %.
   23:44 11-08: the davinci WiFi session's fbreboot to 192.168.9.2 rebooted raphael (both phones can hold .9.2).
+- **2026-11-19 governor 0152 + games.** xnu 0152 (CI 44416992180): GPU steps DOWN on a gpu_win (default 50 ms)
+  average, up on 10 ms. A/B same boot (gv5, 3 rounds): hcr repeats old 7.76% -> win50 2.23% (max 0.17%) at 833 vs
+  1644 mW; home/Settings/switcher within noise; idle +~200 mW (GPU stays higher). gv6: gpu_up 60 worse (hcr 8.8%),
+  win100 no better; hcr run-to-run spread is large (win50 0.39% in gv6). Phone gov file = "gpu_win=50" (= default).
+  **f12** (out/raphael-ios-f12.img = 0152 kernel + f11's args + sweetfb_vsynckeep=1, FLASH=1 MIUI=backup/miui-unenc)
+  RAM-booted OK; NOT flashed (the flash command was refused by the permission check): flash needs the user.
+  xnu 0153 (CI 44428033852): AppleKeyStore wrap/unwrap (sel 10/11) -> keychain works (userland/keytest: add/get/
+  delete 0 for every class); before: errSecNotAvailable -25291. u39 = 0153 test image (touch muted).
+  Games (tools/gametest.sh BUNDLE EXE [SECS]: FrontBoard launch via out/games/launchapp signed with
+  userland/launchapp.ents, unlock, ENV= vars, stdout capture; tools/shot.sh; touch muted with `mdss touch 0` --
+  ghost touches pressed buttons in games): run = HCR, GD, BADLAND, Jetpack (known texture bug, davinci
+  JETPACK-FINDINGS.md), Alto, Odyssey. Metal (allowlisted in /usr/local/gltest/metal_allow; driver changes in
+  userland/redwood/): **Angry Birds plays** (level 1, bird shot, score); **LIMBO** title screen renders (play not
+  tested yet); **Minecraft** (binary re-signed ad-hoc with its own entitlements: the App Store signature left
+  securityd seeing NO entitlements, -34018; original backup/apps/) reaches the main menu with the 3D panorama, but
+  the Play screen stays white: its UI engine never draws (only one empty CPU upload of the UI texture), 220% CPU
+  -- next: CPU profile of minecraftpe; **Real Racing 3** past the reflection crash, sits on the Firemonkeys
+  splash (first run downloads data; no network on raphael) and asks for PVRTC textures (not on Adreno: needs a
+  software decode); **Monument Valley** Unity assert at launch (not looked at); **Monument Valley 2** runs, black:
+  MSAA resolve not implemented; **GTA VC** segfault in its own code (NULL table) during a display-link frame.
+  Debug dylibs: out/games/{secitemlog,exclog}.dylib (/usr/local/lib), inject with ENV="DYLD_INSERT_LIBRARIES=...".
+  Brightness: iOS slider at minimum + `mdss dcs 51 00 08` (the user asked for minimum).
+  tools/usblog.py rotates at 512 MB: a backboardd surface-allocation error loop ran 7 h unattended (PC asleep)
+  and wrote 1.6 GB (cause: the then-current driver's surface use-after-free / Minecraft left running).
