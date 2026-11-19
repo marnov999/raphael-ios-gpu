@@ -571,3 +571,16 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   Brightness: iOS slider at minimum + `mdss dcs 51 00 08` (the user asked for minimum).
   tools/usblog.py rotates at 512 MB: a backboardd surface-allocation error loop ran 7 h unattended (PC asleep)
   and wrote 1.6 GB (cause: the then-current driver's surface use-after-free / Minecraft left running).
+- **2026-11-19 (cont.)** Driver: MSAA resolve (`rwa_resolve`, at -endEncoding: Monument Valley 2 now shows its
+  LOADING screen; stuck there -- its log shows AVAudioEngine "IsFormatSampleRateAndChannelCountValid" exceptions:
+  no audio output device on this port, 0 Hz / 0 channels). Unity console: inject
+  `DYLD_INSERT_LIBRARIES=/usr/local/lib/stdio2file.dylib CFLOG_FORCE_STDERR=1` (FrontBoard's __StdOutPath is not
+  honoured); exceptions: exclog.dylib (objc_setExceptionPreprocessor; interposing objc_exception_throw misses the
+  shared cache). **tools/resign-app.sh APP [EXE]**: re-sign an IPA executable ad hoc with its own entitlements
+  (done for all games; originals backup/apps/). **Monument Valley** asserted SharedStorage_SetInt: its iCloud
+  key-value store (NSUbiquitousKeyValueStore) keeps nothing on this port (userland/kvstest) -> userland/kvsshim
+  (store in NSUserDefaults) loaded by an LC_LOAD_WEAK_DYLIB (tools/insert-dylib.py) -> past the assert, loads its
+  scenes; then exited (no report seen yet). Unity reports ASTC unsupported (device = Apple1 profile) and decodes on
+  the CPU: claiming ASTC (metal_profile / supportsFamily) is the next speed-up. Real Racing 3: PVRTC needs a
+  software decode. **Battery**: the 7 h unattended run drained it to 2% (3.42 V); iOS here barely charges
+  (~0-130 mA net at idle, ~500 mA draw under game load). Phone left in MIUI (tomiui RAM boot) charging, screen off.
