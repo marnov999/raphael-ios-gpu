@@ -618,3 +618,10 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   registerPlayScreen reads IOptions) -> option key `new_play_screen_beta_v2` in the app container's
   Documents/games/com.mojang/minecraftpe/options.txt (container 2C595C40-FD43-4DAF-97AC-94814F429DCC this root):
   set it to 0 (keep the file mobile-owned) for the legacy JSON-UI world list, which uses the working UI path.
+  Minecraft OreUI runtime plan (prepared offline): the hbui bundle = React (@react-facet) under ~20 providers in its
+  router FE; any provider waiting on an engine facet leaves the page blank. Gameface's JS engine is V8 and has a
+  Chrome-DevTools inspector (cohtml::inspector; "Inspector port is not valid, remote debugging disabled"); dev
+  option `ore_ui_debugging` ("Enable Ore UI Debugging (requires restart)") in options.txt may enable it. Logs are
+  otherwise discarded (OreUI::EmptyLogHandler). Tools: tools/cdp.py (scan / targets / eval: console messages,
+  exceptions, JS eval over the USB network), userland/tcprelay (phone: 0.0.0.0:LISTEN -> 127.0.0.1:TARGET if the
+  inspector binds loopback; out/games/tcprelay).
