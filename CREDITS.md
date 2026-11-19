@@ -20,7 +20,7 @@ which is under the **Apple Public Source License 2.0**; the patched files stay u
 - **AOSP mkbootimg** (`tools/mkbootimg.py`, Apache 2.0).
 - Hardware facts from Xiaomi's published raphael kernel sources and mainline Linux (GPL-2.0), as noted in
   NOTES.md.
+- **hakios-metal** (<https://github.com/oosexgang/hakios-xnu-kernel>, `hakios-metal/src/texture.cpp`, MIT,
+  Copyright (c) 2025-2026 the HakiOS authors): the PVRTC1 decoder ported to C in `userland/redwood/pvrtc_decode.h`.
 
 Nothing from Apple's iOS, Xiaomi's firmware or this phone's partitions is in this repository.
-
-| `userland/redwood/pvrtc_decode.h` (PVRTC1 software decode, in davinci's Mesa AIR library) | ported to C from [hakios-metal](https://github.com/oosexgang/hakios-xnu-kernel) `src/texture.cpp` (MIT, Copyright (c) 2025-2026 the HakiOS authors) |
