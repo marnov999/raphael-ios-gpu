@@ -596,3 +596,15 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   characters) render fine. So the page's data never arrives: game logic, stripped binary. Content Log File enabled
   in Creator settings (stays empty). Next idea: the OreUI page may wait on Xbox/XAL sign-in state or Realms data;
   try with network via NAT on the host (needs sudo, user's call), or RE the world-list data source.
+- **Gameplay checks 2026-11-19 (u39, touch muted, new driver):** PLAY = Angry Birds (level 1, shots, score),
+  LIMBO (level 1: boy wakes and walks), Geometry Dash (Stereo Madness, jumping), Alto (racing), Alto's Odyssey
+  (racing, tutorial), BADLAND (in level; bright yellow rectangular blocks where black foliage should be -- same
+  class as Jetpack's), Jetpack (flies, distance counts; background garbage blocks = the open davinci texture bug;
+  "touch to play" crash fixed by enabling /usr/local/gltest/app_sandbox = SweetGLES's empty-audio-route answer,
+  it was absent on raphael). HCR plays (bench). Minecraft: menus/settings/dressing room render, Play page blank
+  (see above). Monument Valley: past its assert, runs; screenshots stale (screencap: "no IOSurface" for the
+  directly scanned-out app surface -> tools/shot.sh returns the previous picture; fix screencap fallback), uses
+  PVRTC (format 166) like Real Racing 3 -> software PVRTC decode needed. MV2: LOADING (audio: no output device).
+  Jetpack texture bug lead: Mortar::Texture2D_iPhone / Pow2RescaleMethod (nonPow2RescaleMode, GetPreviousPow2):
+  the engine may downscale textures to a previous power of two per device class while UVs stay -> check which
+  rescale method it picks on this device (dyld-cache device model / memory).
