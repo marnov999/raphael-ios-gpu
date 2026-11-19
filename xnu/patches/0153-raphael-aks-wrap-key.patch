@@ -1,0 +1,88 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..eb32339 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -119,6 +119,44 @@ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * kAKSWrapKey / kAKSUnwrapKey (raphael 2026-11-19, after HakiOS's MiniAppleKeyStore.cpp): securityd
++ * wraps each keychain item's key with its protection class's key before storing it and unwraps it to
++ * read the item. Unanswered, every SecItemAdd failed with errSecNotAvailable (-25291, securityd sel 10
++ * -> kIOReturnUnsupported x76) and Minecraft aborted on "Couldn't add the Keychain Item.". A wrapped
++ * key is 8 bytes longer, as with AES key wrap (RFC 3394), which is what callers size for: a mark, the
++ * class, and the key mixed with a fixed pattern. NOT encryption: there is no Secure Enclave and no
++ * secret to wrap with, so keychain items on this port are as readable as the data partition.
++ */
++static const uint8_t sweet_aks_wrap_mark[4] = { 'S', 'W', 'w', 'r' };
++
++static void
++sweet_aks_wrap_mix(uint8_t *bytes, uint32_t len)
++{
++	for (uint32_t i = 0; i < len; i++) {
++		bytes[i] ^= (uint8_t)(0x5a + 37 * i);
++	}
++}
++
++/* the caller's input structure, inband or by descriptor, into buf (at most max bytes) */
++static uint32_t
++sweet_aks_struct_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t max)
++{
++	if (args->structureInputDescriptor != NULL) {
++		uint32_t len = (uint32_t)args->structureInputDescriptor->getLength();
++		if (len > max) {
++			return 0;
++		}
++		args->structureInputDescriptor->readBytes(0, buf, len);
++		return len;
++	}
++	if (args->structureInput == NULL || args->structureInputSize > max) {
++		return 0;
++	}
++	memcpy(buf, args->structureInput, args->structureInputSize);
++	return args->structureInputSize;
++}
++
+ /* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
+ static uint32_t
+ sweet_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+@@ -227,6 +265,38 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey: {
++		uint8_t wrapped[8 + 64];
++		uint32_t len = sweet_aks_struct_in(args, wrapped + 8, 64);
++
++		if (len == 0 || in_scalars < 2) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(wrapped, sweet_aks_wrap_mark, sizeof(sweet_aks_wrap_mark));
++		wrapped[4] = (uint8_t)args->scalarInput[1];
++		wrapped[5] = wrapped[6] = wrapped[7] = 0;
++		sweet_aks_wrap_mix(wrapped + 8, len);
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = args->scalarInput[1];
++			args->scalarOutputCount = 1;
++		}
++		ret = sweet_aks_struct_out(args, wrapped, 8 + len);
++		break;
++	}
++	case kAKSUnwrapKey: {
++		uint8_t wrapped[8 + 64];
++		uint32_t len = sweet_aks_struct_in(args, wrapped, sizeof(wrapped));
++
++		if (len <= 8 || memcmp(wrapped, sweet_aks_wrap_mark, sizeof(sweet_aks_wrap_mark)) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		sweet_aks_wrap_mix(wrapped + 8, len - 8);
++		args->scalarOutputCount = 0;
++		ret = sweet_aks_struct_out(args, wrapped + 8, len - 8);
++		break;
++	}
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
