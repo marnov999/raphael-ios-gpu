@@ -613,3 +613,8 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   vanilla.localWorldList etc.) suspends on an engine facet that never arrives -> needs a runtime look (which facet;
   app thread stacks). Jetpack: Mortar's Pow2RescaleMethod is Pad|Scale; "Pad" = content top-left of a pow2 texture
   = the davinci observation -> trace the GL limits Jetpack queries (glGetIntegerv) at runtime.
+  Minecraft workaround to try first: the Play screen's UI tech stack is selectable (hbui facet vanilla.screenTechStack,
+  selectTechStackForScreen("/play", JsonUI) behind an "OptOut" button; C++ UIScreenTechStackSelectorInitializer::
+  registerPlayScreen reads IOptions) -> option key `new_play_screen_beta_v2` in the app container's
+  Documents/games/com.mojang/minecraftpe/options.txt (container 2C595C40-FD43-4DAF-97AC-94814F429DCC this root):
+  set it to 0 (keep the file mobile-owned) for the legacy JSON-UI world list, which uses the working UI path.
