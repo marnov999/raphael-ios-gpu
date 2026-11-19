@@ -608,3 +608,8 @@ display/scanout 0086-0093 0103-0108 0113 0116 0119-0122 0125 0126 0142 0151 0155
   Jetpack texture bug lead: Mortar::Texture2D_iPhone / Pow2RescaleMethod (nonPow2RescaleMode, GetPreviousPow2):
   the engine may downscale textures to a previous power of two per device class while UVs stay -> check which
   rescale method it picks on this device (dyld-cache device model / memory).
+- **Offline 2026-11-19 pm (phone charging):** PVRTC decode staged (see userland/redwood/README.md (16)); Minecraft:
+  Gameface works (the Dressing Room is hbui route /persona), the Play screen (/play, React, facets
+  vanilla.localWorldList etc.) suspends on an engine facet that never arrives -> needs a runtime look (which facet;
+  app thread stacks). Jetpack: Mortar's Pow2RescaleMethod is Pad|Scale; "Pad" = content top-left of a pow2 texture
+  = the davinci observation -> trace the GL limits Jetpack queries (glGetIntegerv) at runtime.

@@ -1,5 +1,5 @@
 --- metal/redwood/redwoodmetal.m.bak-20261119	2026-11-19 00:24:28.063974172 +0100
-+++ metal/redwood/redwoodmetal.m	2026-11-19 12:08:43.462207288 +0100
++++ metal/redwood/redwoodmetal.m	2026-11-19 14:40:16.998068761 +0100
 @@ -93,6 +93,8 @@
  #import <Metal/Metal.h>          /* for MTLSize and the public enumerations, nothing private */
  #import <objc/message.h>
@@ -691,7 +691,7 @@
 -	if (_shape.pixel_format != 10 && rgba_said < 8 && bytes != NULL && size[0] > 0 && size[1] > 0 &&
 +	/* (not for a block-compressed format: its rows are rows of blocks, and "the middle texel" would be
 +	 * read out of the caller's bytes at a texel row, past their end) */
-+	if (_shape.pixel_format != 10 && !(_shape.pixel_format >= 170 && _shape.pixel_format <= 218) &&
++	if (_shape.pixel_format != 10 && !(_shape.pixel_format >= 160 && _shape.pixel_format <= 218) &&
 +	    rgba_said < 8 && bytes != NULL && size[0] > 0 && size[1] > 0 &&
  	    strcmp(getprogname(), "backboardd") != 0) {
  		rgba_said++;

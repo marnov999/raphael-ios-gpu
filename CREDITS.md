@@ -22,3 +22,5 @@ which is under the **Apple Public Source License 2.0**; the patched files stay u
   NOTES.md.
 
 Nothing from Apple's iOS, Xiaomi's firmware or this phone's partitions is in this repository.
+
+| `userland/redwood/pvrtc_decode.h` (PVRTC1 software decode, in davinci's Mesa AIR library) | ported to C from [hakios-metal](https://github.com/oosexgang/hakios-xnu-kernel) `src/texture.cpp` (MIT, Copyright (c) 2025-2026 the HakiOS authors) |
