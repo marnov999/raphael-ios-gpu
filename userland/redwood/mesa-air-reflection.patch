@@ -1,0 +1,194 @@
+--- nir_air.h.bak-20261119	2026-11-19 01:10:44.839505885 +0100
++++ nir_air.h	2026-11-19 01:10:44.863168117 +0100
+@@ -110,6 +110,11 @@
+    unsigned reduction;            /* AGX does not read this field */
+ };
+ 
++struct air_struct_member {
++   const char *name, *type_name;
++   unsigned offset, size;
++};
++
+ struct air_resource {
+    enum air_resource_kind kind;
+    unsigned index;   /* Metal's [[buffer(n)]], [[texture(n)]], [[sampler(n)]] --
+@@ -163,6 +168,14 @@
+     */
+    unsigned argbuf_set;
+    unsigned argbuf_id;
++
++   /* A buffer argument whose pointee is a struct: its members as `air.struct_type_info`
++    * declares them (offset, size, type name, member name), for the runtime's pipeline
++    * REFLECTION (MTLArgument.bufferStructType). Appended last (raphael 2026-11-19): LIMBO
++    * binds only what its pipelines' reflection lists. 0 / NULL for anything else.
++    */
++   unsigned num_members;
++   struct air_struct_member *members;
+ };
+ 
+ struct air_varying {
+--- air_to_nir.c.bak-20261119	2026-11-19 01:10:44.842492168 +0100
++++ air_to_nir.c	2026-11-19 01:10:44.865142885 +0100
+@@ -929,6 +929,30 @@
+       /* a direct argument: Metal names it by .index and there is no set */
+       .argbuf_set = ~0u, .argbuf_id = ~0u,
+    };
++   /* the struct's members, for reflection only: five fields each (offset, size, flag,
++    * type name, member name); a key-and-node pair before or after them (a nested
++    * struct, an indirect argument) is stepped over */
++   const struct air_md *sti = (kind == AIR_RESOURCE_CONSTANT_BUFFER ||
++                               kind == AIR_RESOURCE_DEVICE_BUFFER) && node ?
++                              md_key_node(node, "air.struct_type_info") : NULL;
++   for (unsigned i = 0; sti && i < sti->num_ops;) {
++      uint64_t off = 0, msize = 0, flag = 0;
++      const char *k = md_str(sti, i);
++      if (k && !strncmp(k, "air.", 4)) {
++         i += 2;
++         continue;
++      }
++      const char *mtype = md_str(sti, i + 3), *mname = md_str(sti, i + 4);
++      if (!md_int(sti, i, &off) || !md_int(sti, i + 1, &msize) || !md_int(sti, i + 2, &flag) ||
++          !mtype || !mname)
++         break;
++      struct air_resource *r = &info->resources[info->num_resources];
++      r->members = reralloc(c->mem_ctx, r->members, struct air_struct_member, r->num_members + 1);
++      r->members[r->num_members++] = (struct air_struct_member) {
++         .name = mname, .type_name = mtype, .offset = (unsigned)off, .size = (unsigned)msize,
++      };
++      i += 5;
++   }
+    return &info->resources[info->num_resources++];
+ }
+ 
+@@ -4074,6 +4098,15 @@
+             info->resources[i].name = ralloc_strdup(mem_ctx, info->resources[i].name);
+             info->resources[i].type_name =
+                ralloc_strdup(mem_ctx, info->resources[i].type_name);
++            if (info->resources[i].num_members) {
++               struct air_struct_member *m = ralloc_memdup(mem_ctx, info->resources[i].members,
++                  info->resources[i].num_members * sizeof(*m));
++               for (unsigned k = 0; k < info->resources[i].num_members; k++) {
++                  m[k].name = ralloc_strdup(mem_ctx, m[k].name);
++                  m[k].type_name = ralloc_strdup(mem_ctx, m[k].type_name);
++               }
++               info->resources[i].members = m;
++            }
+          }
+       }
+       if (info->num_varyings) {
+--- air_metal.c.bak-20261119	2026-11-19 01:10:44.844535451 +0100
++++ air_metal.c	2026-11-19 01:11:07.402843017 +0100
+@@ -4399,6 +4399,71 @@
+  * is dense, so this refuses rather than guesses which of the two readings was meant.
+  */
+ int
++rwa_function_arguments(struct rwa_device *device, const void *bitcode, size_t size,
++                       const char *entry, struct rwa_argument *out, unsigned max,
++                       unsigned *count, char *why, size_t why_size)
++{
++   if (count)
++      *count = 0;
++   if (!device || !bitcode || size < 4 || (!out && max)) {
++      say(why, why_size, "no device, no module or nowhere to put its arguments");
++      return -1;
++   }
++   void *mem_ctx = ralloc_context(NULL);
++   if (!mem_ctx) {
++      say(why, why_size, "out of memory reading a module");
++      return -1;
++   }
++   struct air_constant_value *constants;
++   unsigned num_constants =
++      air_module_function_constants(mem_ctx, bitcode, size, &constants);
++   const struct air_to_nir_options options = {
++      .constants = constants,
++      .num_constants = num_constants,
++   };
++   struct air_shader_info info = { 0 };
++   const char *error;
++   nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, &options,
++                                device->nir_options, &info, &error);
++   if (!nir) {
++      say(why, why_size, "%s", error ? error : "the module could not be translated");
++      ralloc_free(mem_ctx);
++      return -1;
++   }
++   unsigned n = 0;
++   for (unsigned i = 0; i < info.num_resources && n < max; i++) {
++      const struct air_resource *r = &info.resources[i];
++      if (r->argbuf_set != ~0u || r->inline_sampler || r->param == ~0u ||
++          r->kind == AIR_RESOURCE_THREADGROUP_BUFFER)
++         continue;
++      struct rwa_argument *a = &out[n++];
++      memset(a, 0, sizeof(*a));
++      a->kind = r->kind == AIR_RESOURCE_SAMPLER ? RWA_ARG_SAMPLER :
++                (r->kind == AIR_RESOURCE_TEXTURE || r->kind == AIR_RESOURCE_IMAGE) ? RWA_ARG_TEXTURE :
++                RWA_ARG_BUFFER;
++      a->index = r->index;
++      a->size = r->size;
++      a->read = r->read;
++      a->write = r->write;
++      a->constant = r->kind == AIR_RESOURCE_CONSTANT_BUFFER;
++      snprintf(a->name, sizeof(a->name), "%s", r->name ? r->name : "");
++      snprintf(a->type_name, sizeof(a->type_name), "%s", r->type_name ? r->type_name : "");
++      for (unsigned k = 0; k < r->num_members && k < RWA_ARG_MEMBERS; k++) {
++         struct rwa_argument_member *m = &a->members[a->member_count++];
++         snprintf(m->name, sizeof(m->name), "%s", r->members[k].name ? r->members[k].name : "");
++         snprintf(m->type_name, sizeof(m->type_name), "%s",
++                  r->members[k].type_name ? r->members[k].type_name : "");
++         m->offset = r->members[k].offset;
++         m->size = r->members[k].size;
++      }
++   }
++   if (count)
++      *count = n;
++   ralloc_free(mem_ctx);
++   return 0;
++}
++
++int
+ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
+                    const char *entry, struct rwa_argbuf_layout *out, unsigned max,
+                    unsigned *count, char *why, size_t why_size)
+--- air_metal.h.bak-20261119	2026-11-19 01:10:44.846829325 +0100
++++ air_metal.h	2026-11-19 01:11:07.401843027 +0100
+@@ -430,6 +430,39 @@
+ 		       unsigned *count, char *why, size_t why_size);
+ 
+ /*
++ * A function's DIRECT arguments, for the runtime's pipeline reflection (MTLArgument):
++ * every buffer, texture and sampler the entry point takes from the API, with Metal's
++ * index, its name and, for a buffer of a struct, the struct's members. Applications bind
++ * by it -- LIMBO's renderer binds exactly what fragmentArguments / vertexArguments list,
++ * so nil reflection was a game that bound nothing (raphael 2026-11-19). Argument-buffer
++ * members, inline samplers and the library's own resources are not listed. Function
++ * constants are taken as zero, as rwa_module_argbufs takes them. Plain fixed-size
++ * fields: the driver keeps a copy of this struct.
++ */
++#define RWA_ARG_NAME 64
++#define RWA_ARG_MEMBERS 32
++enum rwa_argument_kind { RWA_ARG_BUFFER = 0, RWA_ARG_TEXTURE = 1, RWA_ARG_SAMPLER = 2 };
++struct rwa_argument_member {
++	char name[RWA_ARG_NAME];
++	char type_name[32];
++	unsigned offset, size;
++};
++struct rwa_argument {
++	unsigned kind;          /* enum rwa_argument_kind */
++	unsigned index;         /* Metal's [[buffer(n)]] / [[texture(n)]] / [[sampler(n)]] */
++	unsigned size;          /* air.buffer_size, 0 when not given */
++	unsigned read, write;
++	unsigned constant;      /* a buffer in the constant address space */
++	char name[RWA_ARG_NAME];
++	char type_name[RWA_ARG_NAME];
++	unsigned member_count;  /* a buffer of a struct: its members; capped at RWA_ARG_MEMBERS */
++	struct rwa_argument_member members[RWA_ARG_MEMBERS];
++};
++int rwa_function_arguments(struct rwa_device *device, const void *bitcode, size_t size,
++			   const char *entry, struct rwa_argument *out, unsigned max,
++			   unsigned *count, char *why, size_t why_size);
++
++/*
+  * THE ENCODER, which is these three calls and no object: an encoder's whole state is
+  * (destination buffer, destination offset), which the caller passes to each one, so
+  * -setArgumentBuffer:offset: is a driver-side assignment and nothing happens here until

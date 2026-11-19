@@ -1,0 +1,961 @@
+--- userland/metal/redwood/redwoodmetal.m.bak-20261119	2026-11-19 00:24:28.063974172 +0100
++++ userland/metal/redwood/redwoodmetal.m	2026-11-19 01:16:33.320975209 +0100
+@@ -215,6 +215,24 @@
+ 	unsigned write;
+ 	char name[48];
+ };
++/* rwa_function_arguments (air_metal.h, raphael 2026-11-19): a function's direct arguments for
++ * pipeline reflection. Fixed-size, the library's own shape. */
++#define RWA_ARG_NAME 64
++#define RWA_ARG_MEMBERS 32
++struct rwa_argument_member {
++	char name[RWA_ARG_NAME];
++	char type_name[32];
++	unsigned offset, size;
++};
++struct rwa_argument {
++	unsigned kind;          /* 0 buffer, 1 texture, 2 sampler */
++	unsigned index, size, read, write, constant;
++	char name[RWA_ARG_NAME];
++	char type_name[RWA_ARG_NAME];
++	unsigned member_count;
++	struct rwa_argument_member members[RWA_ARG_MEMBERS];
++};
++
+ struct rwa_argbuf_layout {
+ 	unsigned metal_index;    /* the [[buffer(n)]] the set is bound at */
+ 	unsigned encoded_length; /* 8 bytes per member the set declares: Apple's own number */
+@@ -535,8 +553,29 @@
+ 	if (udp == -2) {
+ 		struct sockaddr_in to = { .sin_len = sizeof(to), .sin_family = AF_INET, .sin_port = htons(5141) };
+ 
++		char host[64] = "192.168.7.1";
++		/* raphael (192.168.9.1): /usr/local/gltest/rw_log_host = "IP" or "IP:PORT" overrides davinci's */
++		FILE *hf = fopen("/usr/local/gltest/rw_log_host", "r");
++
++		if (hf != NULL) {
++			char b[64] = { 0 };
++			if (fgets(b, sizeof(b), hf) != NULL) {
++				char *c = strchr(b, ':');
++				b[strcspn(b, " \r\n")] = '\0';
++				if (c != NULL) {
++					*c = '\0';
++					if (atoi(c + 1) > 0) {
++						to.sin_port = htons((uint16_t)atoi(c + 1));
++					}
++				}
++				if (b[0] != '\0') {
++					snprintf(host, sizeof(host), "%s", b);
++				}
++			}
++			fclose(hf);
++		}
+ 		udp = socket(AF_INET, SOCK_DGRAM, 0);
+-		to.sin_addr.s_addr = inet_addr("192.168.7.1");
++		to.sin_addr.s_addr = inet_addr(host);
+ 		if (udp >= 0 && connect(udp, (struct sockaddr *)&to, sizeof(to)) != 0) {
+ 			close(udp);
+ 			udp = -1;
+@@ -577,6 +616,8 @@
+ 	int (*dispatch_buffers)(struct rwa_compute *, const struct rwa_bindings *,
+ 				const struct rwa_buffer_bind *, unsigned, const unsigned[3],
+ 				const unsigned[3], char *, size_t);
++	int (*function_arguments)(struct rwa_device *, const void *, size_t, const char *,
++				  struct rwa_argument *, unsigned, unsigned *, char *, size_t);
+ 	int (*module_argbufs)(struct rwa_device *, const void *, size_t, const char *,
+ 			      struct rwa_argbuf_layout *, unsigned, unsigned *, char *,
+ 			      size_t);
+@@ -600,6 +641,36 @@
+ 	int (*finish)(struct rwa_device *, char *, size_t);
+ } mesa;
+ 
++
++/* ONE LOCK over the Mesa context (raphael 2026-11-19): a pipe_context is not thread-safe, and LIMBO
++ * commits command buffers from its render thread and its main thread at once -- the first time
++ * its draws reached Mesa they crashed in batch_draw_tracking (NULL + 8). Recursive: -commit holds
++ * it across a whole command buffer and the calls inside take it again. */
++static pthread_mutex_t rw_mesa_mutex;
++static void
++rw_mesa_lock_init(void)
++{
++	pthread_mutexattr_t a;
++	pthread_mutexattr_init(&a);
++	pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
++	pthread_mutex_init(&rw_mesa_mutex, &a);
++	pthread_mutexattr_destroy(&a);
++}
++static void
++rw_mesa_lock(void)
++{
++	static pthread_once_t once = PTHREAD_ONCE_INIT;
++	pthread_once(&once, rw_mesa_lock_init);
++	pthread_mutex_lock(&rw_mesa_mutex);
++}
++static void
++rw_mesa_unlock(void)
++{
++	pthread_mutex_unlock(&rw_mesa_mutex);
++}
++#define RWL(e) ({ rw_mesa_lock(); __auto_type _rwl_r = (e); rw_mesa_unlock(); _rwl_r; })
++#define RWLV(e) do { rw_mesa_lock(); (e); rw_mesa_unlock(); } while (0)
++
+ /* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
+  * no library worth loading, and the device object still has to exist. */
+ static bool
+@@ -640,6 +711,7 @@
+ 	 * so -newArgumentEncoder... checks for these before it makes one. */
+ 	*(void **)&mesa.dispatch_buffers = dlsym(mesa.handle, "rwa_dispatch_buffers");
+ 	*(void **)&mesa.module_argbufs = dlsym(mesa.handle, "rwa_module_argbufs");
++	*(void **)&mesa.function_arguments = dlsym(mesa.handle, "rwa_function_arguments");
+ 	*(void **)&mesa.argbuf_encode_buffer = dlsym(mesa.handle, "rwa_argbuf_encode_buffer");
+ 	*(void **)&mesa.argbuf_encode_texture = dlsym(mesa.handle, "rwa_argbuf_encode_texture");
+ 	*(void **)&mesa.argbuf_encode_sampler = dlsym(mesa.handle, "rwa_argbuf_encode_sampler");
+@@ -1138,6 +1210,7 @@
+ 	unsigned count, textureCount, samplerCount;
+ 	unsigned groups[3], size[3];
+ }
++- (void)retainObjects;
+ @end
+ 
+ @interface RedwoodMetalTexture : _MTLResource {
+@@ -1421,6 +1494,197 @@
+ 	}
+ }
+ 
++/*
++ * PIPELINE REFLECTION (raphael 2026-11-19). Metal's own reflection comes from Apple's compiler,
++ * which this port does not run, so it was nil -- and LIMBO's renderer binds exactly what
++ * -[MTLRenderPipelineReflection fragmentArguments] / vertexArguments list (its bind loops take
++ * their counts from it), so it bound nothing: no texture, no sampler, no constants, every draw
++ * refused, a black game. These objects answer the MTLArgument / MTLStructType / MTLStructMember
++ * properties out of rwa_function_arguments, which reads the function's own AIR metadata.
++ */
++BOOL rw_trace_bind_on(void);
++static NSUInteger
++rw_data_type(const char *t)
++{
++	static const struct { const char *n; NSUInteger v; } map[] = {
++		{ "float", 3 }, { "float2", 4 }, { "float3", 5 }, { "float4", 6 },
++		{ "float2x2", 7 }, { "float2x3", 8 }, { "float2x4", 9 }, { "float3x2", 10 },
++		{ "float3x3", 11 }, { "float3x4", 12 }, { "float4x2", 13 }, { "float4x3", 14 },
++		{ "float4x4", 15 }, { "half", 16 }, { "half2", 17 }, { "half3", 18 }, { "half4", 19 },
++		{ "half2x2", 20 }, { "half3x3", 24 }, { "half4x4", 28 }, { "int", 29 }, { "int2", 30 },
++		{ "int3", 31 }, { "int4", 32 }, { "uint", 33 }, { "uint2", 34 }, { "uint3", 35 },
++		{ "uint4", 36 }, { "short", 37 }, { "short2", 38 }, { "short3", 39 }, { "short4", 40 },
++		{ "ushort", 41 }, { "ushort2", 42 }, { "ushort3", 43 }, { "ushort4", 44 },
++		{ "char", 45 }, { "char2", 46 }, { "char3", 47 }, { "char4", 48 }, { "uchar", 49 },
++		{ "uchar2", 50 }, { "uchar3", 51 }, { "uchar4", 52 }, { "bool", 53 },
++		{ "packed_float2", 4 }, { "packed_float3", 5 }, { "packed_float4", 6 },
++		{ "packed_half2", 17 }, { "packed_half3", 18 }, { "packed_half4", 19 },
++	};
++	if (t == NULL) {
++		return 0;
++	}
++	if (strncmp(t, "metal::", 7) == 0) {
++		t += 7;
++	}
++	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++		if (strcmp(t, map[i].n) == 0) {
++			return map[i].v;
++		}
++	}
++	return 1;       /* MTLDataTypeStruct: anything else is a struct (or an array of one) */
++}
++
++@interface RedwoodMetalStructMember : NSObject
++@property (copy) NSString *name;
++@property NSUInteger offset, dataType, argumentIndex;
++@end
++@implementation RedwoodMetalStructMember
++- (id)structType { return nil; }
++- (id)arrayType { return nil; }
++- (id)pointerType { return nil; }
++- (id)textureReferenceType { return nil; }
++- (void)dealloc { [_name release]; [super dealloc]; }
++@end
++
++@interface RedwoodMetalStructType : NSObject
++@property (retain) NSArray *members;
++@end
++@implementation RedwoodMetalStructType
++- (NSUInteger)dataType { return 1; }
++- (id)memberByName:(NSString *)name
++{
++	for (RedwoodMetalStructMember *m in _members) {
++		if ([[m name] isEqualToString:name]) {
++			return m;
++		}
++	}
++	return nil;
++}
++- (void)dealloc { [_members release]; [super dealloc]; }
++@end
++
++@interface RedwoodMetalArgument : NSObject
++@property (copy) NSString *name;
++@property NSUInteger type, access, index, bufferAlignment, bufferDataSize, bufferDataType,
++    textureType, textureDataType, arrayLength;
++@property BOOL active;
++@property (retain) RedwoodMetalStructType *bufferStructType;
++@end
++@implementation RedwoodMetalArgument
++- (BOOL)isActive { return _active; }
++- (BOOL)isUsed { return _active; }
++- (BOOL)isArgument { return YES; }
++- (BOOL)isDepthTexture { return NO; }
++- (id)bufferPointerType { return nil; }
++- (NSUInteger)threadgroupMemoryAlignment { return 0; }
++- (NSUInteger)threadgroupMemoryDataSize { return 0; }
++- (NSUInteger)textureAccess { return _access; }
++- (NSUInteger)arrayLength { return _arrayLength ? _arrayLength : 1; }
++- (NSString *)description
++{
++	return [NSString stringWithFormat:@"<RedwoodMetalArgument %@ type %lu index %lu>", _name,
++	    (unsigned long)_type, (unsigned long)_index];
++}
++- (void)dealloc { [_name release]; [_bufferStructType release]; [super dealloc]; }
++@end
++
++@interface RedwoodMetalPipelineReflection : NSObject
++@property (retain) NSArray *vertexArguments, *fragmentArguments;
++@end
++@implementation RedwoodMetalPipelineReflection
++- (NSArray *)vertexBindings { return _vertexArguments; }
++- (NSArray *)fragmentBindings { return _fragmentArguments; }
++- (NSArray *)tileArguments { return @[]; }
++- (NSArray *)tileBindings { return @[]; }
++- (NSArray *)objectBindings { return @[]; }
++- (NSArray *)meshBindings { return @[]; }
++- (void)dealloc { [_vertexArguments release]; [_fragmentArguments release]; [super dealloc]; }
++@end
++
++/* one function's arguments as MTLArgument-shaped objects; an empty array when unreadable */
++static NSArray *
++rw_reflect_function(struct rwa_device *dev, id function)
++{
++	NSMutableArray *out = [NSMutableArray array];
++	SEL bitcode = sel_getUid("bitcodeData");
++
++	if (dev == NULL || mesa.function_arguments == NULL || function == nil ||
++	    ![function respondsToSelector:bitcode]) {
++		return out;
++	}
++	NSData *air = ((NSData *(*)(id, SEL))objc_msgSend)(function, bitcode);
++	if (air == nil || [air length] < 4) {
++		return out;
++	}
++	static struct rwa_argument args[48];
++	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++	unsigned n = 0;
++	char why[512] = { 0 };
++
++	pthread_mutex_lock(&lock);
++	if (RWL(mesa.function_arguments(dev, [air bytes], [air length], [[function name] UTF8String],
++				    args, 48, &n, why, sizeof(why))) != 0) {
++		pthread_mutex_unlock(&lock);
++		rw_print("reflection of %s: %s\n", [[function name] UTF8String], why);
++		return out;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		struct rwa_argument *a = &args[i];
++		RedwoodMetalArgument *r = [[RedwoodMetalArgument alloc] init];
++
++		r.name = [NSString stringWithUTF8String:a->name];
++		r.index = a->index;
++		r.active = YES;
++		r.access = a->write ? (a->read ? 1 : 2) : 0;
++		if (a->kind == 1) {
++			r.type = 2;                     /* MTLArgumentTypeTexture */
++			r.textureType = 2;              /* MTLTextureType2D */
++			r.textureDataType = strstr(a->type_name, "half") ? 16 :
++			    strstr(a->type_name, "uint") ? 33 : strstr(a->type_name, "int") ? 29 : 3;
++		} else if (a->kind == 2) {
++			r.type = 3;                     /* MTLArgumentTypeSampler */
++		} else {
++			r.type = 0;                     /* MTLArgumentTypeBuffer */
++			r.bufferAlignment = 16;
++			r.bufferDataSize = a->size;
++			r.bufferDataType = a->member_count ? 1 : rw_data_type(a->type_name);
++			if (a->member_count) {
++				NSMutableArray *ms = [NSMutableArray array];
++				unsigned end = 0;
++				for (unsigned k = 0; k < a->member_count; k++) {
++					RedwoodMetalStructMember *m = [[RedwoodMetalStructMember alloc] init];
++					m.name = [NSString stringWithUTF8String:a->members[k].name];
++					m.offset = a->members[k].offset;
++					m.dataType = rw_data_type(a->members[k].type_name);
++					[ms addObject:m];
++					[m release];
++					if (a->members[k].offset + a->members[k].size > end) {
++						end = a->members[k].offset + a->members[k].size;
++					}
++				}
++				RedwoodMetalStructType *st = [[RedwoodMetalStructType alloc] init];
++				st.members = ms;
++				r.bufferStructType = st;
++				[st release];
++				if (r.bufferDataSize == 0) {
++					r.bufferDataSize = (end + 15u) & ~15u;
++				}
++			}
++		}
++		[out addObject:r];
++		[r release];
++	}
++	pthread_mutex_unlock(&lock);
++	if (rw_trace_bind_on()) {
++		for (RedwoodMetalArgument *r in out) {
++			rw_print("REFLECT %s: %s type %lu index %lu members %lu\n", [[function name] UTF8String],
++			    [[r name] UTF8String], (unsigned long)[r type], (unsigned long)[r index],
++			    (unsigned long)[[[r bufferStructType] members] count]);
++		}
++	}
++	return out;
++}
++
+ @implementation RedwoodMetalDevice
+ 
+ + (void)load
+@@ -1541,9 +1805,9 @@
+ 			setenv("FD_MESA_DEBUG", access("/usr/local/gltest/metal_noubwc", F_OK) == 0 ? "sysmem,noubwc,notile" : "sysmem", 0);
+ 			rw_print("FD_MESA_DEBUG=%s (metal_nogmem)\n", getenv("FD_MESA_DEBUG"));
+ 		}
+-		_mesa = mesa.device_open(why, sizeof(why));
++		_mesa = RWL(mesa.device_open(why, sizeof(why)));
+ 		rw_print("the compiler library %s\n",
+-		         _mesa != NULL ? mesa.device_name(_mesa) : why);
++		         _mesa != NULL ? RWL(mesa.device_name(_mesa)) : why);
+ 	}
+ 
+ 	/* The struct Metal reads out of this device by raw pointer, filled here rather than on
+@@ -1576,7 +1840,7 @@
+ - (void)dealloc
+ {
+ 	if (_mesa != NULL) {
+-		mesa.device_close(_mesa);
++		RWLV(mesa.device_close(_mesa));
+ 	}
+ 	if (_gpu != IO_OBJECT_NULL) {
+ 		IOServiceClose(_gpu);
+@@ -1887,12 +2151,12 @@
+ 
+ 	char why[512] = { 0 };
+ 	struct rwa_render_info info = { 0 };
+-	struct rwa_render *render = mesa.render_create(_mesa,
++	struct rwa_render *render = RWL(mesa.render_create(_mesa,
+ 	    vertex_air != nil ? [vertex_air bytes] : NULL,
+ 	    vertex_air != nil ? [vertex_air length] : 0,
+ 	    vertex_entry,
+ 	    [fragment_air bytes], [fragment_air length], fragment_entry,
+-	    &shape, &info, why, sizeof(why));
++	    &shape, &info, why, sizeof(why)));
+ 
+ 	if (render == NULL) {
+ 		/* PRINTED as well as returned, and RW_AGAIN because the same specification
+@@ -1925,10 +2189,17 @@
+ 				     error:(NSError **)error
+ {
+ 	(void)options;
++	id state = [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+ 	if (reflection != NULL) {
+-		*reflection = nil;   /* reflection is Metal's compiler's, and ours is nil */
++		*reflection = nil;
++		if (state != nil && access("/usr/local/gltest/rw_no_reflection", F_OK) != 0) {
++			RedwoodMetalPipelineReflection *r = [[RedwoodMetalPipelineReflection alloc] init];
++			r.vertexArguments = rw_reflect_function(_mesa, [descriptor vertexFunction]);
++			r.fragmentArguments = rw_reflect_function(_mesa, [descriptor fragmentFunction]);
++			*reflection = [r autorelease];
++		}
+ 	}
+-	return [self newRenderPipelineStateWithDescriptor:descriptor error:error];
++	return state;
+ }
+ 
+ /*
+@@ -2160,7 +2431,7 @@
+ 	if (nort && shape.pixel_format == 70 && strcmp(getprogname(), "backboardd") != 0) {
+ 		shape.usage &= ~(unsigned)MTLTextureUsageRenderTarget;
+ 	}
+-	struct rwa_texture *texture = mesa.texture_create(_mesa, &shape, why, sizeof(why));
++	struct rwa_texture *texture = RWL(mesa.texture_create(_mesa, &shape, why, sizeof(why)));
+ 
+ 	if (texture == NULL) {
+ 		rw_print("%s\n", why);
+@@ -2205,7 +2476,7 @@
+ 		.lod_min = [descriptor lodMinClamp],
+ 		.lod_max = [descriptor lodMaxClamp],
+ 	};
+-	struct rwa_sampler *sampler = mesa.sampler_create(_mesa, &state, why, sizeof(why));
++	struct rwa_sampler *sampler = RWL(mesa.sampler_create(_mesa, &state, why, sizeof(why)));
+ 
+ 	if (sampler == NULL) {
+ 		rw_print("%s\n", why);
+@@ -2285,8 +2556,8 @@
+ 		};
+ 	}
+ 
+-	struct rwa_depth_stencil *made = mesa.depth_stencil_create(_mesa, &state, why,
+-								   sizeof(why));
++	struct rwa_depth_stencil *made = RWL(mesa.depth_stencil_create(_mesa, &state, why,
++								   sizeof(why)));
+ 
+ 	if (made == NULL) {
+ 		rw_print("%s\n", why);
+@@ -2438,10 +2709,10 @@
+ 	struct rwa_argbuf_layout sets[8];
+ 	unsigned count = 0;
+ 
+-	if (mesa.module_argbufs(_mesa, [air bytes], [air length],
++	if (RWL(mesa.module_argbufs(_mesa, [air bytes], [air length],
+ 				[[function name] UTF8String], sets,
+ 				(unsigned)(sizeof(sets) / sizeof(sets[0])), &count, why,
+-				sizeof(why)) != 0) {
++				sizeof(why))) != 0) {
+ 		/* the frontend's own sentence, passed through: it names what it refused */
+ 		rw_print("%s\n", why);
+ 		return nil;
+@@ -2592,9 +2863,9 @@
+ 
+ 	char why[512] = { 0 };
+ 	struct rwa_compute_info info = { 0 };
+-	struct rwa_compute *compute = mesa.compute_create(_mesa, [air bytes], [air length],
++	struct rwa_compute *compute = RWL(mesa.compute_create(_mesa, [air bytes], [air length],
+ 							  [[function name] UTF8String], &info,
+-							  why, sizeof(why));
++							  why, sizeof(why)));
+ 	if (compute == NULL) {
+ 		/* The front end's own sentence, passed through rather than replaced: it says
+ 		 * which construct it refused, and an application can act on that. */
+@@ -3045,7 +3316,7 @@
+ 	if (mesa_available() && [device mesaDevice] != NULL) {
+ 		char why[256] = { 0 };
+ 
+-		_mesa = mesa.buffer_create([device mesaDevice], length, why, sizeof(why));
++		_mesa = RWL(mesa.buffer_create([device mesaDevice], length, why, sizeof(why)));
+ 		if (_mesa == NULL) {
+ 			rw_print("Mesa would not allocate %lu bytes: %s\n",
+ 			         (unsigned long)length, why);
+@@ -3054,7 +3325,7 @@
+ 		}
+ 		_owner = device;
+ 		_length = length;
+-		_contents = mesa.buffer_map(_mesa);
++		_contents = RWL(mesa.buffer_map(_mesa));
+ 		return self;
+ 	}
+ 	if (gpu == IO_OBJECT_NULL || length == 0) {
+@@ -3105,7 +3376,7 @@
+ - (void)dealloc
+ {
+ 	if (_mesa != NULL) {
+-		mesa.buffer_destroy(_mesa);
++		RWLV(mesa.buffer_destroy(_mesa));
+ 		[super dealloc];
+ 		return;
+ 	}
+@@ -3251,7 +3522,7 @@
+ {
+ 	self = [super init];
+ 	if (self == nil) {
+-		mesa.texture_destroy(texture);
++		RWLV(mesa.texture_destroy(texture));
+ 		return nil;
+ 	}
+ 	_owner = device;
+@@ -3263,7 +3534,7 @@
+ - (void)dealloc
+ {
+ 	if (_texture != NULL) {
+-		mesa.texture_destroy(_texture);
++		RWLV(mesa.texture_destroy(_texture));
+ 	}
+ 	if (_iosurface != NULL) {
+ 		CFRelease(_iosurface);
+@@ -3344,8 +3615,8 @@
+ 
+ 	(void)image;
+ 	rw_n_replace++;
+-	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+-			       stride, why, sizeof(why)) != 0) {
++	if (RWL(mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
++			       stride, why, sizeof(why))) != 0) {
+ 		rw_print("writing texels: %s\n", why);
+ 	}
+ 	static unsigned rgba_said;
+@@ -3390,8 +3661,8 @@
+ 			     (unsigned)region.size.depth };
+ 
+ 	(void)image;
+-	if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
+-			      stride, why, sizeof(why)) != 0) {
++	if (RWL(mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
++			      stride, why, sizeof(why))) != 0) {
+ 		rw_print("reading texels: %s\n", why);
+ 	}
+ }
+@@ -3420,8 +3691,8 @@
+ 		         "older than this driver and cannot say what a depth buffer holds\n");
+ 		return NO;
+ 	}
+-	if (mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
+-			    sizeof(why)) != 0) {
++	if (RWL(mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
++			    sizeof(why))) != 0) {
+ 		rw_print("reading the depth of a texture: %s\n", why);
+ 		return NO;
+ 	}
+@@ -3572,7 +3843,7 @@
+ 	 * nil to one of these */
+ 	self = [super initWithDevice:device samplerDescriptor:descriptor];
+ 	if (self == nil) {
+-		mesa.sampler_destroy(sampler);
++		RWLV(mesa.sampler_destroy(sampler));
+ 		return nil;
+ 	}
+ 	_sampler = sampler;
+@@ -3582,7 +3853,7 @@
+ - (void)dealloc
+ {
+ 	if (_sampler != NULL) {
+-		mesa.sampler_destroy(_sampler);
++		RWLV(mesa.sampler_destroy(_sampler));
+ 	}
+ 	[super dealloc];
+ }
+@@ -3603,7 +3874,7 @@
+ 	 * there is reported by Apple's own validation. */
+ 	self = [super initWithDevice:device depthStencilDescriptor:descriptor];
+ 	if (self == nil) {
+-		mesa.depth_stencil_destroy(state);
++		RWLV(mesa.depth_stencil_destroy(state));
+ 		return nil;
+ 	}
+ 	_state = state;
+@@ -3647,7 +3918,7 @@
+ - (void)dealloc
+ {
+ 	if (_state != NULL) {
+-		mesa.depth_stencil_destroy(_state);
++		RWLV(mesa.depth_stencil_destroy(_state));
+ 	}
+ 	[super dealloc];
+ }
+@@ -3674,7 +3945,7 @@
+ 	 * by it. */
+ 	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
+ 	if (self == nil) {
+-		mesa.compute_destroy(compute);
++		RWLV(mesa.compute_destroy(compute));
+ 		return nil;
+ 	}
+ 	_owner = device;
+@@ -3692,7 +3963,7 @@
+ - (void)dealloc
+ {
+ 	if (_compute != NULL) {
+-		mesa.compute_destroy(_compute);
++		RWLV(mesa.compute_destroy(_compute));
+ 	}
+ 	[super dealloc];
+ }
+@@ -3723,7 +3994,7 @@
+ 	 * descriptor, for the reason the compute one learned at its own line 1504 */
+ 	self = [super initWithDevice:device pipelineStateDescriptor:descriptor];
+ 	if (self == nil) {
+-		mesa.render_destroy(render);
++		RWLV(mesa.render_destroy(render));
+ 		return nil;
+ 	}
+ 	_owner = device;
+@@ -3751,7 +4022,7 @@
+ - (void)dealloc
+ {
+ 	if (_render != NULL) {
+-		mesa.render_destroy(_render);
++		RWLV(mesa.render_destroy(_render));
+ 	}
+ 	[super dealloc];
+ }
+@@ -3794,7 +4065,50 @@
+ 
+ @end
+ 
+-@implementation RedwoodMetalWork
++/*
++ * A recorded draw or dispatch OWNS what it names, until its command buffer is gone.
++ *
++ * This file is manual retain/release, and the encoders keep their bindings as plain pointers:
++ * so did the work, and Metal's contract says the opposite -- a command buffer made with
++ * retainedReferences (the default, -commandBuffer) keeps every resource its commands use alive
++ * until it completes, and applications rely on it. -setVertexBytes: hands the encoder an
++ * AUTORELEASED buffer of ours; LIMBO encodes on one thread and commits from another
++ * (performSelector), so the pool drained in between and -runDraw:why:size: sent -mesaBuffer to
++ * the freed object's memory: "unrecognized selector" from runDraw, SIGABRT (raphael, 2026-11-19).
++ * Retained in -recordWork:, released with the work (the command buffer's _work array).
++ */
++@implementation RedwoodMetalWork {
++	BOOL _owns;
++}
++
++#define RW_WORK_OBJECTS(X) do { \
++	X(pipeline); X(render); X(depth); X(depthStencilState); X(indexBuffer); \
++	for (unsigned _i = 0; _i < 8; _i++) { X(color[_i]); } \
++	for (unsigned _i = 0; _i < RW_MAX_BUFFERS; _i++) { \
++		X(vertexBuffers[_i]); X(buffers[_i]); X(textures[_i]); X(samplers[_i]); \
++	} \
++} while (0)
++
++- (void)retainObjects
++{
++	if (_owns) {
++		return;
++	}
++#define RW_RETAIN(o) [(id)(o) retain]
++	RW_WORK_OBJECTS(RW_RETAIN);
++#undef RW_RETAIN
++	_owns = YES;
++}
++
++- (void)dealloc
++{
++	if (_owns) {
++#define RW_RELEASE(o) [(id)(o) release]
++		RW_WORK_OBJECTS(RW_RELEASE);
++#undef RW_RELEASE
++	}
++	[super dealloc];
++}
+ @end
+ 
+ /*
+@@ -4142,6 +4456,7 @@
+ 	RW_CB_ERROR        = 5,
+ };
+ 
++BOOL rw_trace_bind_on(void);
+ @implementation RedwoodMetalCommandBuffer {
+ 	RedwoodMetalCommandQueue *_queue;
+ 	NSMutableArray *_work;
+@@ -4268,6 +4583,9 @@
+ 		rw_print("a render pass needs a descriptor\n");
+ 		return nil;
+ 	}
++	if (rw_trace_bind_on()) {
++		rw_print("BIND cb %p new render encoder (thread %p)\n", self, (void *)pthread_self());
++	}
+ 	return [[[RedwoodMetalRenderEncoder alloc] initWithRedwoodCommandBuffer:self
+ 								    descriptor:descriptor]
+ 		   autorelease];
+@@ -4299,6 +4617,7 @@
+ 
+ - (void)recordWork:(RedwoodMetalWork *)work
+ {
++	[work retainObjects];
+ 	[_work addObject:work];
+ }
+ 
+@@ -4307,6 +4626,16 @@
+ /* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
+ - (void)commit
+ {
++	rw_mesa_lock();
++	[self redwoodCommitLocked];
++	rw_mesa_unlock();
++	/* and only then the handlers, so that a handler which makes the next command buffer
++	 * is not waiting for a slot this one still holds -- nor for the lock */
++	[self redwoodDeliverHandlers];
++}
++
++- (void)redwoodCommitLocked
++{
+ 	char why[512] = { 0 };
+ 
+ 	_status = RW_CB_COMMITTED;
+@@ -4354,11 +4683,11 @@
+ 		 * there and every offset is read as zero -- which is what an older library
+ 		 * did with one in any case, out loud. */
+ 		int rc = mesa.dispatch_buffers != NULL
+-			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
++			    ? RWL(mesa.dispatch_buffers([work->pipeline compute], &bindings,
+ 						    table, work->count, work->groups,
+-						    work->size, why, sizeof(why))
+-			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
+-					    work->size, why, sizeof(why));
++						    work->size, why, sizeof(why)))
++			    : RWL(mesa.dispatch([work->pipeline compute], &bindings, work->groups,
++					    work->size, why, sizeof(why)));
+ 		if (rc != 0) {
+ 			rw_print("the dispatch failed: %s\n", why);
+ 			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:2
+@@ -4401,9 +4730,26 @@
+ 	 * included: a buffer that errored is as finished as one that drew, and a slot kept
+ 	 * because of an error would turn one bad draw into a queue that blocks for ever. */
+ 	[self redwoodReturnSlot];
+-	/* and only then the handlers, so that a handler which makes the next command buffer
+-	 * is not waiting for a slot this one still holds */
+-	[self redwoodDeliverHandlers];
++	/* the handlers are delivered by -commit once the Mesa lock is let go */
++}
++
++/*
++ * The depth/stencil state a draw runs with. Metal starts EVERY encoder with depth and stencil
++ * off; the library keeps whatever state the previous draw bound when this one passes NULL. LIMBO's
++ * 2D composite pass (no depth attachment, no -setDepthStencilState:) ran with its scene pass's
++ * depth test still on, and freedreno's batch_draw_tracking read the absent depth buffer: NULL + 8
++ * (raphael 2026-11-19). A pass with no depth attachment set a depth-testing state anyway: a draw
++ * without a depth attachment to test against now gets the library's depth-off state.
++ */
++static struct rwa_depth_stencil *
++rw_draw_depth_stencil(id commandBuffer, RedwoodMetalWork *work)
++{
++	(void)commandBuffer;
++	/* NULL is the library's zeroed state (depth and stencil off, air_metal.c render->dsa) */
++	if (work->depthStencilState == nil || work->depth == nil) {
++		return NULL;
++	}
++	return [work->depthStencilState mesaDepthStencil];
+ }
+ 
+ /* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
+@@ -4495,9 +4841,80 @@
+ 	for (unsigned i = 0; i < work->textureCount; i++) {
+ 		fragment_textures[i] = [work->textures[i] mesaTexture];
+ 	}
++	/*
++	 * An UNBOUND texture slot reads as zero, as on Apple's GPUs: the library refuses a draw whose
++	 * shader reads a texture slot with nothing in it ("reads texture 0 and 0 textures were bound"),
++	 * and LIMBO draws its whole scene pass like that (pipeline RenderObjectPS, no
++	 * setFragmentTexture: on that encoder; raphael 2026-11-19) -- every draw refused, a black game.
++	 * Empty slots below RW_ZERO_SLOTS get a 1x1 RGBA8 texture of zeros instead.
++	 * /usr/local/gltest/rw_unbound_strict (exists) keeps the old refusal.
++	 */
++	unsigned texture_count = work->textureCount;
++	{
++		static int strict = -1;
++		static id zero;
++		enum { RW_ZERO_SLOTS = 8 };
++		if (strict == -1) {
++			strict = access("/usr/local/gltest/rw_unbound_strict", F_OK) == 0;
++		}
++		if (!strict) {
++			if (zero == nil) {
++				MTLTextureDescriptor *d = [MTLTextureDescriptor
++				    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
++				uint32_t px = 0;
++				d.usage = MTLTextureUsageShaderRead;
++				zero = [[_queue device] newTextureWithDescriptor:d];
++				[zero replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&px bytesPerRow:4];
++			}
++			struct rwa_texture *z = [zero mesaTexture];
++			unsigned filled = 0;
++			for (unsigned i = 0; z != NULL && i < RW_ZERO_SLOTS; i++) {
++				if (fragment_textures[i] == NULL) {
++					fragment_textures[i] = z;
++					filled |= 1u << i;
++				}
++			}
++			if (z != NULL && texture_count < RW_ZERO_SLOTS) {
++				texture_count = RW_ZERO_SLOTS;
++			}
++			static unsigned said;
++			if (filled & 1u && said < 3) {
++				said++;
++				rw_print("unbound fragment texture slots 0x%02x read as zero (%u bound)\n", filled,
++				    work->textureCount);
++			}
++		}
++	}
+ 	for (unsigned i = 0; i < work->samplerCount; i++) {
+ 		fragment_samplers[i] = [work->samplers[i] mesaSampler];
+ 	}
++	/* and an unbound SAMPLER slot is a default sampler, for the same draws (LIMBO's next refusal:
++	 * "RenderObjectPS takes sampler 0 from the API and 0 samplers were bound") */
++	unsigned sampler_count = work->samplerCount;
++	{
++		static int strict = -1;
++		static id dflt;
++		enum { RW_DEFAULT_SLOTS = 8 };
++		if (strict == -1) {
++			strict = access("/usr/local/gltest/rw_unbound_strict", F_OK) == 0;
++		}
++		if (!strict) {
++			if (dflt == nil) {
++				MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
++				dflt = [[_queue device] newSamplerStateWithDescriptor:d];
++				[d release];
++			}
++			struct rwa_sampler *z = [dflt mesaSampler];
++			for (unsigned i = 0; z != NULL && i < RW_DEFAULT_SLOTS; i++) {
++				if (fragment_samplers[i] == NULL) {
++					fragment_samplers[i] = z;
++				}
++			}
++			if (z != NULL && sampler_count < RW_DEFAULT_SLOTS) {
++				sampler_count = RW_DEFAULT_SLOTS;
++			}
++		}
++	}
+ 	struct rwa_draw draw = {
+ 		.color = color,
+ 		.color_count = work->colorCount,
+@@ -4510,7 +4927,7 @@
+ 		.depth = [work->depth mesaTexture],
+ 		.clear_depth = work->clearsDepth ? &work->clearDepth : NULL,
+ 		.clear_stencil = work->clearsStencil ? &work->clearStencil : NULL,
+-		.depth_stencil = [work->depthStencilState mesaDepthStencil],
++.depth_stencil = rw_draw_depth_stencil(self, work),
+ 		.stencil_reference = { work->stencilReference[0], work->stencilReference[1] },
+ 		.depth_range = work->hasDepthRange ? work->depthRange : NULL,
+ 		.vertex = { .buffers = vertex_buffers, .buffer_count = work->vertexBufferCount },
+@@ -4521,8 +4938,8 @@
+ 		.vertex_stream_count = [work->render vertexStreamCount],
+ 		.fragment = {
+ 			.buffers = fragment_buffers, .buffer_count = work->count,
+-			.textures = fragment_textures, .texture_count = work->textureCount,
+-			.samplers = fragment_samplers, .sampler_count = work->samplerCount,
++			.textures = fragment_textures, .texture_count = texture_count,
++			.samplers = fragment_samplers, .sampler_count = sampler_count,
+ 		},
+ 		.primitive = work->primitive,
+ 		.vertex_start = work->vertexStart,
+@@ -4558,7 +4975,7 @@
+ 		return NO;
+ 	}
+ 
+-	if (mesa.render_draw([work->render render], &draw, why, size) != 0) {
++	if (RWL(mesa.render_draw([work->render render], &draw, why, size)) != 0) {
+ 		/* OpenGL ES on Metal aborts the application on any command buffer in the error state
+ 		 * (GLDContextRec::flushContextInternal), so for it one draw this library refuses is
+ 		 * dropped and said, not the whole frame -- unless the GPU itself did not finish. */
+@@ -4590,7 +5007,7 @@
+ 	if (_status == RW_CB_ERROR) {
+ 		return;
+ 	}
+-	if (mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
++	if (RWL(mesa.finish([[_queue device] mesaDevice], why, sizeof(why))) != 0) {
+ 		rw_print("THE GPU DID NOT FINISH: %s\n", why);
+ 		_error = [[NSError errorWithDomain:@"RedwoodMetal" code:3
+ 					  userInfo:@{ NSLocalizedDescriptionKey:
+@@ -4951,7 +5368,13 @@
+ 
+ - (id)device { return [_commandBuffer device]; }
+ 
+-- (void)setRenderPipelineState:(id)state { _pipeline = state; }
++- (void)setRenderPipelineState:(id)state
++{
++	if (rw_trace_bind_on()) {
++		rw_print("BIND enc %p pipeline %p\n", self, state);
++	}
++	_pipeline = state;
++}
+ 
+ /*
+  * One table, two meanings, and the offset is no longer thrown away.
+@@ -5009,6 +5432,10 @@
+ - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+ {
+ 	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
++	if (rw_trace_bind_on()) {
++		rw_print("BIND enc %p vertex bytes %lu len %lu -> %p (device %p)\n", self, (unsigned long)index,
++		    (unsigned long)length, buffer, [self device]);
++	}
+ 
+ 	if (buffer != nil) {
+ 		[self setVertexBuffer:[buffer autorelease] offset:0 atIndex:index];
+@@ -5018,14 +5445,43 @@
+ - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+ {
+ 	id buffer = [[self device] newBufferWithBytes:bytes length:length options:0];
++	if (rw_trace_bind_on()) {
++		rw_print("BIND enc %p fragment bytes %lu len %lu -> %p\n", self, (unsigned long)index,
++		    (unsigned long)length, buffer);
++	}
+ 
+ 	if (buffer != nil) {
+ 		[self setFragmentBuffer:[buffer autorelease] offset:0 atIndex:index];
+ 	}
+ }
+ 
++/* raphael 2026-11-19: /usr/local/gltest/rw_trace_bind = a process name logs its first 40 binds */
++static int rw_trace_bind_n = -1;
++BOOL rw_trace_bind_on(void)
++{
++	if (rw_trace_bind_n == -1) {
++		char b[64] = { 0 };
++		FILE *f = fopen("/usr/local/gltest/rw_trace_bind", "r");
++		rw_trace_bind_n = 0;
++		if (f != NULL) {
++			if (fgets(b, sizeof(b), f) != NULL) {
++				b[strcspn(b, " \r\n")] = '\0';
++				if (strcmp(b, getprogname()) == 0 || strcmp(b, "*") == 0) {
++					rw_trace_bind_n = 400;
++				}
++			}
++			fclose(f);
++		}
++	}
++	return rw_trace_bind_n > 0 && rw_trace_bind_n-- > 0;
++}
++
+ - (void)setFragmentTexture:(id)texture atIndex:(NSUInteger)index
+ {
++	if (rw_trace_bind_on()) {
++		rw_print("BIND enc %p fragment texture %lu = %p (%s)\n", self, (unsigned long)index, texture,
++		    texture ? class_getName([texture class]) : "nil");
++	}
+ 	if (index >= RW_MAX_BUFFERS) {
+ 		return;
+ 	}
+@@ -5037,6 +5493,9 @@
+ 
+ - (void)setFragmentSamplerState:(id)sampler atIndex:(NSUInteger)index
+ {
++	if (rw_trace_bind_on()) {
++		rw_print("BIND enc %p fragment sampler %lu = %p\n", self, (unsigned long)index, sampler);
++	}
+ 	if (index >= RW_MAX_BUFFERS) {
+ 		return;
+ 	}
+@@ -5212,6 +5671,9 @@
+ 		work->bufferOffsets[i] = (size_t)_fragmentBufferOffsets[i];
+ 	}
+ 	work->textureCount = _fragmentTextureCount;
++	if (_fragmentTextureCount == 0 && rw_trace_bind_on()) {
++		rw_print("BIND enc %p draws with no fragment texture (pipeline %p)\n", self, _pipeline);
++	}
+ 	for (unsigned i = 0; i < _fragmentTextureCount; i++) {
+ 		work->textures[i] = _fragmentTextures[i];
+ 	}
+@@ -7012,8 +7474,8 @@
+ 		         class_getName(object_getClass(buffer)));
+ 		return;
+ 	}
+-	if (mesa.argbuf_encode_buffer([_destination mesaBuffer], _offset, (unsigned)index,
+-				      [buffer mesaBuffer], offset, why, sizeof(why)) != 0) {
++	if (RWL(mesa.argbuf_encode_buffer([_destination mesaBuffer], _offset, (unsigned)index,
++				      [buffer mesaBuffer], offset, why, sizeof(why))) != 0) {
+ 		rw_print("%s\n", why);
+ 	}
+ }
+@@ -7041,8 +7503,8 @@
+ 		         class_getName(object_getClass(texture)));
+ 		return;
+ 	}
+-	if (mesa.argbuf_encode_texture([_destination mesaBuffer], _offset, (unsigned)index,
+-				       [texture mesaTexture], why, sizeof(why)) != 0) {
++	if (RWL(mesa.argbuf_encode_texture([_destination mesaBuffer], _offset, (unsigned)index,
++				       [texture mesaTexture], why, sizeof(why))) != 0) {
+ 		rw_print("%s\n", why);
+ 	}
+ }
+@@ -7067,8 +7529,8 @@
+ 		         class_getName(object_getClass(sampler)));
+ 		return;
+ 	}
+-	if (mesa.argbuf_encode_sampler([_destination mesaBuffer], _offset, (unsigned)index,
+-				       [sampler mesaSampler], why, sizeof(why)) != 0) {
++	if (RWL(mesa.argbuf_encode_sampler([_destination mesaBuffer], _offset, (unsigned)index,
++				       [sampler mesaSampler], why, sizeof(why))) != 0) {
+ 		rw_print("%s\n", why);
+ 	}
+ }

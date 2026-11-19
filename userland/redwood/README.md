@@ -1,0 +1,33 @@
+# RedwoodMetal + Mesa AIR changes for third-party Metal games (2026-11-19)
+
+The Metal driver (RedwoodMetal.bundle) and its compiler library (libredwoodair.dylib) are built from
+davinci's tree, which is not in this repository:
+
+- `davinci-ios/gpu/userland/metal/redwood/redwoodmetal.m` (+ `redwooddrawable.m`)
+- `davinci-ios/gpu/userland/mesa/src-mesa/src/compiler/air/` (Mesa 24.2.8 + our AIR frontend), build tree
+  `davinci-ios/gpu/userland/mesa/build-fdgl`
+
+The two patches here are the changes made for raphael's games, against the `.bak-20261119` copies in those
+directories:
+
+| patch | what |
+|---|---|
+| `redwoodmetal-games.patch` | (1) a recorded draw/dispatch RETAINS its buffers, textures, samplers and pipelines until its command buffer is freed (MRC file; LIMBO's autoreleased `setVertexBytes:` buffer was freed before commit: "unrecognized selector" in runDraw); (2) PIPELINE REFLECTION: `newRenderPipelineStateWithDescriptor:options:reflection:error:` returns `vertexArguments` / `fragmentArguments` built from `rwa_function_arguments` (LIMBO binds only what reflection lists: with nil it bound nothing); (3) one recursive lock over every Mesa call, `-commit` held under it, handlers delivered after (LIMBO commits from two threads); (4) a draw without a depth attachment runs with the library's depth-off state (LIMBO's 2D pass kept the scene pass's depth test: NULL zsbuf in batch_draw_tracking); (5) unbound fragment texture / sampler slots 0-7 get a 1x1 zero texture / default sampler (Apple reads zeros; `/usr/local/gltest/rw_unbound_strict` keeps the refusal); (6) debug: `/usr/local/gltest/rw_log_host` = `IP[:PORT]` (raphael: `192.168.9.1:5152`, listener `tools/usblog.py out/logs/rw-5152.log 5152`), `/usr/local/gltest/rw_trace_bind` = process name logs binds/encoders/reflection, `/usr/local/gltest/rw_no_reflection` disables (2). |
+| `mesa-air-reflection.patch` | `struct air_resource` gains the buffer's struct members (from `air.struct_type_info`), and `rwa_function_arguments()` lists a function's direct buffer / texture / sampler arguments with names, indices and members. |
+
+Build (as for davinci):
+
+```sh
+ninja -C davinci-ios/gpu/userland/mesa/build-fdgl src/gallium/drivers/freedreno/libredwoodair.dylib
+cd davinci-ios/gpu/userland/metal
+SDK=../mesa/sdk/repo/iPhoneOS16.5.sdk
+/home/marnov/xmiphones/kbuild/proton-clang/bin/clang -target arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O1 \
+  '-DNS_FORMAT_ARGUMENT(A)=' -bundle -framework Foundation -framework IOKit -framework Metal -framework QuartzCore \
+  -framework IOSurface -lobjc -o OUT/RedwoodMetal redwood/redwoodmetal.m redwood/redwooddrawable.m
+ldid -Hsha256 -Cadhoc -S OUT/RedwoodMetal      # and the same ldid for libredwoodair.dylib
+```
+
+On the phone: `/System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal` and `/usr/local/lib/libredwoodair.dylib`
+(push 0644, then `gbx chmod 755`: sweet_push spawns files that arrive executable). Backups of the phone's
+previous copies: `backup/RedwoodMetal.phone-20261119`, `backup/libredwoodair.phone-20261119.dylib`.
+A process only gets Metal if its name is in `/usr/local/gltest/metal_allow` (backup `backup/metal_allow.phone-20261119`).
