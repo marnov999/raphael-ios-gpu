@@ -77,8 +77,87 @@
        }
        if (info->num_varyings) {
 --- air_metal.c.bak-20261119	2026-11-19 01:10:44.844535451 +0100
-+++ air_metal.c	2026-11-19 01:11:07.402843017 +0100
-@@ -4399,6 +4399,71 @@
++++ air_metal.c	2026-11-19 09:28:28.148657533 +0100
+@@ -865,6 +865,47 @@
+    { 252, "MTLPixelFormatDepth32Float",    PIPE_FORMAT_Z32_FLOAT },
+    { 253, "MTLPixelFormatStencil8",        PIPE_FORMAT_S8_UINT },
+    { 260, "MTLPixelFormatDepth32Float_Stencil8", PIPE_FORMAT_Z32_FLOAT_S8X24_UINT },
++   /* Block-compressed formats the A6xx samples natively (raphael 2026-11-19: Angry Birds' level
++    * art is EAC_RGBA8, and refusing it left the level black). Uploads are block-aware:
++    * caller_stride and rwa_texture_write count rows of blocks, as Metal's bytesPerRow does. */
++   { 170, "MTLPixelFormatEAC_R11Unorm",    PIPE_FORMAT_ETC2_R11_UNORM },
++   { 172, "MTLPixelFormatEAC_R11Snorm",    PIPE_FORMAT_ETC2_R11_SNORM },
++   { 174, "MTLPixelFormatEAC_RG11Unorm",   PIPE_FORMAT_ETC2_RG11_UNORM },
++   { 176, "MTLPixelFormatEAC_RG11Snorm",   PIPE_FORMAT_ETC2_RG11_SNORM },
++   { 178, "MTLPixelFormatEAC_RGBA8",       PIPE_FORMAT_ETC2_RGBA8 },
++   { 179, "MTLPixelFormatEAC_RGBA8_sRGB",  PIPE_FORMAT_ETC2_SRGBA8 },
++   { 180, "MTLPixelFormatETC2_RGB8",       PIPE_FORMAT_ETC2_RGB8 },
++   { 181, "MTLPixelFormatETC2_RGB8_sRGB",  PIPE_FORMAT_ETC2_SRGB8 },
++   { 182, "MTLPixelFormatETC2_RGB8A1",     PIPE_FORMAT_ETC2_RGB8A1 },
++   { 183, "MTLPixelFormatETC2_RGB8A1_sRGB", PIPE_FORMAT_ETC2_SRGB8A1 },
++   { 186, "MTLPixelFormatASTC_4x4_sRGB", PIPE_FORMAT_ASTC_4x4_SRGB },
++   { 187, "MTLPixelFormatASTC_5x4_sRGB", PIPE_FORMAT_ASTC_5x4_SRGB },
++   { 188, "MTLPixelFormatASTC_5x5_sRGB", PIPE_FORMAT_ASTC_5x5_SRGB },
++   { 189, "MTLPixelFormatASTC_6x5_sRGB", PIPE_FORMAT_ASTC_6x5_SRGB },
++   { 190, "MTLPixelFormatASTC_6x6_sRGB", PIPE_FORMAT_ASTC_6x6_SRGB },
++   { 192, "MTLPixelFormatASTC_8x5_sRGB", PIPE_FORMAT_ASTC_8x5_SRGB },
++   { 193, "MTLPixelFormatASTC_8x6_sRGB", PIPE_FORMAT_ASTC_8x6_SRGB },
++   { 194, "MTLPixelFormatASTC_8x8_sRGB", PIPE_FORMAT_ASTC_8x8_SRGB },
++   { 195, "MTLPixelFormatASTC_10x5_sRGB", PIPE_FORMAT_ASTC_10x5_SRGB },
++   { 196, "MTLPixelFormatASTC_10x6_sRGB", PIPE_FORMAT_ASTC_10x6_SRGB },
++   { 197, "MTLPixelFormatASTC_10x8_sRGB", PIPE_FORMAT_ASTC_10x8_SRGB },
++   { 198, "MTLPixelFormatASTC_10x10_sRGB", PIPE_FORMAT_ASTC_10x10_SRGB },
++   { 199, "MTLPixelFormatASTC_12x10_sRGB", PIPE_FORMAT_ASTC_12x10_SRGB },
++   { 200, "MTLPixelFormatASTC_12x12_sRGB", PIPE_FORMAT_ASTC_12x12_SRGB },
++   { 204, "MTLPixelFormatASTC_4x4_LDR", PIPE_FORMAT_ASTC_4x4 },
++   { 205, "MTLPixelFormatASTC_5x4_LDR", PIPE_FORMAT_ASTC_5x4 },
++   { 206, "MTLPixelFormatASTC_5x5_LDR", PIPE_FORMAT_ASTC_5x5 },
++   { 207, "MTLPixelFormatASTC_6x5_LDR", PIPE_FORMAT_ASTC_6x5 },
++   { 208, "MTLPixelFormatASTC_6x6_LDR", PIPE_FORMAT_ASTC_6x6 },
++   { 210, "MTLPixelFormatASTC_8x5_LDR", PIPE_FORMAT_ASTC_8x5 },
++   { 211, "MTLPixelFormatASTC_8x6_LDR", PIPE_FORMAT_ASTC_8x6 },
++   { 212, "MTLPixelFormatASTC_8x8_LDR", PIPE_FORMAT_ASTC_8x8 },
++   { 213, "MTLPixelFormatASTC_10x5_LDR", PIPE_FORMAT_ASTC_10x5 },
++   { 214, "MTLPixelFormatASTC_10x6_LDR", PIPE_FORMAT_ASTC_10x6 },
++   { 215, "MTLPixelFormatASTC_10x8_LDR", PIPE_FORMAT_ASTC_10x8 },
++   { 216, "MTLPixelFormatASTC_10x10_LDR", PIPE_FORMAT_ASTC_10x10 },
++   { 217, "MTLPixelFormatASTC_12x10_LDR", PIPE_FORMAT_ASTC_12x10 },
++   { 218, "MTLPixelFormatASTC_12x12_LDR", PIPE_FORMAT_ASTC_12x12 },
+ };
+ 
+ /* Whether a format carries each aspect, asked of Mesa's own description rather than of
+@@ -1517,7 +1558,7 @@
+     * below is about.
+     */
+    if (texture->view)
+-      texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
++      pipe_sampler_view_reference(&texture->view, NULL);
+    pipe_resource_reference(&texture->res, NULL);
+    free(texture);
+ }
+@@ -1594,8 +1635,9 @@
+ caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, size_t stride,
+               size_t *out, char *why, size_t why_size)
+ {
+-   unsigned texel = util_format_get_blocksize(texture->res->format);
+-   size_t least = (size_t)box->width * texel;
++   /* bytes in one row of BLOCKS: a compressed format's row is a row of blocks, which is
++    * also what Metal's bytesPerRow means for one */
++   size_t least = util_format_get_stride(texture->res->format, box->width);
+    if (stride == 0) {
+       *out = least;
+       return true;
+@@ -1676,7 +1718,8 @@
+     */
+    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
+                                           PIPE_MAP_WRITE, &box, bytes, row,
+-                                          row * box.height);
++                                          row * util_format_get_nblocksy(texture->res->format,
++                                                                         box.height));
+    return 0;
+ }
+ 
+@@ -4399,6 +4442,71 @@
   * is dense, so this refuses rather than guesses which of the two readings was meant.
   */
  int
@@ -150,8 +229,214 @@
  rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
                     const char *entry, struct rwa_argbuf_layout *out, unsigned max,
                     unsigned *count, char *why, size_t why_size)
+@@ -4850,6 +4958,23 @@
+    { 53, "MTLVertexFormatHalf", PIPE_FORMAT_R16_FLOAT, AIR_ATTRIB_FLOAT, 2 },
+ };
+ 
++
++/* the SCALED twin of an integer vertex format (converted to float on fetch), or NONE */
++static enum pipe_format
++scaled_vertex_format(enum pipe_format f)
++{
++   switch (f) {
++#define S(n) case PIPE_FORMAT_##n##_UINT: return PIPE_FORMAT_##n##_USCALED; \
++             case PIPE_FORMAT_##n##_SINT: return PIPE_FORMAT_##n##_SSCALED;
++   S(R8) S(R8G8) S(R8G8B8) S(R8G8B8A8)
++   S(R16) S(R16G16) S(R16G16B16) S(R16G16B16A16)
++   S(R32) S(R32G32) S(R32G32B32) S(R32G32B32A32)
++#undef S
++   default:
++      return PIPE_FORMAT_NONE;
++   }
++}
++
+ static const struct rwa_vertex_format *
+ vertex_format(unsigned mtl)
+ {
+@@ -5024,7 +5149,19 @@
+              d->format, vertex_format_refusal(d->format));
+          return false;
+       }
+-      if (f->delivers != a->base_type) {
++      /* An integer format read by a FLOAT attribute is converted to float, as Apple's GPUs do
++       * (Minecraft's world pipelines: float attributes fed by MTLVertexFormatUShort2; refused,
++       * its panorama and world never drew -- raphael 2026-11-19). Gallium's word for it is a
++       * SCALED format, which a6xx fetches (fd6_format_table: R16G16_USCALED etc.).
++       */
++      enum pipe_format src = f->pipe;
++      if (f->delivers != a->base_type && a->base_type == AIR_ATTRIB_FLOAT &&
++          (f->delivers == AIR_ATTRIB_UINT || f->delivers == AIR_ATTRIB_INT)) {
++         enum pipe_format scaled = scaled_vertex_format(f->pipe);
++         if (scaled != PIPE_FORMAT_NONE)
++            src = scaled;
++      }
++      if (src == f->pipe && f->delivers != a->base_type) {
+          say(why, why_size, "vertex attribute %u of %s is %s, which wants %s components, "
+                             "and %s delivers %s ones", a->index, vname,
+              a->type_name ? a->type_name : (a->name ? a->name : "unnamed"),
+@@ -5038,10 +5175,10 @@
+        * maps but that hardware cannot fetch is a sentence here instead of an assertion
+        * there.
+        */
+-      if (!screen->is_format_supported(screen, f->pipe, PIPE_BUFFER, 0, 0,
++      if (!screen->is_format_supported(screen, src, PIPE_BUFFER, 0, 0,
+                                        PIPE_BIND_VERTEX_BUFFER)) {
+          say(why, why_size, "%s cannot fetch %s (%s) as a vertex attribute",
+-             screen->get_name(screen), f->name, util_format_short_name(f->pipe));
++             screen->get_name(screen), f->name, util_format_short_name(src));
+          return false;
+       }
+       if (d->buffer_index >= RWA_MAX_VERTEX_BUFFERS) {
+@@ -5126,7 +5263,7 @@
+       }
+ 
+       out->element[loc] = (struct pipe_vertex_element){
+-         .src_format = f->pipe,
++         .src_format = src,
+          .src_offset = (uint16_t)d->offset,
+          .src_stride = stride,
+          .vertex_buffer_index = d->buffer_index,
+@@ -6343,7 +6480,9 @@
+       &(struct pipe_rasterizer_state){
+          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+-         .multisample = samples > 1 });
++         .multisample = samples > 1,
++         /* always on: rwa_render_draw sets the whole attachment when the draw has none */
++         .scissor = 1 });
+    if (!render->blend || !render->dsa || !render->rast) {
+       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
+       goto fail;
+@@ -6530,6 +6669,70 @@
+    return true;
+ }
+ 
++/*
++ * A render pass's load-action clears with no draw (raphael 2026-11-19): Metal clears an
++ * attachment whose pass draws nothing, and Minecraft clears colour and depth in exactly such a
++ * pass -- uncleared, its screens were white and its depth test read garbage. Only the
++ * attachment and clear fields of `draw` are read.
++ */
++int
++rwa_clear(struct rwa_device *device, const struct rwa_draw *draw, char *why, size_t why_size)
++{
++   struct pipe_context *pipe = device->pipe;
++   struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS] = { 0 };
++   struct pipe_surface *zsurf = NULL;
++   unsigned w = 0, h = 0, mask = 0;
++   union pipe_color_union clear;
++
++   if (draw->color_count > PIPE_MAX_COLOR_BUFS) {
++      say(why, why_size, "%u colour attachments to clear", draw->color_count);
++      return -1;
++   }
++   if (draw->color_count && draw->color && draw->color[0]) {
++      w = draw->color[0]->res->width0;
++      h = draw->color[0]->res->height0;
++   } else if (draw->depth) {
++      w = draw->depth->res->width0;
++      h = draw->depth->res->height0;
++   }
++   if (!w || !h)
++      return 0;
++   struct pipe_framebuffer_state fb = { .width = w, .height = h, .nr_cbufs = draw->color_count,
++                                        .samples = 1 };
++   for (unsigned i = 0; i < draw->color_count; i++) {
++      if (!draw->color[i])
++         continue;
++      surf[i] = pipe->create_surface(pipe, draw->color[i]->res,
++         &(struct pipe_surface){ .format = draw->color[i]->res->format });
++      fb.cbufs[i] = surf[i];
++   }
++   if (draw->depth) {
++      zsurf = pipe->create_surface(pipe, draw->depth->res,
++         &(struct pipe_surface){ .format = draw->depth->res->format });
++      fb.zsbuf = zsurf;
++   }
++   pipe->set_framebuffer_state(pipe, &fb);
++   for (unsigned c = 0; c < 4; c++)
++      clear.f[c] = draw->clear_color ? draw->clear_color[c] : 0.0f;
++   if (draw->clear_color && draw->color_count)
++      mask |= PIPE_CLEAR_COLOR;
++   if (draw->clear_depth && zsurf && format_has_depth(draw->depth->res->format))
++      mask |= PIPE_CLEAR_DEPTH;
++   if (draw->clear_stencil && zsurf && format_has_stencil(draw->depth->res->format))
++      mask |= PIPE_CLEAR_STENCIL;
++   if (mask)
++      pipe->clear(pipe, mask, NULL, &clear,
++                  draw->clear_depth ? (double)*draw->clear_depth : 0.0,
++                  draw->clear_stencil ? *draw->clear_stencil & 0xff : 0);
++   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
++   for (unsigned i = 0; i < draw->color_count; i++)
++      if (surf[i])
++         pipe_surface_reference(&surf[i], NULL);
++   if (zsurf)
++      pipe_surface_reference(&zsurf, NULL);
++   return 0;
++}
++
+ int
+ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+                 char *why, size_t why_size)
+@@ -6847,7 +7050,7 @@
+          say(why, why_size, "%s would not make a render surface of colour attachment %u",
+              rwa_device_name(device), i);
+          for (unsigned j = 0; j < i; j++)
+-            pipe->surface_destroy(pipe, surf[j]);
++            pipe_surface_reference(&surf[j], NULL);
+          return -1;
+       }
+       fb.cbufs[i] = surf[i];
+@@ -6859,7 +7062,7 @@
+          say(why, why_size, "%s would not make a render surface of the depth attachment",
+              rwa_device_name(device));
+          for (unsigned j = 0; j < draw->color_count; j++)
+-            pipe->surface_destroy(pipe, surf[j]);
++            pipe_surface_reference(&surf[j], NULL);
+          return -1;
+       }
+       fb.zsbuf = zsurf;
+@@ -6888,8 +7091,25 @@
+        * it is landed against -- it must turn from (100+x, 200+y, ...) into
+        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
+        */
+-      .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
+-      .translate = { w / 2.0f, h / 2.0f, znear } });
++      .scale = { (draw->viewport ? draw->viewport[2] : w) / 2.0f,
++                 -((draw->viewport ? draw->viewport[3] : h) / 2.0f), zfar - znear },
++      .translate = { (draw->viewport ? draw->viewport[0] : 0.0f) +
++                        (draw->viewport ? draw->viewport[2] : w) / 2.0f,
++                     (draw->viewport ? draw->viewport[1] : 0.0f) +
++                        (draw->viewport ? draw->viewport[3] : h) / 2.0f, znear } });
++
++   {
++      /* Metal's scissor, clamped to the attachment as Metal requires it to lie within */
++      unsigned sx = 0, sy = 0, sw = w, sh = h;
++      if (draw->scissor) {
++         sx = MIN2(draw->scissor[0], w);
++         sy = MIN2(draw->scissor[1], h);
++         sw = MIN2(draw->scissor[2], w - sx);
++         sh = MIN2(draw->scissor[3], h - sy);
++      }
++      pipe->set_scissor_states(pipe, 0, 1, &(struct pipe_scissor_state){
++         .minx = sx, .miny = sy, .maxx = sx + sw, .maxy = sy + sh });
++   }
+ 
+    pipe->bind_blend_state(pipe, render->blend);
+    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
+@@ -7079,8 +7299,8 @@
+    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
+    for (unsigned i = 0; i < draw->color_count; i++)
+       if (surf[i])
+-         pipe->surface_destroy(pipe, surf[i]);
++         pipe_surface_reference(&surf[i], NULL);
+    if (zsurf)
+-      pipe->surface_destroy(pipe, zsurf);
++      pipe_surface_reference(&zsurf, NULL);
+    return rc;
+ }
 --- air_metal.h.bak-20261119	2026-11-19 01:10:44.846829325 +0100
-+++ air_metal.h	2026-11-19 01:11:07.401843027 +0100
++++ air_metal.h	2026-11-19 02:07:20.326641036 +0100
 @@ -430,6 +430,39 @@
  		       unsigned *count, char *why, size_t why_size);
  
@@ -192,3 +477,24 @@
   * THE ENCODER, which is these three calls and no object: an encoder's whole state is
   * (destination buffer, destination offset), which the caller passes to each one, so
   * -setArgumentBuffer:offset: is a driver-side assignment and nothing happens here until
+@@ -1301,8 +1334,20 @@
+ 	unsigned vertex_buffer_table_count;
+ 	const struct rwa_buffer_bind *fragment_buffer_table;
+ 	unsigned fragment_buffer_table_count;
++
++	/* -setViewport:'s rectangle, { originX, originY, width, height } in pixels of the
++	 * attachment, or NULL for the whole attachment (APPENDED, raphael 2026-11-19: Minecraft
++	 * draws into 1x1 and smaller viewports, and covering the attachment instead made its
++	 * screens white). */
++	const float *viewport;
++	/* -setScissorRect:, { x, y, width, height } in pixels, or NULL for the whole attachment
++	 * (APPENDED with the viewport: Minecraft's UI clips its panels with it) */
++	const unsigned *scissor;
+ };
+ 
++/* the attachments' load-action clears of a pass that draws nothing (air_metal.c) */
++int rwa_clear(struct rwa_device *device, const struct rwa_draw *draw, char *why, size_t why_size);
++
+ int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
+ 		    char *why, size_t why_size);
+ 
